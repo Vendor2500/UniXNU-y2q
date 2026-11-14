@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
-index a7c2ae2..d7fa974 100644
+index a7c2ae2..2c1d4a7 100644
 --- a/bsd/dev/pong_usb_ctl.c
 +++ b/bsd/dev/pong_usb_ctl.c
-@@ -1855,6 +1855,43 @@ dispatch_command(const char *cmd)
+@@ -1855,6 +1855,42 @@ dispatch_command(const char *cmd)
  		send_str(pon_reply[0] ? pon_reply : "ponstat: no reply\n");
  	} else if (strcmp(cmd, "screenshot") == 0) {
  		cmd_handle_screenshot();
@@ -40,8 +40,7 @@ index a7c2ae2..d7fa974 100644
 +				pong_touch_post(5, b, 0, 0);   /* PONG_BUTTON_UP */
 +			}
 +		}
-+		snprintf(reply, sizeof(reply), "button: ok (mask %u, %u ms)
-+", mask, ms);
++		snprintf(reply, sizeof(reply), "button: ok (mask %u, %u ms)\n", mask, ms);
 +		send_str(reply);
  	} else if (strncmp(cmd, "tap ", 4) == 0) {
  		cmd_handle_tap(cmd + 4);
