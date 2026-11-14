@@ -1,0 +1,308 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index fbfb7bf..c07e777 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -93,6 +93,7 @@ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* po
+ extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_tools.c */
+ extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);   /* `nettest [dns]` */
+ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);   /* `fileget <path> <offset>` */
++extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ /* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
+ extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
+@@ -2008,6 +2009,14 @@ dispatch_command(const char *cmd)
+ 		fg_reply[0] = '\0';
+ 		(void)pong_wifi_tools_fileget(fg_reply, sizeof(fg_reply), cmd + 8);
+ 		send_str(fg_reply[0] ? fg_reply : "fileget: no reply\n");
++	} else if (strcmp(cmd, "exits") == 0 || strncmp(cmd, "exits ", 6) == 0 || strcmp(cmd, "ps") == 0 ||
++	    strncmp(cmd, "ps ", 3) == 0 || strncmp(cmd, "filels ", 7) == 0) {
++		/* why processes ended, which run, and the crash report folder (bsd/dev/pong_wifi_tools.c) */
++		static char pd_reply[1200];
++
++		pd_reply[0] = '\0';
++		(void)pong_proc_diag_usb(pd_reply, sizeof(pd_reply), cmd);
++		send_str(pd_reply[0] ? pd_reply : "procdiag: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 4e26d65..692c855 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -17,6 +17,9 @@
+ #include <sys/fcntl.h>
+ #include <sys/stat.h>
+ #include <sys/uio.h>
++#include <sys/dirent.h>
++#include <sys/vnode_if.h>
++#include <libkern/OSAtomic.h>
+ #include <sys/vnode.h>
+ #include <sys/kauth.h>
+ #include <sys/proc.h>
+@@ -37,6 +40,8 @@ int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);
+ int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
++int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);
++void pong_exit_note(int pid, const char *name, int rv, uint32_t ns, uint64_t code, const char *why);
+ void pong_wifi_tools_init(void);
+ 
+ #define FW_DIR       "/private/var/mobile/Library/Pong/qca6390-"
+@@ -573,6 +578,22 @@ pong_wifi_tools_usb(char *reply, size_t reply_cap, int what)
+ 
+ /* ---- fileget: a file from the Photos folder (a screenshot taken on the tablet), in base64 pieces ---- */
+ #define FG_PREFIX "/private/var/mobile/Media/DCIM/"
++#define FG_PREFIX2 "/private/var/mobile/Library/Logs/CrashReporter/"   /* crash and jetsam reports (.ips) */
++
++static int
++fg_allowed(const char *path, size_t pl)
++{
++	if (!((pl >= sizeof(FG_PREFIX) - 1 && strncmp(path, FG_PREFIX, sizeof(FG_PREFIX) - 1) == 0) ||
++	    (pl >= sizeof(FG_PREFIX2) - 1 && strncmp(path, FG_PREFIX2, sizeof(FG_PREFIX2) - 1) == 0))) {
++		return 0;
++	}
++	for (size_t i = 0; i + 1 < pl; i++) {
++		if (path[i] == '.' && path[i + 1] == '.') {
++			return 0;
++		}
++	}
++	return 1;
++}
+ #define FG_PIECE  1024u
+ 
+ /* `fileget <path> <offset>` -> "fileget: <size> <offset> <n> <base64 of n bytes>"; read-only, nothing outside FG_PREFIX */
+@@ -604,16 +625,10 @@ pong_wifi_tools_fileget(char *reply, size_t cap, const char *args)
+ 	while (args && *args >= '0' && *args <= '9' && offset < (1ull << 40)) {
+ 		offset = offset * 10u + (uint64_t)(*args++ - '0');
+ 	}
+-	if (cap < 4 * FG_PIECE / 3 + 96 || pl <= sizeof(FG_PREFIX) - 1 || strncmp(path, FG_PREFIX, sizeof(FG_PREFIX) - 1) != 0) {
+-		strlcpy(reply, "fileget: only files under " FG_PREFIX "\n", cap);
++	if (cap < 4 * FG_PIECE / 3 + 96 || !fg_allowed(path, pl)) {
++		strlcpy(reply, "fileget: only files under " FG_PREFIX " or " FG_PREFIX2 ", no ..\n", cap);
+ 		return -1;
+ 	}
+-	for (size_t i = 0; i + 1 < pl; i++) {
+-		if (path[i] == '.' && path[i + 1] == '.') {
+-			strlcpy(reply, "fileget: no .. in the path\n", cap);
+-			return -1;
+-		}
+-	}
+ 	ctx = vfs_context_create(NULL);
+ 	e = vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+ 	if (e == 0) {
+@@ -652,3 +667,197 @@ pong_wifi_tools_fileget(char *reply, size_t cap, const char *args)
+ 	reply[o] = '\0';
+ 	return 0;
+ }
++
++/* ---- process diagnostics: why apps and their helper processes end (Safari's WebContent / GPU processes) ---- */
++struct pong_exit_rec {
++	uint32_t t_ms;
++	int      pid;
++	int      rv;
++	uint32_t ns;
++	uint64_t code;
++	char     name[20];
++	char     why[44];
++};
++#define PE_N 256u
++static struct pong_exit_rec pe_ring[PE_N];
++static volatile SInt32 pe_count;
++
++/* kern_exit.c proc_prepareexit(): every exit, with its wait status and exit reason (namespace, code, description) */
++void
++pong_exit_note(int pid, const char *name, int rv, uint32_t ns, uint64_t code, const char *why)
++{
++	uint32_t i = (uint32_t)OSIncrementAtomic(&pe_count);
++	struct pong_exit_rec *r = &pe_ring[i % PE_N];
++	uint64_t now = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	r->t_ms = (uint32_t)(now / 1000000ull);
++	r->pid = pid;
++	r->rv = rv;
++	r->ns = ns;
++	r->code = code;
++	strlcpy(r->name, name ? name : "?", sizeof(r->name));
++	strlcpy(r->why, why ? why : "", sizeof(r->why));
++}
++
++static uint32_t
++pd_number(const char **s)
++{
++	uint32_t v = 0;
++
++	while (**s == ' ') {
++		(*s)++;
++	}
++	while (**s >= '0' && **s <= '9' && v < 100000000u) {
++		v = v * 10u + (uint32_t)(*(*s)++ - '0');
++	}
++	return v;
++}
++
++/* `exits [from]`: newest first, from = how many newest to skip -> "exits: <total> from <n>: t pid name status ns code why | ..." */
++static int
++pd_exits(char *reply, size_t cap, const char *a)
++{
++	uint32_t total = (uint32_t)pe_count, from = pd_number(&a), k;
++	size_t o = (size_t)snprintf(reply, cap, "exits: %u from %u:", total, from);
++
++	for (k = from; k < total && k < from + PE_N && k < PE_N; k++) {
++		const struct pong_exit_rec *r = &pe_ring[(total - 1 - k) % PE_N];
++		char one[160];
++		int n = snprintf(one, sizeof(one), " | %u.%03u %d %s sig %d st %d ns %u code 0x%llx %s", r->t_ms / 1000, r->t_ms % 1000,
++		    r->pid, r->name, r->rv & 0x7f, (r->rv >> 8) & 0xff, r->ns, (unsigned long long)r->code, r->why);
++
++		if (n <= 0 || o + (size_t)n + 12 >= cap) {
++			break;
++		}
++		memcpy(reply + o, one, (size_t)n);
++		o += (size_t)n;
++	}
++	(void)snprintf(reply + o, cap - o, k < total && k < PE_N ? " | next %u\n" : " | end\n", k);
++	return 0;
++}
++
++/* `ps [pid]`: the processes from that pid up -> "ps: pid name ... next <pid>|end" */
++static int
++pd_ps(char *reply, size_t cap, const char *a)
++{
++	uint32_t pid = pd_number(&a);
++	size_t o = (size_t)snprintf(reply, cap, "ps:");
++
++	for (; pid < 100000u; pid++) {
++		proc_t p = proc_find((int)pid);
++		char one[48];
++		int n;
++
++		if (p == PROC_NULL) {
++			continue;
++		}
++		n = snprintf(one, sizeof(one), " %u %s", pid, proc_best_name(p));
++		proc_rele(p);
++		if (n <= 0 || o + (size_t)n + 16 >= cap) {
++			break;
++		}
++		memcpy(reply + o, one, (size_t)n);
++		o += (size_t)n;
++	}
++	(void)snprintf(reply + o, cap - o, pid < 100000u ? " | next %u\n" : " | end\n", pid);
++	return 0;
++}
++
++/* `filels <dir> [from]`: the names in a directory under the fileget folders, a trailing / on directories */
++static int
++pd_filels(char *reply, size_t cap, const char *a)
++{
++	static uint8_t buf[4096];
++	char dir[160];
++	size_t pl = 0, o;
++	uint32_t from, index = 0;
++	vfs_context_t ctx;
++	vnode_t vp = NULLVP;
++	int e, eof = 0, more = 0;
++	off_t cookie = 0;
++
++	while (*a == ' ') {
++		a++;
++	}
++	while (*a && *a != ' ' && pl + 1 < sizeof(dir)) {
++		dir[pl++] = *a++;
++	}
++	dir[pl] = '\0';
++	from = pd_number(&a);
++	if (!fg_allowed(dir, pl)) {
++		strlcpy(reply, "filels: only under " FG_PREFIX " or " FG_PREFIX2 ", no ..\n", cap);
++		return -1;
++	}
++	ctx = vfs_context_create(NULL);
++	e = vnode_lookup(dir, 0, &vp, ctx);
++	if (e == 0 && !vnode_isdir(vp)) {
++		e = ENOTDIR;
++	}
++	o = (size_t)snprintf(reply, cap, "filels: %s from %u:", dir, from);
++	while (e == 0 && !eof && !more) {
++		uio_t uio = uio_create(1, cookie, UIO_SYSSPACE, UIO_READ);
++		int count = 0;
++		size_t got, at;
++
++		if (uio == NULL) {
++			e = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), sizeof(buf));
++		e = VNOP_READDIR(vp, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx);
++		got = sizeof(buf) - (size_t)uio_resid(uio);
++		cookie = uio_offset(uio);
++		uio_free(uio);
++		if (e != 0 || got == 0) {
++			break;
++		}
++		for (at = 0; at + __builtin_offsetof(struct direntry, d_name) <= got;) {
++			const struct direntry *d = (const struct direntry *)(const void *)(buf + at);
++
++			if (d->d_reclen == 0 || at + d->d_reclen > got) {
++				break;
++			}
++			at += d->d_reclen;
++			if (d->d_ino == 0 || (d->d_namlen == 1 && d->d_name[0] == '.') ||
++			    (d->d_namlen == 2 && d->d_name[0] == '.' && d->d_name[1] == '.')) {
++				continue;
++			}
++			if (index++ < from) {
++				continue;
++			}
++			if (o + d->d_namlen + 24 >= cap) {
++				more = 1;
++				index--;
++				break;
++			}
++			o += (size_t)snprintf(reply + o, cap - o, " %.*s%s", (int)d->d_namlen, d->d_name, d->d_type == DT_DIR ? "/" : "");
++		}
++	}
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	vfs_context_rele(ctx);
++	if (e != 0) {
++		(void)snprintf(reply, cap, "filels: %s error %d\n", dir, e);
++		return -1;
++	}
++	(void)snprintf(reply + o, cap - o, more ? " | next %u\n" : " | end\n", index);
++	return 0;
++}
++
++int
++pong_proc_diag_usb(char *reply, size_t cap, const char *cmd)
++{
++	if (strncmp(cmd, "exits", 5) == 0) {
++		return pd_exits(reply, cap, cmd + 5);
++	}
++	if (strncmp(cmd, "ps", 2) == 0) {
++		return pd_ps(reply, cap, cmd + 2);
++	}
++	if (strncmp(cmd, "filels ", 7) == 0) {
++		return pd_filels(reply, cap, cmd + 7);
++	}
++	strlcpy(reply, "procdiag: unknown\n", cap);
++	return -1;
++}
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index d644e77..ca987b3 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1937,6 +1937,13 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 		if (length > 0) pong_ramoops_diagnostic_write(line,
+ 		    length < (int)sizeof(line) ? length : (int)sizeof(line)-1);
+ 	}
++	{
++		extern void pong_exit_note(int, const char *, int, uint32_t, uint64_t, const char *);
++		os_reason_t note_reason = p->p_exit_reason;
++		const char *note_description = note_reason ? exit_reason_get_string_desc(note_reason) : NULL;
++		pong_exit_note(proc_getpid(p), p->p_comm, rv, note_reason ? note_reason->osr_namespace : 0,
++		    note_reason ? note_reason->osr_code : 0ULL, note_description);
++	}
+ 	{
+ 		uint32_t pong_exit_trace = 0;
+ 		if (PE_parse_boot_argn("pong_exit_trace", &pong_exit_trace, sizeof(pong_exit_trace)) && pong_exit_trace) {
