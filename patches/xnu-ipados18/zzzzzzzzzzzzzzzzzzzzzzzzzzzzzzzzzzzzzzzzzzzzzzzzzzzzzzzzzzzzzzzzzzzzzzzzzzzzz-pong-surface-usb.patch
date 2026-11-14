@@ -1,0 +1,188 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 041fe05..a7c2ae2 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -95,6 +95,7 @@ extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);   /* `fileget <path> <offset>` */
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
++extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ /* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
+ extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
+@@ -2018,6 +2019,13 @@ dispatch_command(const char *cmd)
+ 		pd_reply[0] = '\0';
+ 		(void)pong_proc_diag_usb(pd_reply, sizeof(pd_reply), cmd);
+ 		send_str(pd_reply[0] ? pd_reply : "procdiag: no reply\n");
++	} else if (strncmp(cmd, "surfstat", 8) == 0 || strncmp(cmd, "surflog", 7) == 0 || strncmp(cmd, "surftrace ", 10) == 0) {
++		/* the surfaces other processes draw into for the window server (iokit/Kernel/MiniIOSurface.cpp) */
++		static char sf_reply[1400];
++
++		sf_reply[0] = '\0';
++		(void)pong_surf_usb(sf_reply, sizeof(sf_reply), cmd);
++		send_str(sf_reply[0] ? sf_reply : "surf: no reply\n");
+ 	} else if (strncmp(cmd, "launchpolicy", 12) == 0) {
+ 		/* launchd overrides: daemons that cannot work here are disabled from the next boot (pong_wifi_tools.c) */
+ 		static char lp_reply[200];
+diff --git a/iokit/Kernel/MiniIOSurface.cpp b/iokit/Kernel/MiniIOSurface.cpp
+index 9e2008c..4f5a32e 100644
+--- a/iokit/Kernel/MiniIOSurface.cpp
++++ b/iokit/Kernel/MiniIOSurface.cpp
+@@ -156,6 +156,24 @@ static uint32_t         gSurfaceTraced;                         /* (a tunable is
+  * and who looks them up from a port (another program, which shows it: the window server for a layer).
+  */
+ static char             gSurfaceTraceOf[32];
++/* SM-T970: the trace and every failed call also go into a ring for USB `surflog` (the console is not readable there);
++ * USB `surftrace NAME N` traces N more surfaces of NAME without a reboot. */
++#define PONG_SURF_LINES 96u
++static char             gPongSurfLog[PONG_SURF_LINES][168];
++static volatile SInt32  gPongSurfLogN;
++static uint32_t         gPongTraceExtra;
++static uint32_t         gPongSurfCalls[64], gPongSurfFails[64];
++
++static void
++pongSurfKeep(const char * line)
++{
++	uint32_t i = (uint32_t) OSIncrementAtomic(&gPongSurfLogN) % PONG_SURF_LINES;
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	snprintf(gPongSurfLog[i], sizeof(gPongSurfLog[i]), "%llu.%03llu %s", ns / 1000000000ull, ns / 1000000ull % 1000ull,
++	    strncmp(line, "MiniIOSurface: ", 15) == 0 ? line + 15 : line);
++}
+ 
+ /* Pong's ordinary console already mirrors output to ramoops. */
+ static void
+@@ -168,6 +186,7 @@ traceLine(const char * format, ...)
+ 	vsnprintf(line, sizeof(line), format, list);
+ 	va_end(list);
+ 	IOLog("%s", line);
++	pongSurfKeep(line);
+ }
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+@@ -1097,6 +1116,8 @@ public:
+ 	virtual void free(void) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+ 	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++	IOReturn pongExternalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference);
+ 	virtual IOExternalTrap * getTargetAndTrapForIndex(IOService ** targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 	static mach_port_name_t makeSendRight(task_t task, MiniIOSurface * surface);
+ };
+@@ -1432,11 +1453,11 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
+ 		if (gSurfaceTraceOf[0] != 0 && strncmp(procname, gSurfaceTraceOf, strlen(gSurfaceTraceOf)) != 0) {
+ 			procname[0] = 0;        /* (not one of those asked about: not counted) */
+ 		}
+-		if (procname[0] != 0 && gSurfaceTraced < gSurfaceTrace) {
++		if (procname[0] != 0 && gSurfaceTraced < gSurfaceTrace + gPongTraceExtra) {
+ 			s->traced = gSurfaceTraceOf[0] != 0;
+ 		}
+ 	}
+-	if (s->traced || (gSurfaceTraceOf[0] == 0 && gSurfaceTraced < gSurfaceTrace)) {
++	if (s->traced || (gSurfaceTraceOf[0] == 0 && gSurfaceTraced < gSurfaceTrace + gPongTraceExtra)) {
+ 		char procname[32] = "?";
+ 
+ 		gSurfaceTraced++;
+@@ -1943,6 +1964,25 @@ IOReturn IOSurfaceRootUserClient::gpuHandoff(IOExternalMethodArguments *args)
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	IOReturn ret = pongExternalMethod(selector, args, dispatch, target, reference);
++	uint32_t slot = selector < 63 ? selector : 63;
++
++	gPongSurfCalls[slot]++;
++	if (ret != kIOReturnSuccess) {
++		char procname[24], line[96];
++
++		gPongSurfFails[slot]++;
++		proc_selfname(procname, sizeof(procname));
++		snprintf(line, sizeof(line), "%s[%d] selector %u failed: %#x", procname, proc_selfpid(), selector, ret);
++		pongSurfKeep(line);
++	}
++	return ret;
++}
++
++IOReturn
++IOSurfaceRootUserClient::pongExternalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+ {
+ 	const uint8_t * in = (const uint8_t *) args->structureInput;
+ 	size_t inSize = args->structureInputSize;
+@@ -2321,3 +2361,75 @@ native_pong_ui_services_start(void)
+ }
+ 
+ #endif /* Pong development IOSurface */
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++/*
++ * SM-T970 USB: `surfstat`, `surflog [n]`, `surftrace NAME N` (bsd/dev/pong_usb_ctl.c). Safari's page and the widgets are drawn
++ * by other processes into surfaces the window server shows; this says which calls fail and what the trace saw.
++ */
++extern "C" int pong_surf_usb(char * reply, size_t cap, const char * cmd);
++
++extern "C" int
++pong_surf_usb(char * reply, size_t cap, const char * cmd)
++{
++	size_t o = 0;
++
++	if (strncmp(cmd, "surftrace ", 10) == 0) {
++		const char * a = cmd + 10;
++		size_t n = 0;
++		uint32_t count = 0;
++
++		while (a[n] != 0 && a[n] != ' ' && n + 1 < sizeof(gSurfaceTraceOf)) {
++			n++;
++		}
++		IOLockLock(gSurfaceLock);
++		memcpy(gSurfaceTraceOf, a, n);
++		gSurfaceTraceOf[n] = 0;
++		for (a += n; *a == ' '; a++) {
++		}
++		for (; *a >= '0' && *a <= '9' && count < 100000; a++) {
++			count = count * 10 + (uint32_t)(*a - '0');
++		}
++		gPongTraceExtra = gSurfaceTraced + (count ? count : 24) - gSurfaceTrace;
++		IOLockUnlock(gSurfaceLock);
++		snprintf(reply, cap, "surftrace: of '%s', %u more surfaces\n", gSurfaceTraceOf, count ? count : 24);
++		return 0;
++	}
++	if (strncmp(cmd, "surflog", 7) == 0) {
++		uint32_t total = (uint32_t) gPongSurfLogN, from = 0, k;
++		const char * a = cmd + 7;
++
++		while (*a == ' ') {
++			a++;
++		}
++		for (; *a >= '0' && *a <= '9' && from < 100000; a++) {
++			from = from * 10 + (uint32_t)(*a - '0');
++		}
++		o = (size_t) snprintf(reply, cap, "surflog: %u from %u:", total, from);
++		for (k = from; k < total && k < PONG_SURF_LINES; k++) {
++			const char * line = gPongSurfLog[(total - 1 - k) % PONG_SURF_LINES];
++			size_t len = strnlen(line, sizeof(gPongSurfLog[0]));
++
++			while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
++				len--;
++			}
++			if (o + len + 16 >= cap) {
++				break;
++			}
++			memcpy(reply + o, " | ", 3);
++			memcpy(reply + o + 3, line, len);
++			o += 3 + len;
++		}
++		snprintf(reply + o, cap - o, k < total && k < PONG_SURF_LINES ? " | next %u\n" : " | end\n", k);
++		return 0;
++	}
++	o = (size_t) snprintf(reply, cap, "surfstat: %u surfaces, %llu KB; calls (selector calls/failed):", gSurfaceCount,
++	    (unsigned long long)(gSurfaceBytes >> 10));
++	for (uint32_t i = 0; i < 64 && o + 24 < cap; i++) {
++		if (gPongSurfCalls[i] != 0) {
++			o += (size_t) snprintf(reply + o, cap - o, " %u:%u/%u", i, gPongSurfCalls[i], gPongSurfFails[i]);
++		}
++	}
++	snprintf(reply + o, cap - o, "; trace of '%s', %u traced\n", gSurfaceTraceOf, gSurfaceTraced);
++	return 0;
++}
