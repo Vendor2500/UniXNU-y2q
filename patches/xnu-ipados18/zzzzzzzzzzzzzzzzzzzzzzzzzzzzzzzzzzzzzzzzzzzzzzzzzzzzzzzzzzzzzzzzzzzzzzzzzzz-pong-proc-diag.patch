@@ -26,7 +26,7 @@ index fbfb7bf..c07e777 100644
  		cmd_handle_tgprefer(cmd + 9);
  	} else {
 diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
-index 4e26d65..692c855 100644
+index 4e26d65..e571acf 100644
 --- a/bsd/dev/pong_wifi_tools.c
 +++ b/bsd/dev/pong_wifi_tools.c
 @@ -17,6 +17,9 @@
@@ -176,7 +176,7 @@ index 4e26d65..692c855 100644
 +		char one[48];
 +		int n;
 +
-+		if (p == PROC_NULL) {
++		if (p == NULL) {
 +			continue;
 +		}
 +		n = snprintf(one, sizeof(one), " %u %s", pid, proc_best_name(p));
