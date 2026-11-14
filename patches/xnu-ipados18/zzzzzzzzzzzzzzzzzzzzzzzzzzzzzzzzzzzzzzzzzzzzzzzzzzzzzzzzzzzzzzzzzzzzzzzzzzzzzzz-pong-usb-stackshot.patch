@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 2c1d4a7..47960e6 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -96,6 +96,7 @@ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
++extern int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);   /* `stackshot <pid>`, `stackget <offset>` */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ /* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
+ extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
+@@ -2062,6 +2063,13 @@ dispatch_command(const char *cmd)
+ 		sf_reply[0] = '\0';
+ 		(void)pong_surf_usb(sf_reply, sizeof(sf_reply), cmd);
+ 		send_str(sf_reply[0] ? sf_reply : "surf: no reply\n");
++	} else if (strncmp(cmd, "stackshot", 9) == 0 || strncmp(cmd, "stackget ", 9) == 0) {
++		/* the kernel's stackshot of one process, read in base64 pieces (pong_wifi_tools.c) */
++		static char ss_reply[1500];
++
++		ss_reply[0] = '\0';
++		(void)pong_stackshot_usb(ss_reply, sizeof(ss_reply), cmd);
++		send_str(ss_reply[0] ? ss_reply : "stackshot: no reply\n");
+ 	} else if (strncmp(cmd, "launchpolicy", 12) == 0) {
+ 		/* launchd overrides: daemons that cannot work here are disabled from the next boot (pong_wifi_tools.c) */
+ 		static char lp_reply[200];
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index b6f501c..dfcad77 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -20,6 +20,7 @@
+ #include <sys/dirent.h>
+ #include <sys/vnode_if.h>
+ #include <libkern/OSAtomic.h>
++#include <kern/debug.h>
+ #include <sys/vnode.h>
+ #include <sys/kauth.h>
+ #include <sys/proc.h>
+@@ -42,6 +43,7 @@ int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
+ int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);
+ int pong_launch_policy_usb(char *reply, size_t cap, const char *args);
++int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);
+ void pong_exit_note(int pid, const char *name, int rv, uint32_t ns, uint64_t code, const char *why);
+ void pong_wifi_tools_init(void);
+ 
+@@ -949,3 +951,71 @@ pong_proc_diag_usb(char *reply, size_t cap, const char *cmd)
+ 	strlcpy(reply, "procdiag: unknown\n", cap);
+ 	return -1;
+ }
++
++/* ---- stackshot: what one process's threads are waiting on (and for whom) ---- */
++/*
++ * `stackshot <pid>` takes the kernel's own stackshot of that process into a buffer (kcdata, as the crash reporter's:
++ * thread states, user and kernel frames, image list, wait info naming the port's owner and service), `stackget <offset>`
++ * returns it in base64 pieces like fileget. On the PC, xnu's tools/lldbmacros/kcdata.py decodes it. WebKit's GPU process
++ * draws nothing and is terminated after ~15 s: this says what it is blocked on.
++ */
++#define SS_MAX (1u << 20)
++static uint8_t *ss_buf;
++static unsigned ss_len;
++
++int
++pong_stackshot_usb(char *reply, size_t cap, const char *cmd)
++{
++	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++	if (strncmp(cmd, "stackshot", 9) == 0) {
++		const char *a = cmd + 9;
++		int pid = (int)pd_number(&a);
++		kern_return_t kr;
++
++		if (ss_buf == NULL) {
++			ss_buf = kalloc_data(SS_MAX, Z_WAITOK | Z_ZERO);
++			if (ss_buf == NULL) {
++				strlcpy(reply, "stackshot: no memory\n", cap);
++				return -1;
++			}
++		}
++		ss_len = 0;
++		kr = stack_snapshot_from_kernel(pid ? pid : -1, ss_buf, SS_MAX,
++		    STACKSHOT_KCDATA_FORMAT | STACKSHOT_THREAD_WAITINFO | STACKSHOT_SAVE_LOADINFO | STACKSHOT_GET_DQ |
++		    STACKSHOT_NO_IO_STATS | STACKSHOT_TRYLOCK, 0, 0, &ss_len);
++		(void)snprintf(reply, cap, "stackshot: pid %d rc %d bytes %u\n", pid, kr, ss_len);
++		return kr == KERN_SUCCESS ? 0 : -1;
++	}
++	/* stackget <offset> -> "stackget: <size> <offset> <n> <base64>" */
++	{
++		const char *a = cmd + 8;
++		uint32_t offset = pd_number(&a);
++		unsigned n = 0;
++		size_t o;
++
++		if (ss_buf == NULL || ss_len == 0) {
++			strlcpy(reply, "stackget: error 2\n", cap);
++			return -1;
++		}
++		if (offset < ss_len) {
++			n = ss_len - offset < FG_PIECE ? ss_len - offset : FG_PIECE;
++		}
++		o = (size_t)snprintf(reply, cap, "stackget: %u %u %u ", ss_len, offset, n);
++		for (unsigned i = 0; i < n && o + 5 < cap; i += 3) {
++			const uint8_t *d = ss_buf + offset;
++			uint32_t v = (uint32_t)d[i] << 16 | (i + 1 < n ? (uint32_t)d[i + 1] << 8 : 0) | (i + 2 < n ? d[i + 2] : 0);
++
++			reply[o++] = b64[v >> 18 & 63];
++			reply[o++] = b64[v >> 12 & 63];
++			reply[o++] = i + 1 < n ? b64[v >> 6 & 63] : '=';
++			reply[o++] = i + 2 < n ? b64[v & 63] : '=';
++		}
++		if (o + 2 > cap) {
++			o = cap - 2;
++		}
++		reply[o++] = '\n';
++		reply[o] = '\0';
++		return 0;
++	}
++}
