@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index c07e777..041fe05 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -94,6 +94,7 @@ extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* po
+ extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);   /* `nettest [dns]` */
+ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);   /* `fileget <path> <offset>` */
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
++extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
+ extern void pong_wifi_tools_init(void);                                     /* pong_wifi_tools.c: Wi-Fi starts by itself */
+ /* pong_boot_write.c: a new boot image received over this channel and written to the boot partition */
+ extern int pong_boot_usb(char *reply, size_t cap, const char *cmd);
+@@ -2017,6 +2018,13 @@ dispatch_command(const char *cmd)
+ 		pd_reply[0] = '\0';
+ 		(void)pong_proc_diag_usb(pd_reply, sizeof(pd_reply), cmd);
+ 		send_str(pd_reply[0] ? pd_reply : "procdiag: no reply\n");
++	} else if (strncmp(cmd, "launchpolicy", 12) == 0) {
++		/* launchd overrides: daemons that cannot work here are disabled from the next boot (pong_wifi_tools.c) */
++		static char lp_reply[200];
++
++		lp_reply[0] = '\0';
++		(void)pong_launch_policy_usb(lp_reply, sizeof(lp_reply), cmd + 12);
++		send_str(lp_reply[0] ? lp_reply : "launchpolicy: no reply\n");
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index e571acf..b6f501c 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -41,6 +41,7 @@ int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);
+ int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
+ int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);
++int pong_launch_policy_usb(char *reply, size_t cap, const char *args);
+ void pong_exit_note(int pid, const char *name, int rv, uint32_t ns, uint64_t code, const char *why);
+ void pong_wifi_tools_init(void);
+ 
+@@ -58,7 +59,8 @@ static struct {
+ 	int auto_state;                 /* 0 off, 1 waiting for the files, 2 started the stack, 3 gave up */
+ 	int auto_tries;
+ 	int last_rc;
+-} wt;
++	int lp_rc;                      /* launch policy: -1 not written yet, else the write's error */
++} wt = { .lp_rc = -1 };
+ 
+ static void
+ fw_path(char *out, size_t cap, const char *name)
+@@ -245,6 +247,85 @@ fw_save(char *reply, size_t cap)
+ 	return bad ? -1 : 0;
+ }
+ 
++/*
++ * Launch policy (launchd's own overrides file on the Data volume, as `launchctl disable` writes it): daemons that have nothing
++ * to work with on this tablet and exit at once are disabled, so that a Mach lookup of their services fails instead of hanging.
++ *   com.apple.fairplayd.A2  exits 0 at once (no FairPlayIOKit user client; ref/G986N-iOS userland/src/inject_fairplay.c). launchd
++ *                           throttles the restarts, and a message to com.apple.fairplayd.versioned then waits: all five Settings
++ *                           freezes on 11-14 were a thread blocked there holding an unfair lock the main thread needed.
++ *   com.apple.bluetoothd    exits every 10 s (no Bluetooth transport yet); Settings > Bluetooth froze the same way.
++ * launchd reads the file when it starts, so this takes effect from the next boot. Boot argument pong_launch_policy=0 writes an
++ * empty policy instead (everything enabled again on the boot after). ref/rui-gts7xlwifi package/BootWatchdogPolicy.c does the same.
++ */
++#define LP_DIR "/private/var/db/com.apple.xpc.launchd/"
++static const char lp_head[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++    "<plist version=\"1.0\"><dict>";
++static const char lp_jobs[] = "<key>com.apple.fairplayd.A2</key><true/><key>com.apple.bluetoothd</key><true/>";
++static const char lp_tail[] = "</dict></plist>\n";
++
++static int
++lp_put(const char *path, const char *data, size_t len, int trunc)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int e = vnode_open(path, O_CREAT | (trunc ? O_TRUNC : 0) | FWRITE | O_NOFOLLOW, 0644, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++
++	if (e == 0) {
++		int resid = 0, e2;
++
++		if (len) {
++			e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC,
++			    vfs_context_ucred(ctx), &resid, current_proc());
++			if (e == 0 && resid != 0) {
++				e = EIO;
++			}
++		}
++		e2 = vnode_close(vp, FWRITE, ctx);
++		if (e == 0) {
++			e = e2;
++		}
++	}
++	vfs_context_rele(ctx);
++	return e;
++}
++
++static int
++lp_write(int disable)
++{
++	char body[512];
++	int n = snprintf(body, sizeof(body), "%s%s%s", lp_head, disable ? lp_jobs : "", lp_tail);
++	int e;
++
++	if (n <= 0 || n >= (int)sizeof(body)) {
++		return EINVAL;
++	}
++	e = lp_put(LP_DIR "disabled.plist", body, (size_t)n, 1);
++	if (e == 0) {
++		/* an empty migration marker selects launchd's current override loader (as on a stock device) */
++		e = lp_put(LP_DIR "disabled.migrated", "", 0, 0);
++	}
++	wt.lp_rc = e;
++	return e;
++}
++
++/* `launchpolicy [write|clear]` */
++int
++pong_launch_policy_usb(char *reply, size_t cap, const char *args)
++{
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (args && strncmp(args, "write", 5) == 0) {
++		(void)lp_write(1);
++	} else if (args && strncmp(args, "clear", 5) == 0) {
++		(void)lp_write(0);
++	}
++	(void)snprintf(reply, cap, "launchpolicy: %s (rc %d); disables com.apple.fairplayd.A2, com.apple.bluetoothd from the next boot\n",
++	    wt.lp_rc < 0 ? "not written this boot" : wt.lp_rc == 0 ? "written" : "write failed", wt.lp_rc);
++	return wt.lp_rc > 0 ? -1 : 0;
++}
++
+ static void
+ wt_idle_forever(void)
+ {
+@@ -275,6 +356,13 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    wt.last_rc, wt.auto_tries);
+ 		wt_idle_forever();
+ 	}
++	{
++		uint32_t lp = 1;
++
++		(void)PE_parse_boot_argn("pong_launch_policy", &lp, sizeof(lp));
++		native_wifi_logf(6, "launch policy: %s (%d)", lp ? "fairplayd.A2 and bluetoothd disabled from the next boot" : "cleared",
++		    lp_write(lp != 0));
++	}
+ 	reply[0] = '\0';
+ 	(void)pong_wifi_stack_usb(reply, sizeof(reply), 1);
+ 	wt.auto_state = 2;
