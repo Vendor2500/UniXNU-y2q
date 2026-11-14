@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index a7c2ae2..d7fa974 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1855,6 +1855,43 @@ dispatch_command(const char *cmd)
+ 		send_str(pon_reply[0] ? pon_reply : "ponstat: no reply\n");
+ 	} else if (strcmp(cmd, "screenshot") == 0) {
+ 		cmd_handle_screenshot();
++	} else if (strncmp(cmd, "button ", 7) == 0) {
++		/* `button KEYS MS`: press the hardware buttons named by KEYS together (digits: 0 power, 1 volume up, 2 volume down),
++		 * hold MS milliseconds (default 150), release; "button 01 300" is the iPad screenshot */
++		const char *k = cmd + 7;
++		unsigned mask = 0, ms = 0;
++		char reply[64];
++
++		for (; *k >= '0' && *k <= '2'; k++) {
++			mask |= 1u << (*k - '0');
++		}
++		while (*k == ' ') {
++			k++;
++		}
++		for (; *k >= '0' && *k <= '9' && ms < 10000; k++) {
++			ms = ms * 10 + (unsigned)(*k - '0');
++		}
++		if (ms == 0) {
++			ms = 150;
++		}
++		if (ms > 10000) {
++			ms = 10000;
++		}
++		for (unsigned b = 0; b < 3; b++) {
++			if (mask & (1u << b)) {
++				pong_touch_post(4, b, 0, 0);   /* PONG_BUTTON_DOWN (sys/pong_input.h) */
++				delay_for_interval(20, NSEC_PER_MSEC);
++			}
++		}
++		delay_for_interval(ms, NSEC_PER_MSEC);
++		for (unsigned b = 0; b < 3; b++) {
++			if (mask & (1u << b)) {
++				pong_touch_post(5, b, 0, 0);   /* PONG_BUTTON_UP */
++			}
++		}
++		snprintf(reply, sizeof(reply), "button: ok (mask %u, %u ms)
++", mask, ms);
++		send_str(reply);
+ 	} else if (strncmp(cmd, "tap ", 4) == 0) {
+ 		cmd_handle_tap(cmd + 4);
+ 	} else if (strncmp(cmd, "swipe ", 6) == 0) {
