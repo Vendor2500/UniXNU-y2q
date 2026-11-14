@@ -1,0 +1,173 @@
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index dfcad77..fafe08b 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -44,6 +44,7 @@ int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
+ int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);
+ int pong_launch_policy_usb(char *reply, size_t cap, const char *args);
+ int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);
++extern int pong_publish_bare_accelerator(void);   /* iokit/Kernel/PongBareAccel.cpp */
+ void pong_exit_note(int pid, const char *name, int rv, uint32_t ns, uint64_t code, const char *why);
+ void pong_wifi_tools_init(void);
+ 
+@@ -373,12 +374,29 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 	wt_idle_forever();
+ }
+ 
++/* The IOAcceleratorES stand-in, a few seconds into boot (before Safari, widgets and posters first draw). */
++static void
++accel_standin_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	delay_for_interval(3000, 1000000u);
++	native_wifi_logf(6, "accel stand-in: %d", pong_publish_bare_accelerator());
++}
++
+ void
+ pong_wifi_tools_init(void)
+ {
+ 	uint32_t on = 1;
+ 	thread_t th = THREAD_NULL;
+ 
++	{
++		uint32_t accel = 0;   /* off until USB `bareaccel` has been seen to work; pong_accel_standin=1 turns it on */
++		thread_t at = THREAD_NULL;
++
++		(void)PE_parse_boot_argn("pong_accel_standin", &accel, sizeof(accel));
++		if (accel && kernel_thread_start(accel_standin_thread, NULL, &at) == KERN_SUCCESS) {
++			thread_deallocate(at);
++		}
++	}
+ 	(void)PE_parse_boot_argn("pong_wifi_auto", &on, sizeof(on));
+ 	if (!on) {
+ 		return;
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 8cbf96f..0311016 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -6064,6 +6064,9 @@ struct IOServiceMatchContext {
+ 	uint32_t       done;
+ };
+ 
++/* SM-T970: a plain IOService that stands in for "IOAcceleratorES" (iokit/Kernel/PongBareAccel.cpp) */
++extern IOService * pong_accel_standin;
++
+ bool
+ IOService::instanceMatch(const OSObject * entry, void * context)
+ {
+@@ -6153,6 +6156,9 @@ IOService::copyExistingServices( OSDictionary * matching,
+ 		if ((str = OSDynamicCast(OSString, obj))) {
+ 			const OSSymbol * sym = OSSymbol::withString(str);
+ 			OSMetaClass::applyToInstancesOfClassName(sym, instanceMatch, &ctx);
++			if (ctx.result == NULL && pong_accel_standin != NULL && sym->isEqualTo("IOAcceleratorES")) {
++				(void) instanceMatch(pong_accel_standin, &ctx);
++			}
+ 			sym->release();
+ 		} else {
+ 			IOService::gMetaClass.applyToInstances(instanceMatch, &ctx);
+diff --git a/iokit/Kernel/PongBareAccel.cpp b/iokit/Kernel/PongBareAccel.cpp
+index 19e1b9f..ce0b4c3 100644
+--- a/iokit/Kernel/PongBareAccel.cpp
++++ b/iokit/Kernel/PongBareAccel.cpp
+@@ -1,83 +1,54 @@
+ /*
+- * SM-T970 (no GPU yet): an IOAcceleratorES with no Metal plugin properties (USB `bareaccel`).
++ * SM-T970 (no GPU yet): a stand-in for an IOAcceleratorES with no Metal plugin properties.
+  *
+  * CoreAnimation's CAMetalContextCreate waits, once per process, up to 300 x 100 ms for an IOAcceleratorES service
+  * before it looks for a GPU (QuartzCore 22H374 __CAMetalContextCreate_block_invoke: IOServiceMatching("IOAcceleratorES"),
+- * IOServiceGetMatchingServices, usleep(100000), at most 300 times). With none published (the Adreno backend publishes its
+- * own only with pong_metal=1), WebKit's GPU process stalls there on its first drawing (CA::CG::Queue::render_callback ->
++ * IOServiceGetMatchingServices, usleep(100000), at most 300 times). With none (the Adreno backend publishes its own only
++ * with pong_metal=1), WebKit's GPU process stalls there on its first drawing (CA::CG::Queue::render_callback ->
+  * CA::CG::AccelRenderer::acquire -> CAMetalContextCreate), draws nothing and is terminated as unresponsive after about
+- * 15 s: Safari's page stays blank. Published without MetalPluginName, Metal finds no device and CoreAnimation keeps its
+- * software renderer (ref/G986N-iOS MiniIOMobileFramebuffer.cpp found the same on iOS 16).
++ * 15 s: Safari's page stays blank. Found, the accelerator has no MetalPluginName, Metal finds no device and
++ * CoreAnimation keeps its software renderer (ref/G986N-iOS MiniIOMobileFramebuffer.cpp, the same on iOS 16).
+  *
+- * The class path is the one drivers/PongAdreno's PongAdrenoPublishMetalAccelerator uses (that submodule is upstream's):
+- * the IOAcceleratorES metaclass bound to the guest's own, and the AGXAccelerator subclass, without the Adreno backend or
+- * the plugin properties.
++ * The first try (11-15 03:15) published the Adreno platform's AGXAccelerator through its late-bound IOAcceleratorES
++ * metaclass and hung the kernel. This one makes no class: a plain IOService is published, and IOService.cpp's
++ * copyExistingServices() answers a lookup of the class name "IOAcceleratorES" that finds nothing with it.
++ * USB `bareaccel` publishes it; boot argument pong_accel_standin=1 also does at boot (pong_wifi_tools.c).
+  */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOPlatformExpert.h>
+-#include <libkern/c++/OSMetaClass.h>
+-#include <mach/kmod.h>
+ 
+-extern "C" IOService *native_adreno_accelerator_allocate(void);
+-extern "C" void PongIOAcceleratorMetaConstruct(void *);
+-extern "C" void PongAdrenoAcceleratorStaticInit(void);
+-extern "C" kmod_info_t g_kernel_kmod_info;
+ extern "C" void pong_ramoops_diagnostic_write(const char *, int);
+-/* IOAcceleratorES::gMetaClass (drivers/PongAdreno/PongIOAcceleratorABI.h: 136-byte instance, as IOService) */
+-extern char pong_ioaccel_es_metaclass[] __asm("__ZN15IOAcceleratorES10gMetaClassE");
+-
+ extern "C" int pong_publish_bare_accelerator(void);
+ 
++IOService * pong_accel_standin;         /* read by IOService::copyExistingServices() */
++
+ extern "C" int
+ pong_publish_bare_accelerator(void)
+ {
+-	static IOService * bare;
+-	const OSSymbol * name;
+-	const OSMetaClass * parent;
+-	void * handle;
+ 	IOService * service;
+ 
+-	if (bare != NULL) {
++	if (pong_accel_standin != NULL) {
+ 		return 1;
+ 	}
+-	name = OSSymbol::withCString("IOAcceleratorES");
+-	parent = name ? OSMetaClass::getMetaClassWithName(name) : NULL;
+-	if (name) {
+-		name->release();
+-	}
+-	handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+-	if (handle == NULL) {
+-		return -1;
+-	}
+-	if (parent == NULL) {
+-		PongIOAcceleratorMetaConstruct(pong_ioaccel_es_metaclass);
+-	} else if (parent->getClassSize() != sizeof(IOService)) {
+-		(void) OSMetaClass::postModLoad(handle);
+-		return -2;
+-	}
+-	PongAdrenoAcceleratorStaticInit();
+-	if (OSMetaClass::postModLoad(handle) != kOSReturnSuccess) {
+-		return -3;
+-	}
+-	service = native_adreno_accelerator_allocate();
++	service = new IOService;
+ 	if (service == NULL) {
+-		return -4;
++		return -1;
+ 	}
+ 	if (!service->init()) {
+ 		service->release();
+-		return -5;
++		return -2;
+ 	}
+ 	service->setName("PongSoftwareAccelerator");
+-	service->setProperty("PongSoftwareOnly", true);
++	service->setProperty("PongAcceleratorStandIn", true);
+ 	if (!service->attach(IOService::getPlatform())) {
+ 		service->release();
+-		return -6;
++		return -3;
+ 	}
+ 	service->registerService();
+-	bare = service;
++	pong_accel_standin = service;
+ 	{
+-		static const char message[] = "PONG ACCEL: IOAcceleratorES without a Metal plugin published (CoreAnimation software renderer)\n";
++		static const char message[] = "PONG ACCEL: IOAcceleratorES stand-in without a Metal plugin (CoreAnimation software renderer)\n";
+ 
+ 		IOLog("%s", message);
+ 		pong_ramoops_diagnostic_write(message, sizeof(message) - 1);
