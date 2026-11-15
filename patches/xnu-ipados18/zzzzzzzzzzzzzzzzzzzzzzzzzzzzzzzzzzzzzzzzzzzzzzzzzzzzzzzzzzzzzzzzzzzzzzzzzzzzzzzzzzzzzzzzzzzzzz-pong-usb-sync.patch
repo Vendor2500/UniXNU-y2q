@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index c5373bf..5508759 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -43,6 +43,9 @@ typedef int (*proc_iterate_fn_t)(proc_t, void *);
+ extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout, void *arg, proc_iterate_fn_t filterfn, void *filterarg);
+ extern const char *proc_best_name(proc_t p);
+ extern int reboot_kernel(int howto, char *bootstr);
++/* bsd/vfs/vfs_syscalls.c: the in-kernel sync power management uses; returns within sync_timeout seconds */
++extern int sync_internal(void);
++static bool reboot_nosync;   /* `reboot force`: restart without the file system sync */
+ extern bool pong_pmic_restart_reason(unsigned reason);   /* pong_buttons.c */
+ extern uint32_t pong_pmic_restart_result;
+ extern int pong_pon_dump(char *out, size_t cap);
+@@ -839,6 +842,15 @@ cmd_handle_reboot(bool to_recovery)
+ 	}
+ 
+ 	delay_for_interval(50, NSEC_PER_MSEC);
++	/*
++	 * z94: dropping PS_HOLD is a cold reset, so commit the file systems first. Without it APFS lost writes made a minute
++	 * before a USB restart (11-16: a 44-byte file written over USB came back as its older 32-byte self).
++	 */
++	if (!reboot_nosync) {
++		pmsg_log("[PONG_USB] syncing file systems before the restart\n");
++		(void)sync_internal();
++		pmsg_log("[PONG_USB] sync done\n");
++	}
+ 	/*
+ 	 * reboot_kernel() panics here with "Halt/Restart Timed Out" (no restart handler answers), and
+ 	 * PSCI SYSTEM_RESET returned without a reset (both 11-10). The stock kernel's restart node is
+@@ -1846,6 +1858,7 @@ dispatch_command(const char *cmd)
+ 		/* bsd/dev/pong_boot_write.c is writing chunks of the boot partition: a restart now leaves it mixed */
+ 		send_str("reboot: refused, the boot partition is being written ('bootwrite status'; 'reboot force' overrides)\n");
+ 	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reboot force") == 0) {
++		reboot_nosync = strcmp(cmd, "reboot force") == 0;
+ 		cmd_handle_reboot(false);
+ 	} else if (strcmp(cmd, "reboot-recovery") == 0) {
+ 		cmd_handle_reboot(true);
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index fbb1f56..dd5cc86 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -1264,16 +1264,29 @@ fs_put(const char *path, const uint8_t *data, uint32_t len, off_t off)
+ {
+ 	vfs_context_t ctx = vfs_context_create(NULL);
+ 	vnode_t vp = NULLVP;
+-	int e = vnode_open(path, O_CREAT | (off == 0 ? O_TRUNC : 0) | FWRITE | O_NOFOLLOW, 0755, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	int e = vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, 0755, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+ 
+ 	if (e == 0) {
+ 		int resid = 0, e2;
+ 
+-		e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, off, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC,
+-		    vfs_context_ucred(ctx), &resid, current_proc());
++		/* z94: the open's O_TRUNC did not shorten an existing file (11-16), so offset 0 sets the size to 0 itself */
++		if (off == 0) {
++			struct vnode_attr va;
++
++			VATTR_INIT(&va);
++			VATTR_SET(&va, va_data_size, 0);
++			e = vnode_setattr(vp, &va, ctx);
++		}
++		if (e == 0) {
++			e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, off, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC,
++			    vfs_context_ucred(ctx), &resid, current_proc());
++		}
+ 		if (e == 0 && resid != 0) {
+ 			e = EIO;
+ 		}
++		if (e == 0) {
++			e = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		}
+ 		e2 = vnode_close(vp, FWRITE, ctx);
+ 		if (e == 0) {
+ 			e = e2;
