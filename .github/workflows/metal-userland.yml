@@ -62,8 +62,13 @@ jobs:
           fetch "$RUNNER_TEMP/mesa-src" https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_PIN" https://github.com/mesa3d/mesa.git
           fetch "$RUNNER_TEMP/m2v-src" https://github.com/steelbrain/metal2vulkan.git "$M2V_PIN"
 
-      - name: T970 patches
-        run: python3 scripts/patch_pong_metal_t970.py .
+      - name: T970 patches and the parity builders
+        run: |
+          set -euo pipefail
+          python3 scripts/patch_pong_metal_t970.py .
+          # the parity114 translator and parity167 Mesa pair with the overlay builders
+          # (migration/ipados18/runtime-fixes-and-build-overlay.md), not the 20G81-era ones
+          cp kits/PongPlatform24/build-support/merged-scripts/build-pong-{turnip,metal-bridge,metal-plugin}.py scripts/
 
       - name: prepare trees
         run: |
