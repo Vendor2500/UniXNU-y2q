@@ -34,7 +34,7 @@ index 9d355ad..a5ec61c 100644
  		static char st_reply[512];
  
 diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
-index fafe08b..300f26b 100644
+index fafe08b..74234ea 100644
 --- a/bsd/dev/pong_wifi_tools.c
 +++ b/bsd/dev/pong_wifi_tools.c
 @@ -34,6 +34,7 @@
@@ -164,19 +164,19 @@ index fafe08b..300f26b 100644
 +	reply[0] = '\0';
 +	(void)pong_gpu_probe_usb(reply, sizeof(reply), 11);
 +	{
-+		const char *g = strstr(reply, "gmustart[");
++		const char *g = strnstr(reply, "gmustart[", sizeof(reply));
 +
 +		gpu_keep(0, g ? g : reply);
 +	}
-+	if (strstr(reply, "gmustart[status=0 ")) {
++	if (strnstr(reply, "gmustart[status=0 ", sizeof(reply))) {
 +		reply[0] = '\0';
 +		(void)pong_gpu_gmu_gx(1, reply, sizeof(reply));
 +		gpu_keep(1, reply);
-+		if (strstr(reply, "status=0 ")) {
++		if (strnstr(reply, "status=0 ", sizeof(reply))) {
 +			reply[0] = '\0';
 +			(void)pong_t970_gpu_start(reply, sizeof(reply));
 +			gpu_keep(2, reply);
-+			if (strstr(reply, "status=0 ")) {
++			if (strnstr(reply, "status=0 ", sizeof(reply))) {
 +				reply[0] = '\0';
 +				(void)pong_t970_gpu_selftest(reply, sizeof(reply));
 +				gpu_keep(3, reply);
