@@ -1,0 +1,117 @@
+diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
+index 6b2f526..bbd3708 100644
+--- a/bsd/dev/pong_gpu_gmu.c
++++ b/bsd/dev/pong_gpu_gmu.c
+@@ -19,6 +19,11 @@
+  *      icache region (read back), the boot registers, the CM3 release and its ready word, the HFI queues and the
+  *      performance/bandwidth/start messages with their acknowledgements.
+  * GX stays off. A failure puts the CM3 back in reset (A650Gmu.c). One attempt per boot.
++ *
++ * `gpuprobe gxon` (stage B, after a successful gmustart): GX power through the GMU, A650GmuPowerGx unchanged: the
++ * GX_BW_PERF_VOTE HFI message at perf level 1 (305 MHz, RPMh level 64; DDR vote off) and the OOB_GPU_SET request, then
++ * SPTPRAC_PWR_CLK_STATUS must clear GX_HM_GDSC_POWER_OFF and GX_HM_CLK_OFF (0xc0). CakeAL UniXNU-sm-t970 v133 took the
++ * same three steps on this tablet and read 0xc0 -> 0. The OOB request stays set, so GX stays on. Once per boot.
+  */
+ #include <pexpert/arm64/board_config.h>
+ #if defined(PONG)
+@@ -45,6 +50,7 @@ extern vm_offset_t g_cmd_db_page;   /* pong_gpu_probe.c: mode 6 maps the AOP com
+ 
+ int pong_gpu_gmu_start(char *reply, size_t cap);
+ int pong_gpu_gmu_attempted(void);
++int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);
+ 
+ /* ---- the windows (device tree: qcom,gmu@3d6a000, gmu rscc 0x3de0000, gpu pdc 0xb290000, kgsl-smmu@3da0000) ---- */
+ #define GG_CORE_PHYS    0x03d6a000UL
+@@ -545,4 +551,38 @@ pong_gpu_gmu_start(char *reply, size_t cap)
+ 	return st == A650GmuSuccess ? 0 : -1;
+ }
+ 
++int
++pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
++{
++	static int tries;
++	A650GmuGxResult r;
++	A650GmuStatus st;
++
++	if (gg.attempted != 1) {   /* 1 = A650GmuSuccess + 1: a complete cold start this boot */
++		snprintf(reply, cap, "gxon: stop=no_gmu attempted=%d (run `gpuprobe gmustart` first)\n", gg.attempted);
++		return -1;
++	}
++	if (tries++) {
++		uint32_t gx = 0;
++
++		(void)gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &gx);
++		snprintf(reply, cap, "gxon: stop=once_per_boot gx=%#x\n", gx);
++		return -1;
++	}
++	gg_mark('X', perf, 0);
++	st = A650GmuPowerGx(&gg.dev, perf, &r);
++	gg_mark('Y', (uint32_t)st, r.gx_after);
++	{
++		const vm_offset_t cb = gg_cb();
++
++		snprintf(reply, cap,
++		    "gxon: status=%d perf=%u vote=%u err=%#x polls=%u info=%#x gx=%#x>%#x on=%u cb_fsr=%#x far=%#x:%#x fsynr=%#x"
++		    " gfsr=%#x gfsynr0=%#x\n",
++		    (int)st, perf, r.vote_status, r.vote_error, r.oob_polls, r.oob_info, r.gx_before, r.gx_after, r.gx_on,
++		    gg_rd(cb, GG_CB_FSR), gg_rd(cb, GG_CB_FAR + 4), gg_rd(cb, GG_CB_FAR), gg_rd(cb, GG_CB_FSYNR0),
++		    gg_rd(gg.smmu, 0x48), gg_rd(gg.smmu, 0x50));
++	}
++	return st == A650GmuSuccess ? 0 : -1;
++}
++
+ #endif /* PONG */
+diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
+index a5ce030..eae3cdf 100644
+--- a/bsd/dev/pong_gpu_probe.c
++++ b/bsd/dev/pong_gpu_probe.c
+@@ -1272,17 +1272,21 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 	 * and GPU_CC_GX_GDSCR (PWR_ON == 1).
+ 	 */
+ 	const bool gpucc_ahb_on = (cc_ahb & CBCR_CLK_OFF_BIT) == 0;
+-	const bool gx_gdsc_on   = (gx_gdscr & GDSCR_PWR_ON_BIT) != 0;
++	/* GX registers only when the GMU reports GX powered AND clocked (SPTPRAC_PWR_CLK_STATUS bits 6/7 clear, Linux
++	 * a6xx_gmu_gx_is_on), with the GDSC re-read now: after a half-done `gpuprobe gxon` the head switch can be on with the
++	 * GX clock off, and an AHB read of an unclocked GX block hangs the bus (review 11-15) */
++	const bool gx_gdsc_on   = (gpu_probe_rd32(g_gpucc_page, GPUCC_GX_GDSCR_OFF) & GDSCR_PWR_ON_BIT) != 0 && gmu_read &&
++	    (gmu_gx & 0xc0u) == 0u;
+ 	if (!gpucc_ahb_on || !gx_gdsc_on) {
+ 		if (mode >= 8) {
+ 			snprintf(reply, reply_cap,
+ 			    "gpuprobe: stage=3(smmu_gr0) stop=%s gmu[rst=0x%x fw=0x%x gx=0x%x hfi=0x%x irq=0x%x fence=0x%x]%s\n",
+-			    !gpucc_ahb_on ? "gpucc_ahb_off" : "gx_gdsc_off", gmu_rst, gmu_fw, gmu_gx, gmu_hfi, gmu_irq, gmu_fence,
++			    !gpucc_ahb_on ? "gpucc_ahb_off" : (gmu_read && (gmu_gx & 0xc0u) == 0x80u) ? "gx_clk_off" : "gx_gdsc_off", gmu_rst, gmu_fw, gmu_gx, gmu_hfi, gmu_irq, gmu_fence,
+ 			    gmuclk_extra);
+ 			gpu_probe_pmsg(reply);
+ 			return 3;
+ 		}
+-		const char *why = !gpucc_ahb_on ? "gpucc_ahb_off" : "gx_gdsc_off";
++		const char *why = !gpucc_ahb_on ? "gpucc_ahb_off" : (gmu_read && (gmu_gx & 0xc0u) == 0x80u) ? "gx_clk_off" : "gx_gdsc_off";
+ 		snprintf(reply, reply_cap,
+ 		    "gpuprobe: stage=3(smmu_gr0) stop=%s "
+ 		    "cx[0x%08x>0x%08x hw=0x%08x>0x%08x ahb=0x%08x>0x%08x smmu=0x%08x>0x%08x] "
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 0d80690..3ef5820 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -95,6 +95,7 @@ extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);   /* `fileget <path> <offset>` */
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
++extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpuprobe gxon` (pong_gpu_gmu.c) */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+ extern int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);   /* `stackshot <pid>`, `stackget <offset>` */
+ extern int pong_publish_bare_accelerator(void);   /* drivers/PongAdreno/PongAdrenoAccelerator.cpp */
+@@ -1999,6 +2000,12 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_gpuprobe(10);
+ 	} else if (strcmp(cmd, "gpuprobe gmustart") == 0) {
+ 		cmd_handle_gpuprobe(11);
++	} else if (strcmp(cmd, "gpuprobe gxon") == 0) {
++		char gx_reply[320];
++
++		gx_reply[0] = '\0';
++		(void)pong_gpu_gmu_gx(1, gx_reply, sizeof(gx_reply));
++		send_str(gx_reply[0] ? gx_reply : "gxon: no reply\n");
+ 	} else if (strcmp(cmd, "adspup") == 0) {
+ 		/* the audio DSP's shared memory, read only (bsd/dev/pong_adsp.c) */
+ 		char adsp_reply[896];
