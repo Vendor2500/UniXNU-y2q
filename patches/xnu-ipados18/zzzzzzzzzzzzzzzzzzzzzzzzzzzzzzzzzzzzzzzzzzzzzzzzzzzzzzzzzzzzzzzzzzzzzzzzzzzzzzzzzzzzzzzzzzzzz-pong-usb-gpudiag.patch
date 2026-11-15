@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index a9bd121..c5373bf 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -101,6 +101,7 @@ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpupro
+ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
+ extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ extern int pong_metal_diag_usb(char *out, size_t cap);   /* `metaldiag` (NativeAdrenoPublish.cpp, T970 patch) */
++extern int pong_gpu_diag_usb(char *reply, size_t cap);   /* `gpudiag` (bsd/kern/kern_exit.c, z93) */
+ extern int pong_wifi_join_usb(char *reply, size_t cap);   /* `wifijoin` (pong_wifi_tools.c, z92) */
+ extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+@@ -2033,6 +2034,11 @@ dispatch_command(const char *cmd)
+ 		gs_reply[0] = '\0';
+ 		(void)pong_t970_gpu_start(gs_reply, sizeof(gs_reply));
+ 		send_str(gs_reply[0] ? gs_reply : "gpustart: no reply\n");
++	} else if (strcmp(cmd, "gpudiag") == 0) {
++		static char gd_reply[1700];
++
++		(void)pong_gpu_diag_usb(gd_reply, sizeof(gd_reply));
++		send_str(gd_reply);
+ 	} else if (strcmp(cmd, "wifijoin") == 0) {
+ 		char wj_reply[160];
+ 
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index ca987b3..8ddef26 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -147,6 +147,28 @@ extern void pong_ramoops_diagnostic_write(const char *, int);
+  * process can read kernel memory or choose a physical address through it.
+  * Resolve its MIB once in userspace before installing fatal signal handlers.
+  */
++/* The latest lines, for the USB `gpudiag` command (z93): the Metal plugin reports here and pmsg needs TWRP to read. */
++static char pong_diag_ring[8][200];
++static uint32_t pong_diag_next;
++int pong_gpu_diag_usb(char *reply, size_t cap);
++int
++pong_gpu_diag_usb(char *reply, size_t cap)
++{
++	size_t o = 0;
++	uint32_t n = os_atomic_load(&pong_diag_next, relaxed);
++
++	o += (size_t)snprintf(reply, cap, "gpudiag: %u lines\n", n);
++	for (uint32_t i = n > 8 ? n - 8 : 0; i < n && o + 1 < cap; i++) {
++		int w = snprintf(reply + o, cap - o, " %s", pong_diag_ring[i % 8]);
++
++		if (w < 0) {
++			break;
++		}
++		o += (size_t)w;
++	}
++	return 0;
++}
++
+ static int
+ pong_diagnostic_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -155,7 +177,8 @@ pong_diagnostic_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!process) return EPERM;
+ 	bool settings = strcmp(process->p_comm, "Preferences") == 0;
+ 	bool renderer = strcmp(process->p_comm, "backboardd") == 0 ||
+-	    strcmp(process->p_comm, "SpringBoard") == 0;
++	    strcmp(process->p_comm, "SpringBoard") == 0 ||
++	    strncmp(process->p_comm, "com.apple.WebKi", 15) == 0;   /* WebKit's GPU process runs the Metal plugin too */
+ 	if (!settings && !renderer) return EPERM;
+ 	if (!req->newptr || !req->newlen || req->newlen >= sizeof(text)) return EINVAL;
+ 	int error = SYSCTL_IN(req, text, req->newlen);
+@@ -165,6 +188,11 @@ pong_diagnostic_sysctl SYSCTL_HANDLER_ARGS
+ 	    settings ? "PONG SETTINGS" : "PONG GPU", proc_getpid(process), text);
+ 	if (length > 0) pong_ramoops_diagnostic_write(line,
+ 	    length < (int)sizeof(line) ? length : (int)sizeof(line)-1);
++	if (length > 0) {
++		uint32_t slot = os_atomic_inc_orig(&pong_diag_next, relaxed);
++
++		(void)strlcpy(pong_diag_ring[slot % 8], line, sizeof(pong_diag_ring[0]));
++	}
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, pong_diagnostic,
