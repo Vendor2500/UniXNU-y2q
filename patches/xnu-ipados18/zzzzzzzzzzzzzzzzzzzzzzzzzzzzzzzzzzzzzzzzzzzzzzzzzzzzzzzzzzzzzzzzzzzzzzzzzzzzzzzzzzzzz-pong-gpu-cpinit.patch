@@ -1,0 +1,548 @@
+diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
+index bbd3708..749b8e7 100644
+--- a/bsd/dev/pong_gpu_gmu.c
++++ b/bsd/dev/pong_gpu_gmu.c
+@@ -24,6 +24,13 @@
+  * GX_BW_PERF_VOTE HFI message at perf level 1 (305 MHz, RPMh level 64; DDR vote off) and the OOB_GPU_SET request, then
+  * SPTPRAC_PWR_CLK_STATUS must clear GX_HM_GDSC_POWER_OFF and GX_HM_CLK_OFF (0xc0). CakeAL UniXNU-sm-t970 v133 took the
+  * same three steps on this tablet and read 0xc0 -> 0. The OOB request stays set, so GX stays on. Once per boot.
++ *
++ * `gpuprobe cpinit` (stage C1, after gxon): the first GPU commands, as UniXNU-gts7xlwifi package/GpuProbe.cpp mode 9 did on
++ * this tablet (2026-10-24; gpuContext, hwInit, cpStart) without NativeAdreno: the GPU's own SMMU context (bank 0 / ASID 2, the
++ * DT iommus <0 0x401> as one SMR, stream 0 under mask 0x401, on slot 0), four kernel buffers at 32 MiB (outside the UCHE GMEM
++ * window at 0), Linux v6.6 hw_init for the A650 (clock gating, CP protect, APRIV), a650_sqe.fw without its first dword, ring 0
++ * with NO_UPDATE, CP_ME_INIT with its fence, then one CP_MEM_WRITE of 0xA6500C0D into the scratch page that the CPU reads back.
++ * No zap shader (stage C2). Once per boot. Design: work/gpu_stage_c/DESIGN.md.
+  */
+ #include <pexpert/arm64/board_config.h>
+ #if defined(PONG)
+@@ -51,6 +58,7 @@ extern vm_offset_t g_cmd_db_page;   /* pong_gpu_probe.c: mode 6 maps the AOP com
+ int pong_gpu_gmu_start(char *reply, size_t cap);
+ int pong_gpu_gmu_attempted(void);
+ int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);
++int pong_gpu_cp_init(char *reply, size_t cap);
+ 
+ /* ---- the windows (device tree: qcom,gmu@3d6a000, gmu rscc 0x3de0000, gpu pdc 0xb290000, kgsl-smmu@3da0000) ---- */
+ #define GG_CORE_PHYS    0x03d6a000UL
+@@ -142,6 +150,7 @@ gg_mark(char tag, uint32_t a, uint32_t b)
+ }
+ 
+ static uint32_t gg_last_phase = 0xffffffffu, gg_last_stage = 0xffffffffu;
++static int gg_gx_ok;
+ 
+ static void
+ gg_progress(unsigned w, size_t at)
+@@ -571,6 +580,7 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
+ 	}
+ 	gg_mark('X', perf, 0);
+ 	st = A650GmuPowerGx(&gg.dev, perf, &r);
++	gg_gx_ok = st == A650GmuSuccess && r.gx_on;
+ 	gg_mark('Y', (uint32_t)st, r.gx_after);
+ 	{
+ 		const vm_offset_t cb = gg_cb();
+@@ -585,4 +595,480 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
+ 	return st == A650GmuSuccess ? 0 : -1;
+ }
+ 
++/* ---- stage C1: the GPU's context, hw_init, SQE, ring 0, CP_ME_INIT, one CP_MEM_WRITE ---- */
++#define GC_CORE_PHYS    0x03d00000UL         /* qcom,kgsl-3d0 */
++#define GC_CORE_BYTES   0x40000UL            /* dword registers up to 0xffff (SECVID 0xf810) */
++#define GC_IOVA         0x02000000ull        /* 32 MiB: past the UCHE GMEM window at 0 (GpuProbe.cpp:774-778) */
++#define GC_SQE_OFF      0x0000u              /* 32 KiB */
++#define GC_RING_OFF     0x8000u              /* 32 KiB, 32 KiB aligned IOVA */
++#define GC_MEMP_OFF     0x10000u             /* rptr shadow +0, fence +4 */
++#define GC_SCR_OFF      0x11000u             /* the marker page */
++#define GC_BYTES        0x14000u             /* a 16 KiB multiple */
++#define GC_RING_BYTES   0x8000u
++#define GC_LEAF_RW      0x0060000000000e43ull   /* page, nG, AF, outer shareable, AP EL0+EL1 RW, XN (ArmSmmu4K.c encoding) */
++#define GC_LEAF_RX      0x0000000000000ec3ull   /* the SQE: read only for both, executable (no implicit PXN: not EL0-writable) */
++#define GC_BANK         0u
++#define GC_ASID         2u
++#define GC_SLOT         0u
++#define GC_SMR_VAL      0x84010000u          /* valid, mask 0x401, stream 0: streams 0, 1, 0x400, 0x401 */
++#define GC_TCR          0x80802020u          /* TG1 4K, EPD1, SH0 outer, non-cacheable walks, T0SZ 32 (ArmSmmu4KContext.c) */
++#define GC_MAIR0        0xff44u
++#define GC_SCTLR        0x27u                /* CFRE AFE TRE M; no fault interrupt here */
++#define GC_MARK         0xa6500c0du
++
++static struct {
++	vm_offset_t core;
++	uint8_t *buf;
++	uint64_t *table;
++	IOPhysicalAddress table_pa;
++	uint32_t rb_off, rb_got, s2_orig, actlr, sqe_bad, step;
++} gc;
++
++static inline void
++gc_w(uint32_t reg, uint32_t v)
++{
++	*(volatile uint32_t *)(gc.core + reg * 4u) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++gc_r(uint32_t reg)
++{
++	return *(volatile uint32_t *)(gc.core + reg * 4u);
++}
++
++static inline void
++gc_w64(uint32_t reg, uint64_t v)
++{
++	gc_w(reg, (uint32_t)v);
++	gc_w(reg + 1u, (uint32_t)(v >> 32));
++}
++
++static vm_offset_t
++gc_cb0(void)
++{
++	const uint32_t idr1 = gg_rd(gg.smmu, GG_IDR1);
++	const uint32_t page = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++
++	return gg.smmu + (page << (((idr1 >> 28) & 7u) + 1u)) + GC_BANK * page;
++}
++
++/* the PM4 parity bit (Linux PM4_PARITY): the field plus the bit has an odd number of ones */
++static inline uint32_t
++gc_odd(uint32_t v)
++{
++	return (__builtin_popcount(v) & 1) ? 0u : 1u;
++}
++
++static inline uint32_t
++gc_pkt7(uint32_t op, uint32_t count)
++{
++	return 0x70000000u | count | (gc_odd(count) << 15) | (op << 16) | (gc_odd(op) << 23);
++}
++
++static inline uint32_t
++gc_pkt4(uint32_t reg, uint32_t count)
++{
++	return 0x40000000u | count | (gc_odd(count) << 7) | (reg << 8) | (gc_odd(reg) << 27);
++}
++
++static int
++gc_memory(void)
++{
++	static uint64_t pa_of[GC_BYTES / 4096];
++	uint64_t *t;
++	uint8_t *raw = kalloc_data(GC_BYTES + PAGE_SIZE, Z_WAITOK | Z_ZERO);
++
++	if (!raw) {
++		return -1;
++	}
++	gc.buf = (uint8_t *)(((uintptr_t)raw + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
++	t = IOMallocContiguous(0x4000, 0x4000, &gc.table_pa);
++	if (!t || !gc.table_pa || (gc.table_pa & 0xfffu) || gc.table_pa + 0x4000 > (1ull << 36)) {
++		return -2;
++	}
++	gc.table = t;
++	bzero(t, 0x4000);
++	for (uintptr_t p = (uintptr_t)gc.buf; p < (uintptr_t)gc.buf + GC_BYTES; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t off = 0; off < GC_BYTES; off += (uint32_t)PAGE_SIZE) {
++		const uint64_t pa = kvtophys((vm_offset_t)(gc.buf + off));
++		const ppnum_t pn = (ppnum_t)atop_64(pa);
++
++		if (!pa || (pa & (PAGE_SIZE - 1)) || pa + PAGE_SIZE > (1ull << 36) || !pmap_valid_page(pn)) {
++			return -3;
++		}
++		for (uint32_t sub = 0; sub < (uint32_t)PAGE_SIZE; sub += 4096) {
++			pa_of[(off + sub) / 4096] = pa + sub;
++		}
++		pmap_set_cache_attributes(pn, GG_WIMG_WCOMB);
++		if ((pmap_cache_attributes(pn) & 0xffu) != GG_WIMG_WCOMB) {
++			return -4;
++		}
++	}
++	/* L1 at 0, L2 (0..1 GiB) at 0x1000, L3 (32..34 MiB) at 0x2000 */
++	t[0] = (gc.table_pa + 0x1000) | 3;
++	t[512 + ((GC_IOVA >> 21) & 511u)] = (gc.table_pa + 0x2000) | 3;
++	for (uint32_t i = 0; i < GC_BYTES / 4096; i++) {
++		t[1024 + ((GC_IOVA >> 12) & 511u) + i] = (pa_of[i] & 0x0000fffffffff000ull) |
++		    (i * 4096u < GC_RING_OFF ? GC_LEAF_RX : GC_LEAF_RW);
++	}
++	for (uintptr_t p = (uintptr_t)t; p < (uintptr_t)t + 0x4000; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
++
++/* Bank 0 / ASID 2 for the GPU, every write read back while the bank is off (as gg_smmu), then the route on SMR slot 0 */
++static int
++gc_smmu(uint32_t *why)
++{
++	const uint32_t idr1 = gg_rd(gg.smmu, GG_IDR1), idr2 = gg_rd(gg.smmu, GG_IDR2);
++	const uint32_t page = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	const vm_offset_t cb = gg.smmu + (page << (((idr1 >> 28) & 7u) + 1u)) + GC_BANK * page;
++	uint32_t tcr2;
++
++	*why = 0;
++	for (unsigned int i = 0; i < 6; i++) {   /* the route must not overlap a valid one */
++		if (i != GG_SLOT && (gg_rd(gg.smmu, GG_SMR(i)) & (1u << 31))) {
++			gc.rb_got = gg_rd(gg.smmu, GG_SMR(i));
++			gc.rb_off = i;
++			*why = 2;
++			return -1;
++		}
++	}
++	gc.s2_orig = gg_rd(gg.smmu, GG_S2CR(GC_SLOT));
++	if ((gc.s2_orig & 0x30000u) != 0x20000u) {   /* not a FAULT slot: someone's; leave it */
++		*why = 3;
++		return -1;
++	}
++	gg_wr(cb, GG_CB_SCTLR, 0);
++	if (gg_rd(cb, GG_CB_SCTLR) & 1u) {
++		*why = 4;
++		return -1;
++	}
++	tcr2 = (gg_rd(cb, GG_CB_TCR2) & ~0x38017u) | 0x38010u | (idr2 & 0xfu);
++	{
++		struct { vm_offset_t base; uint32_t off, val, ignore; } w[11] = {
++			{ gg.smmu, page + 0x800 + GG_CBAR(GC_BANK), 1u, 0 },
++			{ gg.smmu, page + GG_CBAR(GC_BANK), GG_CBAR_VAL, 0 },
++			{ cb, GG_CB_TCR2, tcr2, 0x60u },            /* TBI0/1 may read 1 (ArmSmmu4KValidateContextReadback) */
++			{ cb, GG_CB_TTBR0, (uint32_t)gc.table_pa, 0 },
++			{ cb, GG_CB_TTBR0 + 4, (uint32_t)(gc.table_pa >> 32) | (GC_ASID << 16), 0 },
++			{ cb, GG_CB_TTBR1, 0, 0 },
++			{ cb, GG_CB_TTBR1 + 4, GC_ASID << 16, 0 },
++			{ cb, GG_CB_TCR, GC_TCR, 0 },
++			{ cb, GG_CB_CONTEXTIDR, GC_ASID, 0 },
++			{ cb, GG_CB_MAIR0, GC_MAIR0, 0 },
++			{ cb, GG_CB_MAIR0 + 4, 0, 0 },
++		};
++
++		for (unsigned int i = 0; i < 11; i++) {
++			gg_wr(w[i].base, w[i].off, w[i].val);
++			if ((gg_rd(w[i].base, w[i].off) & ~w[i].ignore) != w[i].val) {
++				gc.rb_off = w[i].off;
++				gc.rb_got = gg_rd(w[i].base, w[i].off);
++				*why = 10u + i;
++				return -1;
++			}
++		}
++	}
++	gc.actlr = gg_rd(cb, 0x4);
++	gg_wr(cb, 0x4, gc.actlr & ~2u);           /* ACTLR without CPRE (arm_mmu500_reset; GpuProbe.cpp:680-688) */
++	gg_wr(cb, GG_CB_FSR, ~0u);
++	gg_wr(cb, GG_CB_TLBIALL, 0);
++	gg_wr(cb, GG_CB_TLBSYNC, 0);
++	for (unsigned int i = 0; i < 1000 && (gg_rd(cb, GG_CB_TLBSTATUS) & 1u); i++) {
++		IODelay(1);
++	}
++	if (gg_rd(cb, GG_CB_TLBSTATUS) & 1u) {
++		*why = 7;
++		return -1;
++	}
++	gg_wr(cb, GG_CB_SCTLR, GC_SCTLR);
++	if (gg_rd(cb, GG_CB_SCTLR) != GC_SCTLR) {
++		gg_wr(cb, GG_CB_SCTLR, 0);
++		*why = 5;
++		return -1;
++	}
++	gg_wr(gg.smmu, GG_S2CR(GC_SLOT), GC_BANK);   /* translate through bank 0, before the SMR goes valid */
++	if ((gg_rd(gg.smmu, GG_S2CR(GC_SLOT)) & 0x0c0300ffu) != GC_BANK) {
++		gc.rb_got = gg_rd(gg.smmu, GG_S2CR(GC_SLOT));
++		gg_wr(gg.smmu, GG_S2CR(GC_SLOT), gc.s2_orig);
++		gg_wr(cb, GG_CB_SCTLR, 0);
++		*why = 8;
++		return -1;
++	}
++	gg_wr(gg.smmu, GG_SMR(GC_SLOT), GC_SMR_VAL);
++	if (gg_rd(gg.smmu, GG_SMR(GC_SLOT)) != GC_SMR_VAL) {
++		gc.rb_got = gg_rd(gg.smmu, GG_SMR(GC_SLOT));
++		gg_wr(gg.smmu, GG_SMR(GC_SLOT), 0);
++		gg_wr(gg.smmu, GG_S2CR(GC_SLOT), gc.s2_orig);
++		gg_wr(cb, GG_CB_SCTLR, 0);
++		*why = 9;
++		return -1;
++	}
++	return 0;
++}
++
++/* Linux v6.6 a650_protect (GpuProbe.cpp:697-712): A6XX_PROTECT_RDONLY / _NORDWR; the last entry goes to CP_PROTECT(47) */
++#define GC_RO(reg, len) ((((uint32_t)(len) & 0x3fffu) << 18) | ((uint32_t)(reg) & 0x3ffffu))
++#define GC_NO(reg, len) ((1u << 31) | GC_RO(reg, len))
++static const uint32_t gc_protect[39] = {
++	GC_RO(0x00000, 0x04ff), GC_RO(0x00501, 0x0005), GC_RO(0x0050b, 0x02f4), GC_NO(0x0050e, 0), GC_NO(0x00510, 0),
++	GC_NO(0x00534, 0), GC_NO(0x00800, 0x0082), GC_NO(0x008a0, 0x0008), GC_NO(0x008ab, 0x0024), GC_RO(0x008de, 0x00ae),
++	GC_NO(0x00900, 0x004d), GC_NO(0x0098d, 0x0272), GC_NO(0x00e00, 0x0001), GC_NO(0x00e03, 0x000c), GC_NO(0x03c00, 0x00c3),
++	GC_RO(0x03cc4, 0x1fff), GC_NO(0x08630, 0x01cf), GC_NO(0x08e00, 0), GC_NO(0x08e08, 0), GC_NO(0x08e50, 0x001f),
++	GC_NO(0x08e80, 0x027f), GC_NO(0x09624, 0x01db), GC_NO(0x09e60, 0x0011), GC_NO(0x09e78, 0x0187), GC_NO(0x0a630, 0x01cf),
++	GC_NO(0x0ae02, 0), GC_NO(0x0ae50, 0x032f), GC_NO(0x0b604, 0), GC_NO(0x0b608, 0x0007), GC_NO(0x0be02, 0x0001),
++	GC_NO(0x0be20, 0x17df), GC_NO(0x0f000, 0x0bff), GC_RO(0x0fc00, 0x1fff), GC_NO(0x18400, 0x1fff), GC_NO(0x1a800, 0x1fff),
++	GC_NO(0x1f400, 0x0443), GC_RO(0x1f844, 0x007b), GC_NO(0x1f887, 0x001b), GC_NO(0x1f8c0, 0),
++};
++/* Linux v6.6 a650_hwcg (GpuProbe.cpp:718-733) */
++static const uint32_t gc_hwcg[49][2] = {
++	{0x00b0, 0x02222222}, {0x00b4, 0x02222220}, {0x00b8, 0x00000080}, {0x00bc, 0x0000f3cf},
++	{0x00c0, 0x02222222}, {0x00c4, 0x22222222}, {0x00c8, 0x22222222}, {0x00cc, 0x00022222},
++	{0x00d0, 0x11111111}, {0x00d4, 0x11111111}, {0x00d8, 0x11111111}, {0x00dc, 0x00011111},
++	{0x00e0, 0x77777777}, {0x00e4, 0x77777777}, {0x00e8, 0x77777777}, {0x00ec, 0x00077777},
++	{0x00f0, 0x22222222}, {0x00f4, 0x01002222}, {0x00f8, 0x00002220}, {0x0100, 0x00040f00},
++	{0x0104, 0x25222022}, {0x0105, 0x00005555}, {0x0106, 0x00000011}, {0x0107, 0x00445044},
++	{0x0108, 0x04222222}, {0x0111, 0x00002222}, {0x0114, 0x00222222}, {0x0117, 0x00000002},
++	{0x011b, 0x00002222}, {0x0109, 0x00004000}, {0x0112, 0x00002222}, {0x0115, 0x00000200},
++	{0x011c, 0x00000000}, {0x010a, 0x00000000}, {0x0113, 0x00000000}, {0x0116, 0x04104004},
++	{0x011d, 0x00000000}, {0x0120, 0x00000222}, {0x0121, 0x00000111}, {0x0122, 0x00000777},
++	{0x010b, 0x22222222}, {0x0110, 0x00000004}, {0x010f, 0x00000002}, {0x0533, 0x00000182},
++	{0x0044, 0x00000000}, {0x0042, 0x00000000}, {0x0118, 0x00000222}, {0x0119, 0x00000111},
++	{0x011a, 0x00000555},
++};
++
++/* hw_init of Linux v6.6 a6xx_gpu.c for the A650, as GpuProbe.cpp hwInit (757-812); RBBM_INT_0_MASK stays 0 (no handler yet) */
++static void
++gc_hw_init(void)
++{
++	static const uint32_t addr_mode[12] = { 0x842, 0xc01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0xe00, 0xae01, 0xb601,
++		                                0xf810 };
++	uint32_t v = 0;
++
++	gc_w(0x3c45, 0); (void)gc_r(0x3c45);                 /* GBIF_HALT */
++	gc_w(0x0016, 0); (void)gc_r(0x0016);                 /* RBBM_GBIF_HALT */
++	gc_w(0xf803, 0);                                     /* RBBM_SECVID_TSB_CNTL */
++	gc_w64(0xf800, 0); gc_w(0xf802, 0);                  /* TSB_TRUSTED_BASE, _SIZE */
++	for (unsigned int i = 0; i < 12; i++) {
++		gc_w(addr_mode[i], 1);                       /* *_ADDR_MODE_CNTL: 64-bit */
++	}
++	/* a6xx_set_hwcg: SP clock off (GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL bit 0), the table, SP clock on, RBBM_CLOCK_CNTL */
++	(void)gg_read32(NULL, A650GmuCore, 0x80u * 4u, &v);
++	(void)gg_write32(NULL, A650GmuCore, 0x80u * 4u, v & ~1u);
++	for (unsigned int i = 0; i < 49; i++) {
++		gc_w(gc_hwcg[i][0], gc_hwcg[i][1]);
++	}
++	(void)gg_read32(NULL, A650GmuCore, 0x80u * 4u, &v);
++	(void)gg_write32(NULL, A650GmuCore, 0x80u * 4u, v | 1u);
++	gc_w(0x00ae, 0x8aa8aa82);                            /* RBBM_CLOCK_CNTL */
++	for (uint32_t reg = 0x3c03; reg <= 0x3c06; reg++) {
++		gc_w(reg, 0x00071620);                       /* GBIF_QSB_SIDE0..3 */
++	}
++	gc_w(0x0011, 0x3);                                   /* RBBM_GBIF_CLIENT_QOS_CNTL */
++	gc_w(0x050b, 0xffffffffu);                           /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	gc_w64(0x0e05, 0x0001ffffffffffc0ull);               /* UCHE_WRITE_RANGE_MAX */
++	gc_w64(0x0e09, 0x0001fffffffff000ull);               /* UCHE_TRAP_BASE */
++	gc_w64(0x0e07, 0x0001fffffffff000ull);               /* UCHE_WRITE_THRU_BASE */
++	gc_w(0x0e18, 0x804); gc_w(0x0e17, 0x4);              /* UCHE_FILTER_CNTL, UCHE_CACHE_WAYS */
++	gc_w(0x08c2, 0x02000140); gc_w(0x08c1, 0x8040362c);  /* CP_ROQ_THRESHOLDS_2/_1 */
++	gc_w(0x08c3, 128);                                   /* CP_MEM_POOL_SIZE */
++	gc_w(0x9e00, 0x00300200);                            /* PC_DBG_ECO_CNTL (A650) */
++	gc_w(0x098d, 1);                                     /* CP_AHB_CNTL */
++	gc_w(0x0500, 1);                                     /* RBBM_PERFCTR_CNTL */
++	gc_w(0x08d0, 0);                                     /* CP_PERFCTR_CP_SEL(0) */
++	gc_w(0x8e08, 0x816); gc_w(0xb604, 0x6); gc_w(0xae02, 0x26);   /* RB, TPL1, SP _NC_MODE_CNTL (hbb 16) */
++	gc_w(0x0e01, 3u << 21);                              /* UCHE_MODE_CNTL */
++	gc_w(0x001f, (1u << 30) | 0x1fffff);                 /* RBBM_INTERFACE_HANG_INT_CNTL */
++	gc_w(0x0e19, 1);                                     /* UCHE_CLIENT_PF */
++	gc_w(0xb608, 0); gc_w(0xb609, 0x3fe05ff4); gc_w(0xb60a, 0x3fa0ebee);
++	gc_w(0xb60b, 0x3f5193ed); gc_w(0xb60c, 0x3f0243f0);  /* TPL1_BICUBIC_WEIGHTS_TABLE_0..4 */
++	(void)gg_write32(NULL, A650GmuCore, 0x930eu * 4u, 0xff000000u);       /* GPU_GMU_AO_GPU_CX_BUSY_MASK */
++	(void)gg_read32(NULL, A650GmuCore, 0x5041u * 4u, &v);
++	(void)gg_write32(NULL, A650GmuCore, 0x5041u * 4u, (v & ~0xffu) | (1u << 5));
++	(void)gg_write32(NULL, A650GmuCore, 0x5040u * 4u, 1);
++	gc_w(0x084f, (1u << 0) | (1u << 1) | (1u << 3));     /* CP_PROTECT_CNTL */
++	for (unsigned int i = 0; i + 1 < 39; i++) {
++		gc_w(0x0850 + i, gc_protect[i]);
++	}
++	gc_w(0x0850 + 47, gc_protect[38]);                   /* CP_PROTECT(47) */
++	gc_w(0x0844, (1u << 6) | (1u << 5) | (1u << 3) | (1u << 2) | (1u << 1));   /* CP_APRIV_CNTL (a650 hw_apriv) */
++	gc_w(0x0038, 0);                                     /* RBBM_INT_0_MASK: polled here */
++}
++
++/* words at ring index `at`, then CP_SCRATCH(2) and a CACHE_FLUSH_TS fence to memptrs+4 (NativeAdrenoRing emitFence, A6xx form) */
++static uint32_t
++gc_submit(uint32_t at, const uint32_t *words, uint32_t n, uint32_t seqno)
++{
++	volatile uint32_t *ring = (volatile uint32_t *)(void *)(gc.buf + GC_RING_OFF);
++	const uint64_t fence = GC_IOVA + GC_MEMP_OFF + 4;
++	const uint32_t tail[7] = { gc_pkt4(0x0885, 1), seqno, gc_pkt7(0x46, 4), 0x04u | (1u << 31), (uint32_t)fence,
++		                   (uint32_t)(fence >> 32), seqno };
++
++	for (uint32_t i = 0; i < n; i++) {
++		ring[at++] = words[i];
++	}
++	for (uint32_t i = 0; i < 7; i++) {
++		ring[at++] = tail[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gg_mark('W', at, seqno);
++	gc_w(0x0807, at);                                    /* CP_RB_WPTR */
++	return at;
++}
++
++/* 200 ms for the fence; 0 when memptrs+4 reads seqno */
++static int
++gc_wait(uint32_t seqno, uint32_t *polls)
++{
++	volatile uint32_t *memp = (volatile uint32_t *)(void *)(gc.buf + GC_MEMP_OFF);
++
++	for (*polls = 0; *polls < 2000; (*polls)++) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (memp[1] == seqno) {
++			return 0;
++		}
++		IODelay(100);
++	}
++	return -1;
++}
++
++int
++pong_gpu_cp_init(char *reply, size_t cap)
++{
++	static int tries;
++	const uint8_t *fw = NULL;
++	uint32_t fw_len = 0, why = 0, polls1 = 0, polls2 = 0, at = 0, mark = 0, sptp = 0;
++	int rc = -1;
++	const char *stop = "none";
++	volatile uint32_t *memp, *scr;
++
++	(void)gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp);
++	if (gg.attempted != 1 || !gg_gx_ok || (sptp & 0xc0u)) {
++		snprintf(reply, cap, "cpinit: stop=no_gx gmu=%d gx=%d sptprac=%#x (gmustart, then gxon)\n", gg.attempted, gg_gx_ok, sptp);
++		return -1;
++	}
++	if (tries++) {
++		snprintf(reply, cap, "cpinit: stop=once_per_boot step=%u\n", gc.step);
++		return -1;
++	}
++	if (pong_fw_lookup("a650_sqe.fw", &fw, &fw_len) != 0 || !fw || fw_len < 8 || fw_len - 4 > GC_RING_OFF) {
++		tries = 0;   /* nothing touched yet: fwput it and run again */
++		snprintf(reply, cap, "cpinit: stop=sqe_missing len=%u\n", fw_len);
++		return -1;
++	}
++	gc.step = 1;
++	gg_mark('c', 1, 0);
++	gc.core = ml_io_map(GC_CORE_PHYS, GC_CORE_BYTES);
++	if (gc_memory()) {
++		stop = "memory";
++		goto out;
++	}
++	gc.step = 2;
++	gg_mark('c', 2, 0);
++	if (gc_smmu(&why)) {
++		stop = "smmu";
++		goto out;
++	}
++	gc.step = 3;                                         /* the SQE without its first dword, read back */
++	gg_mark('c', 3, fw_len);
++	for (uint32_t i = 0; i < fw_len - 4; i++) {
++		gc.buf[GC_SQE_OFF + i] = fw[4 + i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < fw_len - 4 && !gc.sqe_bad; i++) {
++		if (gc.buf[GC_SQE_OFF + i] != fw[4 + i]) {
++			gc.sqe_bad = i + 1;
++		}
++	}
++	if (gc.sqe_bad) {
++		stop = "sqe_readback";
++		goto out;
++	}
++	gc.step = 4;
++	gg_mark('c', 4, 0);
++	gc_hw_init();
++	gc_w64(0x0830, GC_IOVA + GC_SQE_OFF);                /* CP_SQE_INSTR_BASE, before CP_SQE_CNTL */
++	if (gc_r(0x0830) != (uint32_t)(GC_IOVA + GC_SQE_OFF) || gc_r(0x0844) != 0x6eu) {
++		stop = "hwinit_readback";
++		goto out;
++	}
++	gc.step = 5;                                         /* ring 0: BASE, CNTL (BUFSZ 12, BLKSZ 2, NO_UPDATE), RPTR_ADDR, WPTR, SCRATCH(2) */
++	gg_mark('c', 5, 0);
++	gc_w64(0x0800, GC_IOVA + GC_RING_OFF);
++	gc_w(0x0802, 12u | (2u << 8) | (1u << 27));
++	gc_w64(0x0804, GC_IOVA + GC_MEMP_OFF);
++	gc_w(0x0807, 0);
++	gc_w(0x0885, 0);
++	if (gc_r(0x0802) != (12u | (2u << 8) | (1u << 27)) || gc_r(0x0806) != 0) {
++		stop = "ring_readback";
++		goto out;
++	}
++	gc.step = 6;                                         /* start the microcode, then CP_ME_INIT (a6xx_cp_init) with fence 1 */
++	gg_mark('c', 6, 0);
++	gc_w(0x0808, 1);                                     /* CP_SQE_CNTL */
++	IODelay(1000);
++	if ((gg_rd(gc_cb0(), GG_CB_FSR) & 0xc00001feu) || gc_r(0x0821)) {
++		stop = "sqe_start_fault";
++		goto out;
++	}
++	{
++		const uint32_t me_init[9] = { gc_pkt7(0x48, 8), 0x2f, 0x00000003, 0x20000000, 0, 0, 0, 0, 0 };
++
++		at = gc_submit(0, me_init, 9, 1);
++	}
++	if (gc_wait(1, &polls1)) {
++		stop = "me_init_fence";
++		goto out;
++	}
++	gc.step = 7;                                         /* CP_MEM_WRITE of the marker into the scratch page, fence 2 */
++	gg_mark('c', 7, 0);
++	scr = (volatile uint32_t *)(void *)(gc.buf + GC_SCR_OFF);
++	scr[0] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	{
++		const uint64_t dst = GC_IOVA + GC_SCR_OFF;
++		const uint32_t w[4] = { gc_pkt7(0x3d, 3), (uint32_t)dst, (uint32_t)(dst >> 32), GC_MARK };
++
++		at = gc_submit(at, w, 4, 2);
++	}
++	if (gc_wait(2, &polls2)) {
++		stop = "mem_write_fence";
++		goto out;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	mark = scr[0];
++	if (mark != GC_MARK) {
++		stop = "marker";
++		goto out;
++	}
++	gc.step = 8;
++	rc = 0;
++out:
++	gg_mark('d', gc.step, (uint32_t)rc);
++	memp = gc.buf ? (volatile uint32_t *)(void *)(gc.buf + GC_MEMP_OFF) : NULL;
++	{
++		const vm_offset_t cb0 = gc_cb0();
++		const int core = gc.core != 0 && gc.step >= 4;
++
++		snprintf(reply, cap,
++		    "cpinit: status=%d step=%u stop=%s why=%u rb=%#x:%#x smr0=%#x s2cr0=%#x>%#x actlr=%#x sqe=%u bad=%u"
++		    " wptr=%u rptr=%#x fence=%u polls=%u/%u mark=%#x scratch2=%#x rbbm=%#x int0=%#x hwfault=%#x cpint=%#x prot=%#x"
++		    " cb0[sctlr=%#x fsr=%#x far=%#x:%#x fsynr=%#x] gfsr=%#x\n",
++		    rc, gc.step, stop, why, gc.rb_off, gc.rb_got, gg_rd(gg.smmu, GG_SMR(GC_SLOT)), gc.s2_orig,
++		    gg_rd(gg.smmu, GG_S2CR(GC_SLOT)), gc.actlr, fw_len ? fw_len - 4 : 0, gc.sqe_bad, at,
++		    core ? gc_r(0x0806) : 0, memp ? memp[1] : 0, polls1, polls2, mark, core ? gc_r(0x0885) : 0,
++		    core ? gc_r(0x0210) : 0, core ? gc_r(0x0201) : 0, core ? gc_r(0x0821) : 0, core ? gc_r(0x0823) : 0,
++		    core ? gc_r(0x0824) : 0, gg_rd(cb0, GG_CB_SCTLR), gg_rd(cb0, GG_CB_FSR), gg_rd(cb0, GG_CB_FAR + 4),
++		    gg_rd(cb0, GG_CB_FAR), gg_rd(cb0, GG_CB_FSYNR0), gg_rd(gg.smmu, 0x48));
++	}
++	return rc;
++}
++
+ #endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 3ef5820..b004316 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -96,6 +96,7 @@ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
+ extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpuprobe gxon` (pong_gpu_gmu.c) */
++extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpuprobe cpinit` (pong_gpu_gmu.c) */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+ extern int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);   /* `stackshot <pid>`, `stackget <offset>` */
+ extern int pong_publish_bare_accelerator(void);   /* drivers/PongAdreno/PongAdrenoAccelerator.cpp */
+@@ -2006,6 +2007,12 @@ dispatch_command(const char *cmd)
+ 		gx_reply[0] = '\0';
+ 		(void)pong_gpu_gmu_gx(1, gx_reply, sizeof(gx_reply));
+ 		send_str(gx_reply[0] ? gx_reply : "gxon: no reply\n");
++	} else if (strcmp(cmd, "gpuprobe cpinit") == 0) {
++		static char cp_reply[640];
++
++		cp_reply[0] = '\0';
++		(void)pong_gpu_cp_init(cp_reply, sizeof(cp_reply));
++		send_str(cp_reply[0] ? cp_reply : "cpinit: no reply\n");
+ 	} else if (strcmp(cmd, "adspup") == 0) {
+ 		/* the audio DSP's shared memory, read only (bsd/dev/pong_adsp.c) */
+ 		char adsp_reply[896];
