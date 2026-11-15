@@ -1275,10 +1275,10 @@ index 0000000..217b4df
 +POSSIBILITY OF SUCH DAMAGE.
 diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
 new file mode 100644
-index 0000000..9938c22
+index 0000000..fb3e299
 --- /dev/null
 +++ b/bsd/dev/pong_gpu_gmu.c
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,443 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/*
 + * SM-T970 (SM8250, Adreno 650): the GMU cold start, `gpuprobe gmustart` (mode 11 of pong_gpu_probe.c).
@@ -1291,7 +1291,7 @@ index 0000000..9938c22
 + *      the device tree's mask 0x400 (0x84000005: this SMMU took that pair and refused the precedent's two exact routes,
 + *      `gpuprobe gsmmu` 11-13). Non-coherent table walks and Normal non-cacheable memory, as the precedent;
 + *   2. the GMU's four memory regions (a6xx_gmu_init for the a650): the instruction cache region at IOVA 0x4000
-+ *      (64 KiB, the least A650Gmu.c takes), the dummy page at 0x60000000, the log (16 KiB) at 0x60004000 and the HFI
++ *      (to 0x160000, executable: the firmware's blocks and working RAM reach 0x15ffff), the dummy page at 0x60000000, the log (16 KiB) at 0x60004000 and the HFI
 + *      queues (16 KiB) at 0x60008000, in one wired kernel block whose pages are write-combining for the CPU;
 + *   3. the HFI startup tables from the AOP command DB: the gfx/mx/cx ARC level tables and the MC0/SH0/ACV/CN0 BCM
 + *      addresses (A650GmuBuildStartup);
@@ -1363,11 +1363,14 @@ index 0000000..9938c22
 +#define GG_MAIR0        0x44u               /* attr 0: Normal non-cacheable */
 +#define GG_SCTLR        0x27u               /* CFRE AFE TRE M */
 +#define GG_LEAF         0x0060000000000c43ull   /* 4 KiB page, AP EL0 RW, AF, nG, XN; non-shareable, attr 0 */
++#define GG_LEAF_X       0x0000000000000c43ull   /* the same, executable: the icache region (the GMU fetches from it) */
 +#define GG_WIMG_WCOMB   0x6u
 +
 +/* ---- the GMU's memory: one block, its IOVAs ---- */
 +#define GG_ICACHE_IOVA  0x00004000ull
-+#define GG_ICACHE_BYTES 0x10000u
++#define GG_ICACHE_BYTES 0x15c000u           /* to 0x160000: a650_gmu.bin has a block at 0x157000 and declares working RAM
++                                             * at 0x144000 (0x13000) and 0x157000 (0x9000), where the GMU runs code (CakeAL
++                                             * UniXNU-sm-t970 v127: privileged fetches at 0x153e00/0x154600) */
 +#define GG_DUMMY_IOVA   0x60000000ull
 +#define GG_DUMMY_BYTES  0x1000u
 +#define GG_LOG_IOVA     0x60004000ull
@@ -1509,7 +1512,7 @@ index 0000000..9938c22
 +gg_memory(void)
 +{
 +	uint64_t *t;
-+	uint64_t pa_of[GG_BLOCK_BYTES / 4096];
++	static uint64_t pa_of[GG_BLOCK_BYTES / 4096];   /* static: a kernel stack is 16 KiB (CakeAL v126 overflowed one) */
 +
 +	gg.block = kalloc_data(GG_BLOCK_BYTES + PAGE_SIZE, Z_WAITOK | Z_ZERO);
 +	if (!gg.block) {
@@ -1547,7 +1550,7 @@ index 0000000..9938c22
 +	t[512 + 0] = (gg.table_pa + 0x3000) | 3;
 +	t[1024 + ((GG_DUMMY_IOVA >> 21) & 511u)] = (gg.table_pa + 0x4000) | 3;
 +	for (uint32_t i = 0; i < GG_ICACHE_BYTES / 4096; i++) {
-+		t[1536 + ((GG_ICACHE_IOVA >> 12) & 511u) + i] = (pa_of[i] & 0x0000fffffffff000ull) | GG_LEAF;
++		t[1536 + ((GG_ICACHE_IOVA >> 12) & 511u) + i] = (pa_of[i] & 0x0000fffffffff000ull) | GG_LEAF_X;
 +	}
 +	{
 +		const uint32_t first = GG_ICACHE_BYTES / 4096, pages = (GG_DUMMY_BYTES + GG_LOG_BYTES + GG_HFI_BYTES) / 4096;
