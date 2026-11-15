@@ -173,6 +173,20 @@ ACCEL_CPP_REPLACEMENTS = (
 )
 
 
+PUBLISH_CPP_REPLACEMENTS = (
+    # USB `metaldiag` (kernel z91): what the Metal plugin and its processes did, from the diagnostic table above
+    ('extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */\n}\n',
+     'extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */\n}\n'
+     'extern "C" int pong_metal_diag_usb(char *out,size_t cap)\n{\n'
+     '    const NativeAdrenoMetalDiag &d=native_adreno_metal_diag;\n'
+     '    return snprintf(out,cap,"metaldiag: opens=%u closes=%u busy=%u bad=%u grants=%u calls=%u last=%u/%#x attach=%#x props=%u names=%u reports=%u"\n'
+     '        " foreign=%u/%#x\\n openers=%s,%s,%s readers=%s,%s,%s name_reader=%s starters=%s,%s,%s\\n report=%s\\n report2=%s\\n",\n'
+     '        d.opens,d.closes,d.busy,d.bad,d.grants,d.calls,d.last_selector,d.last_status,d.attach_status,d.property_reads,d.name_reads,d.reports,\n'
+     '        d.foreign_opens,d.foreign_type,d.opener[0],d.opener[1],d.opener[2],d.reader[0],d.reader[1],d.reader[2],d.name_reader,\n'
+     '        d.starter[0],d.starter[1],d.starter[2],d.report,d.report2);\n}\n'),
+)
+
+
 def apply_replacements(path: Path, pairs: tuple[tuple[str, str], ...]) -> bool:
     if not path.is_file():
         return False
@@ -208,6 +222,7 @@ def patch_pong_adreno(adreno_source: Path) -> None:
         ('submit/NativeAdrenoSmmuContext.cpp', SMMUCTX_CPP_REPLACEMENTS),
         ('submit/NativeAdrenoIrq.cpp', IRQ_CPP_REPLACEMENTS),
         ('PongAdrenoAccelerator.cpp', ACCEL_CPP_REPLACEMENTS),
+        ('submit/NativeAdrenoPublish.cpp', PUBLISH_CPP_REPLACEMENTS),
     ):
         target = root / rel
         if apply_replacements(target, pairs):

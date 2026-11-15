@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 74120ef..35093b1 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -100,6 +100,7 @@ extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpupro
+ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpuprobe cpzap` (pong_gpu_gmu.c) */
+ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
+ extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
++extern int pong_metal_diag_usb(char *out, size_t cap);   /* `metaldiag` (NativeAdrenoPublish.cpp, T970 patch) */
+ extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+@@ -2031,6 +2032,12 @@ dispatch_command(const char *cmd)
+ 		gs_reply[0] = '\0';
+ 		(void)pong_t970_gpu_start(gs_reply, sizeof(gs_reply));
+ 		send_str(gs_reply[0] ? gs_reply : "gpustart: no reply\n");
++	} else if (strcmp(cmd, "metaldiag") == 0) {
++		static char md_reply[700];
++
++		md_reply[0] = '\0';
++		(void)pong_metal_diag_usb(md_reply, sizeof(md_reply));
++		send_str(md_reply[0] ? md_reply : "metaldiag: not linked\n");
+ 	} else if (strncmp(cmd, "fsput ", 6) == 0 || strncmp(cmd, "fsmkdir ", 8) == 0 || strncmp(cmd, "fsstat ", 7) == 0 ||
+ 	    strncmp(cmd, "fssum ", 6) == 0) {
+ 		static char fs_reply[320];
