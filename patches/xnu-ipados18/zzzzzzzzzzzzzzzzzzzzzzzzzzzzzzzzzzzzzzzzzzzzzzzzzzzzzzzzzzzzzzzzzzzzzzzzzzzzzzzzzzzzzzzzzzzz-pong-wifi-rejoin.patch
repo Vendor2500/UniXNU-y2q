@@ -1,0 +1,157 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 35093b1..a9bd121 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -101,6 +101,7 @@ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpupro
+ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
+ extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ extern int pong_metal_diag_usb(char *out, size_t cap);   /* `metaldiag` (NativeAdrenoPublish.cpp, T970 patch) */
++extern int pong_wifi_join_usb(char *reply, size_t cap);   /* `wifijoin` (pong_wifi_tools.c, z92) */
+ extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+@@ -2032,6 +2033,11 @@ dispatch_command(const char *cmd)
+ 		gs_reply[0] = '\0';
+ 		(void)pong_t970_gpu_start(gs_reply, sizeof(gs_reply));
+ 		send_str(gs_reply[0] ? gs_reply : "gpustart: no reply\n");
++	} else if (strcmp(cmd, "wifijoin") == 0) {
++		char wj_reply[160];
++
++		(void)pong_wifi_join_usb(wj_reply, sizeof(wj_reply));
++		send_str(wj_reply);
+ 	} else if (strcmp(cmd, "metaldiag") == 0) {
+ 		static char md_reply[700];
+ 
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index b8de386..fbb1f56 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -346,6 +346,8 @@ wt_idle_forever(void)
+ 	}
+ }
+ 
++static void wifi_join_loop(void);   /* below: save the daemon's last join, join it again after a restart (z92) */
++
+ static void
+ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -380,7 +382,7 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 	wt.auto_state = 2;
+ 	native_wifi_logf(6, "wifi-auto: firmware loaded from the Data volume after %d tries (%u+%u+%u+%u bytes); %s",
+ 	    wt.auto_tries + 1, wt.len[0], wt.len[1], wt.len[2], wt.len[3], reply);
+-	wt_idle_forever();
++	wifi_join_loop();
+ }
+ 
+ /*
+@@ -1390,3 +1392,110 @@ pong_fs_usb(char *reply, size_t cap, const char *cmd)
+ 	}
+ 	return e;
+ }
++
++/*
++ * Wi-Fi rejoin after a restart (z92). iOS's wifid does not join the remembered network by itself after a restart (it scans
++ * and sends only requests 481/483). PongWifiNet.cpp keeps the last join the daemon asked for (name, and the passphrase or the
++ * 64 hex digits of the PMK the daemon derived). Once that join is up it is saved here, root only, 0600; after the next boot,
++ * 30 s after the stack started and then every minute for ten minutes, the same join is asked for when the network is in the
++ * scan results and the daemon has neither joined nor left anything. Neither the name nor the key reaches a log.
++ * Boot argument pong_wifi_rejoin=0 turns the asking off (saving stays). `wifijoin` shows the state.
++ */
++#define WJ_PATH  "/private/var/pong/wifi-join"
++#define WJ_MAGIC 0x314a5750u   /* "PWJ1" */
++extern unsigned pong_wifi_last_join(uint8_t *ssid, unsigned *ssid_len, char *pass, unsigned *pass_len, unsigned *daemon_ops,
++    int *state, int *same);                                                   /* PongWifiNet.cpp (scripts/t970_wifi_rejoin_edits.py) */
++extern int pong_wifi_rejoin(const uint8_t *ssid, unsigned ssid_len, const char *pass, unsigned pass_len);
++
++struct wj_record {
++	uint32_t magic;
++	uint8_t  ssid_len, pass_len, pad[2];
++	uint8_t  ssid[32];
++	char     pass[68];
++};
++static struct {
++	int loaded, saves, tries, last_rc, state, ops;
++	unsigned seq;
++} wj;
++
++static int
++wj_file(struct wj_record *r, int write)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int e = vnode_open(WJ_PATH, write ? (O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW) : (FREAD | O_NOFOLLOW), S_IRUSR | S_IWUSR,
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++
++	if (e == 0) {
++		int resid = 0, e2;
++
++		e = vn_rdwr(write ? UIO_WRITE : UIO_READ, vp, (caddr_t)r, (int)sizeof(*r), 0, UIO_SYSSPACE,
++		    IO_NODELOCKED | (write ? IO_UNIT | IO_SYNC : 0), vfs_context_ucred(ctx), &resid, current_proc());
++		if (e == 0 && resid != 0) {
++			e = EIO;
++		}
++		e2 = vnode_close(vp, write ? FWRITE : FREAD, ctx);
++		if (e == 0) {
++			e = e2;
++		}
++	}
++	vfs_context_rele(ctx);
++	return e;
++}
++
++static void
++wifi_join_loop(void)
++{
++	struct wj_record saved, cur;
++	uint32_t ask = 1;
++	unsigned saved_seq = 0;
++
++	(void)PE_parse_boot_argn("pong_wifi_rejoin", &ask, sizeof(ask));
++	bzero(&saved, sizeof(saved));
++	wj.loaded = wj_file(&saved, 0) == 0 && saved.magic == WJ_MAGIC && saved.ssid_len && saved.ssid_len <= 32 && saved.pass_len <= 64;
++	if (!wj.loaded) {
++		bzero(&saved, sizeof(saved));
++	}
++	native_wifi_logf(6, "wifi-join: saved network %s, asking %s", wj.loaded ? "present" : "absent", ask ? "on" : "off");
++	for (unsigned tick = 1;; tick++) {
++		unsigned ssid_len = 0, pass_len = 0, ops = 0, seq;
++		int state = 0, same = 0;
++
++		delay_for_interval(10000, 1000000u);
++		bzero(&cur, sizeof(cur));
++		seq = pong_wifi_last_join(cur.ssid, &ssid_len, cur.pass, &pass_len, &ops, &state, &same);
++		wj.seq = seq;
++		wj.state = state;
++		wj.ops = (int)ops;
++		if (seq && seq != saved_seq && same && ssid_len <= 32 && pass_len <= 64) {
++			cur.magic = WJ_MAGIC;
++			cur.ssid_len = (uint8_t)ssid_len;
++			cur.pass_len = (uint8_t)pass_len;
++			saved_seq = seq;
++			if (memcmp(&cur, &saved, sizeof(cur)) != 0) {
++				int e = wj_file(&cur, 1);
++
++				wj.saves += e == 0;
++				native_wifi_logf(6, "wifi-join: saved the network the daemon joined (%d)", e);
++				if (e == 0) {
++					saved = cur;
++					wj.loaded = 1;
++				}
++			}
++		}
++		bzero(&cur, sizeof(cur));
++		if (ask && wj.loaded && !ops && state < 3 && tick >= 3 && tick <= 63 && (tick - 3) % 6 == 0) {
++			wj.last_rc = pong_wifi_rejoin(saved.ssid, saved.ssid_len, saved.pass, saved.pass_len);
++			wj.tries++;
++		}
++	}
++}
++
++int pong_wifi_join_usb(char *reply, size_t cap);
++
++int
++pong_wifi_join_usb(char *reply, size_t cap)
++{
++	return snprintf(reply, cap, "wifijoin: saved %d saves %d tries %d last %d seq %u daemon joins/leaves %d state %d\n",
++	           wj.loaded, wj.saves, wj.tries, wj.last_rc, wj.seq, wj.ops, wj.state);
++}

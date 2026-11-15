@@ -123,6 +123,12 @@ NET_TAIL = ('\nextern "C" void pong_wifi_net_traffic(void);\n'
             '}\n')
 
 
+# z92: rejoin the last network after a restart (scripts/t970_wifi_rejoin_edits.py)
+from t970_wifi_rejoin_edits import REJOIN_EDITS, REJOIN_TAIL   # noqa: E402
+NET_EDITS = NET_EDITS + REJOIN_EDITS
+NET_TAIL = NET_TAIL + REJOIN_TAIL
+
+
 def network_source(out):
     text = (ROOT / 'drivers/PongWifi/PongWifiNet.cpp').read_text(encoding='utf-8')
     for old, new in NET_EDITS:
