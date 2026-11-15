@@ -1,0 +1,240 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index a5ec61c..74120ef 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -100,6 +100,7 @@ extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpupro
+ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpuprobe cpzap` (pong_gpu_gmu.c) */
+ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
+ extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
++extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+@@ -2030,6 +2031,13 @@ dispatch_command(const char *cmd)
+ 		gs_reply[0] = '\0';
+ 		(void)pong_t970_gpu_start(gs_reply, sizeof(gs_reply));
+ 		send_str(gs_reply[0] ? gs_reply : "gpustart: no reply\n");
++	} else if (strncmp(cmd, "fsput ", 6) == 0 || strncmp(cmd, "fsmkdir ", 8) == 0 || strncmp(cmd, "fsstat ", 7) == 0 ||
++	    strncmp(cmd, "fssum ", 6) == 0) {
++		static char fs_reply[320];
++
++		fs_reply[0] = '\0';
++		(void)pong_fs_usb(fs_reply, sizeof(fs_reply), cmd);
++		send_str(fs_reply[0] ? fs_reply : "fs: no reply\n");
+ 	} else if (strcmp(cmd, "gpuauto") == 0 || strcmp(cmd, "gpusave") == 0) {
+ 		static char ga_reply[1500];
+ 
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 74234ea..b8de386 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -23,6 +23,7 @@
+ #include <kern/debug.h>
+ #include <sys/vnode.h>
+ #include <sys/kauth.h>
++#include <sys/mount.h>
+ #include <sys/proc.h>
+ #include <sys/socket.h>
+ #include <sys/kpi_socket.h>
+@@ -1214,3 +1215,178 @@ pong_stackshot_usb(char *reply, size_t cap, const char *cmd)
+ 		return 0;
+ 	}
+ }
++
++/*
++ * Files over USB (z89): userland pieces that are not in the root image (the Metal bundle) go to the device without the
++ * TWRP/root-image round trip. Data arrives with `fwput NAME` (8 MiB a slot); then
++ *   fsput NAME OFF PATH   writes slot NAME at byte OFF of PATH (OFF 0 creates/truncates; mode 0755, owner root)
++ *   fsmkdir PATH          mkdir 0755
++ *   fsstat PATH           size, mode, uid and whether its file system is read-only
++ *   fssum PATH            size and CRC-32 (zlib's) of the whole file, to compare with the PC's copy
++ */
++extern int pong_kernel_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c */
++
++static uint32_t
++fs_crc(uint32_t crc, const uint8_t *p, size_t n)
++{
++	crc = ~crc;
++	while (n--) {
++		crc ^= *p++;
++		for (int k = 0; k < 8; k++) {
++			crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++		}
++	}
++	return ~crc;
++}
++
++static const char *
++fs_word(const char *s, char *out, size_t cap)
++{
++	size_t n = 0;
++
++	while (*s == ' ') {
++		s++;
++	}
++	while (*s && *s != ' ') {
++		if (n + 1 < cap) {
++			out[n++] = *s;
++		}
++		s++;
++	}
++	out[n] = '\0';
++	return s;
++}
++
++static int
++fs_put(const char *path, const uint8_t *data, uint32_t len, off_t off)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int e = vnode_open(path, O_CREAT | (off == 0 ? O_TRUNC : 0) | FWRITE | O_NOFOLLOW, 0755, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++
++	if (e == 0) {
++		int resid = 0, e2;
++
++		e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, off, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC,
++		    vfs_context_ucred(ctx), &resid, current_proc());
++		if (e == 0 && resid != 0) {
++			e = EIO;
++		}
++		e2 = vnode_close(vp, FWRITE, ctx);
++		if (e == 0) {
++			e = e2;
++		}
++	}
++	vfs_context_rele(ctx);
++	return e;
++}
++
++static int
++fs_sum(const char *path, uint64_t *size, uint32_t *crc)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	const uint32_t chunk = 256u << 10;
++	uint8_t *buf = NULL;
++	int e = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++
++	*size = 0;
++	*crc = 0;
++	if (e == 0) {
++		buf = kalloc_data(chunk, Z_WAITOK);
++		if (!buf) {
++			e = ENOMEM;
++		}
++		while (e == 0) {
++			int resid = 0;
++
++			e = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)chunk, (off_t)*size, UIO_SYSSPACE, IO_NODELOCKED,
++			    vfs_context_ucred(ctx), &resid, current_proc());
++			if (e != 0 || resid == (int)chunk) {
++				break;
++			}
++			*crc = fs_crc(*crc, buf, chunk - (uint32_t)resid);
++			*size += chunk - (uint32_t)resid;
++		}
++		if (buf) {
++			kfree_data(buf, chunk);
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	vfs_context_rele(ctx);
++	return e;
++}
++
++int pong_fs_usb(char *reply, size_t cap, const char *cmd);
++
++int
++pong_fs_usb(char *reply, size_t cap, const char *cmd)
++{
++	char verb[16], a[40], b[24], path[200];
++	const char *s = fs_word(cmd, verb, sizeof(verb));
++	int e;
++
++	if (strcmp(verb, "fsput") == 0) {
++		const uint8_t *data = NULL;
++		uint32_t len = 0;
++		uint64_t off = 0;
++
++		s = fs_word(s, a, sizeof(a));
++		s = fs_word(s, b, sizeof(b));
++		(void)fs_word(s, path, sizeof(path));
++		for (const char *p = b; *p; p++) {
++			if (*p < '0' || *p > '9') {
++				(void)snprintf(reply, cap, "fsput: bad offset\n");
++				return -1;
++			}
++			off = off * 10 + (uint64_t)(*p - '0');
++		}
++		if (!a[0] || !b[0] || path[0] != '/' || pong_fw_lookup(a, &data, &len) != 0 || !data || !len) {
++			(void)snprintf(reply, cap, "fsput: usage fsput SLOT OFF /PATH (slot from fwput)\n");
++			return -1;
++		}
++		e = fs_put(path, data, len, (off_t)off);
++		(void)snprintf(reply, cap, "fsput: %s %u @%llu -> %s e=%d\n", a, len, (unsigned long long)off, path, e);
++		return e;
++	}
++	(void)fs_word(s, path, sizeof(path));
++	if (path[0] != '/') {
++		(void)snprintf(reply, cap, "%s: absolute path needed\n", verb);
++		return -1;
++	}
++	if (strcmp(verb, "fsmkdir") == 0) {
++		e = pong_kernel_mkdir(path, 0755);
++		(void)snprintf(reply, cap, "fsmkdir: %s e=%d\n", path, e);
++		return e;
++	}
++	if (strcmp(verb, "fssum") == 0) {
++		uint64_t size;
++		uint32_t crc;
++
++		e = fs_sum(path, &size, &crc);
++		(void)snprintf(reply, cap, "fssum: %s size=%llu crc=%08x e=%d\n", path, (unsigned long long)size, crc, e);
++		return e;
++	}
++	{
++		vfs_context_t ctx = vfs_context_create(NULL);
++		vnode_t vp = NULLVP;
++		struct vnode_attr va;
++
++		e = vnode_lookup(path, 0, &vp, ctx);
++		if (e == 0) {
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_data_size);
++			VATTR_WANTED(&va, va_mode);
++			VATTR_WANTED(&va, va_uid);
++			e = vnode_getattr(vp, &va, ctx);
++			(void)snprintf(reply, cap, "fsstat: %s size=%llu mode=%o uid=%u ro=%d dir=%d e=%d\n", path,
++			    (unsigned long long)va.va_data_size, (unsigned)va.va_mode, (unsigned)va.va_uid,
++			    vfs_isrdonly(vnode_mount(vp)), vnode_isdir(vp), e);
++			vnode_put(vp);
++		} else {
++			(void)snprintf(reply, cap, "fsstat: %s e=%d\n", path, e);
++		}
++		vfs_context_rele(ctx);
++	}
++	return e;
++}
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 8f4c284..b006d57 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -10205,6 +10205,18 @@ mkdir_extended(proc_t p, struct mkdir_extended_args *uap, __unused int32_t *retv
+ 	return ciferror;
+ }
+ 
++/* SM-T970 (z89): mkdir of a kernel path for the USB `fsmkdir` command (bsd/dev/pong_wifi_tools.c) */
++int pong_kernel_mkdir(const char *path, int mode);
++int
++pong_kernel_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
+ int
+ mkdir(proc_t p, struct mkdir_args *uap, __unused int32_t *retval)
+ {

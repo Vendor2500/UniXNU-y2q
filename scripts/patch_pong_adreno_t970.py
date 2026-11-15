@@ -162,6 +162,17 @@ IRQ_CPP_REPLACEMENTS = (
 )
 
 
+ACCEL_CPP_REPLACEMENTS = (
+    # pong_metal_plugin=NAME: where Metal looks for the plugin bundle (MetalPluginName, relative to
+    # /System/Library/Extensions); lets the SM-T970 keep it on the Data volume while the OS volume is read-only.
+    ('extern "C" void PongAdrenoAcceleratorStaticInit(void);\n',
+     'extern "C" void PongAdrenoAcceleratorStaticInit(void);\nextern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);\n'),
+    ('    service->setProperty("MetalPluginName","PongAdrenoMetal");\n',
+     '    {char plugin[96]="PongAdrenoMetal";(void)PE_parse_boot_argn("pong_metal_plugin",plugin,sizeof(plugin));\n'
+     '     service->setProperty("MetalPluginName",plugin);}\n'),
+)
+
+
 def apply_replacements(path: Path, pairs: tuple[tuple[str, str], ...]) -> bool:
     if not path.is_file():
         return False
@@ -196,6 +207,7 @@ def patch_pong_adreno(adreno_source: Path) -> None:
         ('submit/NativeAdrenoCpInit.cpp', CPINIT_CPP_REPLACEMENTS),
         ('submit/NativeAdrenoSmmuContext.cpp', SMMUCTX_CPP_REPLACEMENTS),
         ('submit/NativeAdrenoIrq.cpp', IRQ_CPP_REPLACEMENTS),
+        ('PongAdrenoAccelerator.cpp', ACCEL_CPP_REPLACEMENTS),
     ):
         target = root / rel
         if apply_replacements(target, pairs):
