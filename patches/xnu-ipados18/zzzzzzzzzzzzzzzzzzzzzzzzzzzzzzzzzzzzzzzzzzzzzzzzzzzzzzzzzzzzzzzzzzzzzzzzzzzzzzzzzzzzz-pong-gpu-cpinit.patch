@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
-index bbd3708..749b8e7 100644
+index bbd3708..2fdba64 100644
 --- a/bsd/dev/pong_gpu_gmu.c
 +++ b/bsd/dev/pong_gpu_gmu.c
 @@ -24,6 +24,13 @@
@@ -40,7 +40,7 @@ index bbd3708..749b8e7 100644
  	gg_mark('Y', (uint32_t)st, r.gx_after);
  	{
  		const vm_offset_t cb = gg_cb();
-@@ -585,4 +595,480 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
+@@ -585,4 +595,536 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
  	return st == A650GmuSuccess ? 0 : -1;
  }
  
@@ -62,7 +62,8 @@ index bbd3708..749b8e7 100644
 +#define GC_SMR_VAL      0x84010000u          /* valid, mask 0x401, stream 0: streams 0, 1, 0x400, 0x401 */
 +#define GC_TCR          0x80802020u          /* TG1 4K, EPD1, SH0 outer, non-cacheable walks, T0SZ 32 (ArmSmmu4KContext.c) */
 +#define GC_MAIR0        0xff44u
-+#define GC_SCTLR        0x27u                /* CFRE AFE TRE M; no fault interrupt here */
++#define GC_SCTLR        0x127u               /* HUPCF CFRE AFE TRE M; CFCFG (bit 7) 0 = terminate, no stall
++                                             * (ArmSmmu4KContext.c 0x1067 | continue_after_fault << 8, less CFIE) */
 +#define GC_MARK         0xa6500c0du
 +
 +static struct {
@@ -70,7 +71,8 @@ index bbd3708..749b8e7 100644
 +	uint8_t *buf;
 +	uint64_t *table;
 +	IOPhysicalAddress table_pa;
-+	uint32_t rb_off, rb_got, s2_orig, actlr, sqe_bad, step;
++	uint32_t rb_off, rb_got, s2_orig, actlr, sqe_bad, step, routes;
++	int mem_ok;
 +} gc;
 +
 +static inline void
@@ -199,7 +201,7 @@ index bbd3708..749b8e7 100644
 +		*why = 4;
 +		return -1;
 +	}
-+	tcr2 = (gg_rd(cb, GG_CB_TCR2) & ~0x38017u) | 0x38010u | (idr2 & 0xfu);
++	tcr2 = (gg_rd(cb, GG_CB_TCR2) & ~0x38017u) | 0x38010u | ((idr2 >> 4) & 0xfu);
 +	{
 +		struct { vm_offset_t base; uint32_t off, val, ignore; } w[11] = {
 +			{ gg.smmu, page + 0x800 + GG_CBAR(GC_BANK), 1u, 0 },
@@ -245,6 +247,7 @@ index bbd3708..749b8e7 100644
 +	}
 +	gg_wr(gg.smmu, GG_S2CR(GC_SLOT), GC_BANK);   /* translate through bank 0, before the SMR goes valid */
 +	if ((gg_rd(gg.smmu, GG_S2CR(GC_SLOT)) & 0x0c0300ffu) != GC_BANK) {
++		gc.rb_off = GG_S2CR(GC_SLOT);
 +		gc.rb_got = gg_rd(gg.smmu, GG_S2CR(GC_SLOT));
 +		gg_wr(gg.smmu, GG_S2CR(GC_SLOT), gc.s2_orig);
 +		gg_wr(cb, GG_CB_SCTLR, 0);
@@ -252,15 +255,48 @@ index bbd3708..749b8e7 100644
 +		return -1;
 +	}
 +	gg_wr(gg.smmu, GG_SMR(GC_SLOT), GC_SMR_VAL);
-+	if (gg_rd(gg.smmu, GG_SMR(GC_SLOT)) != GC_SMR_VAL) {
-+		gc.rb_got = gg_rd(gg.smmu, GG_SMR(GC_SLOT));
-+		gg_wr(gg.smmu, GG_SMR(GC_SLOT), 0);
-+		gg_wr(gg.smmu, GG_S2CR(GC_SLOT), gc.s2_orig);
-+		gg_wr(cb, GG_CB_SCTLR, 0);
-+		*why = 9;
-+		return -1;
++	if (gg_rd(gg.smmu, GG_SMR(GC_SLOT)) == GC_SMR_VAL) {
++		gc.routes = 1;
++		return 0;
 +	}
-+	return 0;
++	gc.rb_off = GG_SMR(GC_SLOT);
++	gc.rb_got = gg_rd(gg.smmu, GG_SMR(GC_SLOT));
++	gg_wr(gg.smmu, GG_SMR(GC_SLOT), 0);
++	{
++		static const uint32_t slot[4] = { 0, 1, 4, 5 }, sid[4] = { 0, 1, 0x400, 0x401 };
++		uint32_t orig[4];
++		unsigned int n;
++
++		for (n = 0; n < 4; n++) {
++			orig[n] = gg_rd(gg.smmu, GG_S2CR(slot[n]));
++			if ((orig[n] & 0x30000u) != 0x20000u) {
++				break;
++			}
++			gg_wr(gg.smmu, GG_S2CR(slot[n]), GC_BANK);
++			if ((gg_rd(gg.smmu, GG_S2CR(slot[n])) & 0x0c0300ffu) != GC_BANK) {
++				gg_wr(gg.smmu, GG_S2CR(slot[n]), orig[n]);
++				break;
++			}
++			gg_wr(gg.smmu, GG_SMR(slot[n]), 0x80000000u | sid[n]);
++			if (gg_rd(gg.smmu, GG_SMR(slot[n])) != (0x80000000u | sid[n])) {
++				gg_wr(gg.smmu, GG_SMR(slot[n]), 0);
++				gg_wr(gg.smmu, GG_S2CR(slot[n]), orig[n]);
++				break;
++			}
++		}
++		if (n == 4) {
++			gc.routes = 4;
++			return 0;
++		}
++		while (n--) {
++			gg_wr(gg.smmu, GG_SMR(slot[n]), 0);
++			gg_wr(gg.smmu, GG_S2CR(slot[n]), orig[n]);
++		}
++	}
++	gg_wr(gg.smmu, GG_S2CR(GC_SLOT), gc.s2_orig);
++	gg_wr(cb, GG_CB_SCTLR, 0);
++	*why = 9;
++	return -1;
 +}
 +
 +/* Linux v6.6 a650_protect (GpuProbe.cpp:697-712): A6XX_PROTECT_RDONLY / _NORDWR; the last entry goes to CP_PROTECT(47) */
@@ -398,26 +434,33 @@ index bbd3708..749b8e7 100644
 +	const char *stop = "none";
 +	volatile uint32_t *memp, *scr;
 +
-+	(void)gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp);
-+	if (gg.attempted != 1 || !gg_gx_ok || (sptp & 0xc0u)) {
++	if (gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp) || gg.attempted != 1 || !gg_gx_ok || (sptp & 0xc0u)) {
 +		snprintf(reply, cap, "cpinit: stop=no_gx gmu=%d gx=%d sptprac=%#x (gmustart, then gxon)\n", gg.attempted, gg_gx_ok, sptp);
 +		return -1;
 +	}
-+	if (tries++) {
++	if (tries) {   /* set at CP_SQE_CNTL: a stop before it leaves the bank off and no route, so it may run again */
 +		snprintf(reply, cap, "cpinit: stop=once_per_boot step=%u\n", gc.step);
 +		return -1;
 +	}
 +	if (pong_fw_lookup("a650_sqe.fw", &fw, &fw_len) != 0 || !fw || fw_len < 8 || fw_len - 4 > GC_RING_OFF) {
-+		tries = 0;   /* nothing touched yet: fwput it and run again */
 +		snprintf(reply, cap, "cpinit: stop=sqe_missing len=%u\n", fw_len);
 +		return -1;
 +	}
 +	gc.step = 1;
 +	gg_mark('c', 1, 0);
-+	gc.core = ml_io_map(GC_CORE_PHYS, GC_CORE_BYTES);
-+	if (gc_memory()) {
-+		stop = "memory";
++	if (!gc.core) {
++		gc.core = ml_io_map(GC_CORE_PHYS, GC_CORE_BYTES);
++	}
++	if (!gc.core) {
++		stop = "iomap";
 +		goto out;
++	}
++	if (!gc.mem_ok) {
++		if (gc_memory()) {
++			stop = "memory";
++			goto out;
++		}
++		gc.mem_ok = 1;
 +	}
 +	gc.step = 2;
 +	gg_mark('c', 2, 0);
@@ -427,6 +470,7 @@ index bbd3708..749b8e7 100644
 +	}
 +	gc.step = 3;                                         /* the SQE without its first dword, read back */
 +	gg_mark('c', 3, fw_len);
++	gc.sqe_bad = 0;
 +	for (uint32_t i = 0; i < fw_len - 4; i++) {
 +		gc.buf[GC_SQE_OFF + i] = fw[4 + i];
 +	}
@@ -444,7 +488,8 @@ index bbd3708..749b8e7 100644
 +	gg_mark('c', 4, 0);
 +	gc_hw_init();
 +	gc_w64(0x0830, GC_IOVA + GC_SQE_OFF);                /* CP_SQE_INSTR_BASE, before CP_SQE_CNTL */
-+	if (gc_r(0x0830) != (uint32_t)(GC_IOVA + GC_SQE_OFF) || gc_r(0x0844) != 0x6eu) {
++	if (gc_r(0x0830) != (uint32_t)(GC_IOVA + GC_SQE_OFF) || gc_r(0x0831) != (uint32_t)((GC_IOVA + GC_SQE_OFF) >> 32) ||
++	    gc_r(0x0844) != 0x6eu) {
 +		stop = "hwinit_readback";
 +		goto out;
 +	}
@@ -455,12 +500,15 @@ index bbd3708..749b8e7 100644
 +	gc_w64(0x0804, GC_IOVA + GC_MEMP_OFF);
 +	gc_w(0x0807, 0);
 +	gc_w(0x0885, 0);
-+	if (gc_r(0x0802) != (12u | (2u << 8) | (1u << 27)) || gc_r(0x0806) != 0) {
++	if (gc_r(0x0802) != (12u | (2u << 8) | (1u << 27)) || gc_r(0x0806) != 0 ||
++	    gc_r(0x0800) != (uint32_t)(GC_IOVA + GC_RING_OFF) || gc_r(0x0801) != (uint32_t)((GC_IOVA + GC_RING_OFF) >> 32) ||
++	    gc_r(0x0804) != (uint32_t)(GC_IOVA + GC_MEMP_OFF) || gc_r(0x0805) != (uint32_t)((GC_IOVA + GC_MEMP_OFF) >> 32)) {
 +		stop = "ring_readback";
 +		goto out;
 +	}
 +	gc.step = 6;                                         /* start the microcode, then CP_ME_INIT (a6xx_cp_init) with fence 1 */
 +	gg_mark('c', 6, 0);
++	tries = 1;
 +	gc_w(0x0808, 1);                                     /* CP_SQE_CNTL */
 +	IODelay(1000);
 +	if ((gg_rd(gc_cb0(), GG_CB_FSR) & 0xc00001feu) || gc_r(0x0821)) {
@@ -505,24 +553,32 @@ index bbd3708..749b8e7 100644
 +	{
 +		const vm_offset_t cb0 = gc_cb0();
 +		const int core = gc.core != 0 && gc.step >= 4;
++		uint32_t sqe_pc = 0, sqe_op = 0;
++
++		if (core && gc.step >= 6) {
++			gc_w(0x0908, 0);                     /* CP_SQE_STAT_ADDR: then the SQE PC and the packet header */
++			sqe_pc = gc_r(0x0909);
++			sqe_op = gc_r(0x0909);
++		}
 +
 +		snprintf(reply, cap,
-+		    "cpinit: status=%d step=%u stop=%s why=%u rb=%#x:%#x smr0=%#x s2cr0=%#x>%#x actlr=%#x sqe=%u bad=%u"
++		    "cpinit: status=%d step=%u stop=%s why=%u rb=%#x:%#x routes=%u smr0=%#x s2cr0=%#x>%#x actlr=%#x>%#x sqe=%u bad=%u"
 +		    " wptr=%u rptr=%#x fence=%u polls=%u/%u mark=%#x scratch2=%#x rbbm=%#x int0=%#x hwfault=%#x cpint=%#x prot=%#x"
-+		    " cb0[sctlr=%#x fsr=%#x far=%#x:%#x fsynr=%#x] gfsr=%#x\n",
-+		    rc, gc.step, stop, why, gc.rb_off, gc.rb_got, gg_rd(gg.smmu, GG_SMR(GC_SLOT)), gc.s2_orig,
-+		    gg_rd(gg.smmu, GG_S2CR(GC_SLOT)), gc.actlr, fw_len ? fw_len - 4 : 0, gc.sqe_bad, at,
++		    " sqe_stat=%#x/%#x pf=%#x rbbm3=%#x cb0[sctlr=%#x fsr=%#x far=%#x:%#x fsynr=%#x/%#x] gfsr=%#x\n",
++		    rc, gc.step, stop, why, gc.rb_off, gc.rb_got, gc.routes, gg_rd(gg.smmu, GG_SMR(GC_SLOT)), gc.s2_orig,
++		    gg_rd(gg.smmu, GG_S2CR(GC_SLOT)), gc.actlr, gg_rd(cb0, 0x4), fw_len ? fw_len - 4 : 0, gc.sqe_bad, at,
 +		    core ? gc_r(0x0806) : 0, memp ? memp[1] : 0, polls1, polls2, mark, core ? gc_r(0x0885) : 0,
 +		    core ? gc_r(0x0210) : 0, core ? gc_r(0x0201) : 0, core ? gc_r(0x0821) : 0, core ? gc_r(0x0823) : 0,
-+		    core ? gc_r(0x0824) : 0, gg_rd(cb0, GG_CB_SCTLR), gg_rd(cb0, GG_CB_FSR), gg_rd(cb0, GG_CB_FAR + 4),
-+		    gg_rd(cb0, GG_CB_FAR), gg_rd(cb0, GG_CB_FSYNR0), gg_rd(gg.smmu, 0x48));
++		    core ? gc_r(0x0824) : 0, sqe_pc, sqe_op, core ? gc_r(0x0e19) : 0, core ? gc_r(0x0213) : 0,
++		    gg_rd(cb0, GG_CB_SCTLR), gg_rd(cb0, GG_CB_FSR), gg_rd(cb0, GG_CB_FAR + 4),
++		    gg_rd(cb0, GG_CB_FAR), gg_rd(cb0, GG_CB_FSYNR0), gg_rd(cb0, 0x6c), gg_rd(gg.smmu, 0x48));
 +	}
 +	return rc;
 +}
 +
  #endif /* PONG */
 diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
-index 3ef5820..b004316 100644
+index 3ef5820..b728c3d 100644
 --- a/bsd/dev/pong_usb_ctl.c
 +++ b/bsd/dev/pong_usb_ctl.c
 @@ -96,6 +96,7 @@ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
@@ -538,7 +594,7 @@ index 3ef5820..b004316 100644
  		(void)pong_gpu_gmu_gx(1, gx_reply, sizeof(gx_reply));
  		send_str(gx_reply[0] ? gx_reply : "gxon: no reply\n");
 +	} else if (strcmp(cmd, "gpuprobe cpinit") == 0) {
-+		static char cp_reply[640];
++		static char cp_reply[896];
 +
 +		cp_reply[0] = '\0';
 +		(void)pong_gpu_cp_init(cp_reply, sizeof(cp_reply));
