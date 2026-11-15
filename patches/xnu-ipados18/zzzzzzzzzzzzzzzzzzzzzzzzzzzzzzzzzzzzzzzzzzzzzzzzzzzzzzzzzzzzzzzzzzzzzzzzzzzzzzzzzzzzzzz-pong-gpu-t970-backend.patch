@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
-index b67f921..43ef395 100644
+index b67f921..3d60271 100644
 --- a/bsd/dev/pong_gpu_gmu.c
 +++ b/bsd/dev/pong_gpu_gmu.c
 @@ -68,6 +68,9 @@ int pong_gpu_gmu_attempted(void);
@@ -8,11 +8,30 @@ index b67f921..43ef395 100644
  int pong_gpu_cp_zap(char *reply, size_t cap);
 +int pong_gpu_zap_auth(char *reply, size_t cap);
 +int pong_gpu_t970_ready(vm_offset_t *core, vm_offset_t *smmu);
-+void pong_gpu_a650_hw_init(void);
++int pong_gpu_a650_hw_init(void);
  
  /* ---- the windows (device tree: qcom,gmu@3d6a000, gmu rscc 0x3de0000, gpu pdc 0xb290000, kgsl-smmu@3da0000) ---- */
  #define GG_CORE_PHYS    0x03d6a000UL
-@@ -1196,8 +1199,23 @@ gz_le32(const uint8_t *p)
+@@ -159,6 +162,7 @@ gg_mark(char tag, uint32_t a, uint32_t b)
+ }
+ 
+ static uint32_t gg_last_phase = 0xffffffffu, gg_last_stage = 0xffffffffu;
++static int gc_t970_owner;   /* PongAdrenoCpT970.cpp took the GPU */
+ static int gg_gx_ok;
+ 
+ static void
+@@ -996,6 +1000,10 @@ pong_gpu_cp_init(char *reply, size_t cap)
+ 	const char *stop = "none";
+ 	volatile uint32_t *memp, *scr;
+ 
++	if (gc_t970_owner) {
++		snprintf(reply, cap, "cpinit: stop=t970_backend (gpustart owns the GPU)\n");
++		return -1;
++	}
+ 	if (gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp) || gg.attempted != 1 || !gg_gx_ok || (sptp & 0xc0u)) {
+ 		snprintf(reply, cap, "cpinit: stop=no_gx gmu=%d gx=%d sptprac=%#x (gmustart, then gxon)\n", gg.attempted, gg_gx_ok, sptp);
+ 		return -1;
+@@ -1196,8 +1204,23 @@ gz_le32(const uint8_t *p)
  	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
  }
  
@@ -36,7 +55,7 @@ index b67f921..43ef395 100644
  {
  	static int tries;
  	const uint8_t *fw = NULL;
-@@ -1208,7 +1226,7 @@ pong_gpu_cp_zap(char *reply, size_t cap)
+@@ -1208,7 +1231,7 @@ pong_gpu_cp_zap(char *reply, size_t cap)
  	unsigned int phnum = 0, hash = 0;
  	uint32_t phoff = 0;
  
@@ -45,7 +64,7 @@ index b67f921..43ef395 100644
  		snprintf(reply, cap, "cpzap: stop=no_cp cpinit_step=%u (gmustart, gxon, cpinit first)\n", gc.step);
  		return -1;
  	}
-@@ -1225,7 +1243,7 @@ pong_gpu_cp_zap(char *reply, size_t cap)
+@@ -1225,7 +1248,7 @@ pong_gpu_cp_zap(char *reply, size_t cap)
  		uint32_t sptp = 0;
  
  		/* GX powered and clocked, the ring drained and no CP fault before TrustZone is asked anything */
@@ -54,7 +73,7 @@ index b67f921..43ef395 100644
  			snprintf(reply, cap, "cpzap: stop=gpu_state sptprac=%#x rptr=%#x wptr=%u hwfault=%#x\n", sptp, gc_r(0x0806),
  			    gc.wptr, gc_r(0x0821));
  			return -1;
-@@ -1358,6 +1376,10 @@ pong_gpu_cp_zap(char *reply, size_t cap)
+@@ -1358,6 +1381,10 @@ pong_gpu_cp_zap(char *reply, size_t cap)
  	if (aa || a1) {
  		goto out;
  	}
@@ -65,7 +84,7 @@ index b67f921..43ef395 100644
  	step = 7;                                            /* CP_SET_SECURE_MODE(0) through the ring, fence 3 */
  	gg_mark('z', 7, 0);
  	{
-@@ -1410,4 +1432,36 @@ out:
+@@ -1410,4 +1437,41 @@ out:
  	return step == 9 ? 0 : -1;
  }
  
@@ -91,14 +110,19 @@ index b67f921..43ef395 100644
 +	}
 +	*core = gc.core;
 +	*smmu = gg.smmu;
++	gc_t970_owner = 1;   /* `gpuprobe cpinit` stays out from here on */
 +	return 0;
 +}
 +
-+void
++int
 +pong_gpu_a650_hw_init(void)
 +{
++	if (!gc.core) {
++		return -1;
++	}
 +	gg_mark('h', 0, 0);
 +	gc_hw_init();
++	return gc_r(0x0844) == 0x6eu && gc_r(0x00ae) == 0x8aa8aa82u ? 0 : -1;   /* CP_APRIV_CNTL, RBBM_CLOCK_CNTL */
 +}
 +
  #endif /* PONG */

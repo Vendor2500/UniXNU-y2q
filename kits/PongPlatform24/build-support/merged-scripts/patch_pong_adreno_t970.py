@@ -143,6 +143,14 @@ CPINIT_CPP_REPLACEMENTS = (
      '    if(AdrenoPM4Type7(CpThreadControlOpcode,1,&words[0])!=AdrenoPM4Success ||\n'),
 )
 
+SMMUCTX_CPP_REPLACEMENTS = (
+    ('#include <IOKit/IOLib.h>\n',
+     '#include <IOKit/IOLib.h>\n'
+     '/* 1: the pinned tree\'s dma-coherent table walks (the A730); the SM-T970 backend sets 0 (SM8250 walks are non-coherent) */\n'
+     'extern "C" {volatile uint32_t native_adreno_smmu_coherent_walk=1;}\n'),
+    ('.asid=asid,.coherent_walk=1,', '.asid=asid,.coherent_walk=native_adreno_smmu_coherent_walk?1u:0u,'),
+)
+
 
 def apply_replacements(path: Path, pairs: tuple[tuple[str, str], ...]) -> bool:
     if not path.is_file():
@@ -176,6 +184,7 @@ def patch_pong_adreno(adreno_source: Path) -> None:
         ('submit/NativeAdrenoRing.cpp', RING_CPP_REPLACEMENTS),
         ('submit/NativeAdrenoCpInit.h', CPINIT_H_REPLACEMENTS),
         ('submit/NativeAdrenoCpInit.cpp', CPINIT_CPP_REPLACEMENTS),
+        ('submit/NativeAdrenoSmmuContext.cpp', SMMUCTX_CPP_REPLACEMENTS),
     ):
         target = root / rel
         if apply_replacements(target, pairs):

@@ -33,20 +33,23 @@
 extern "C" {
 /* bsd/dev/pong_gpu_gmu.c */
 int pong_gpu_t970_ready(vm_offset_t *core, vm_offset_t *smmu);
-void pong_gpu_a650_hw_init(void);
+int pong_gpu_a650_hw_init(void);
 int pong_gpu_zap_auth(char *reply, size_t cap);
 int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
 extern uint64_t (*native_adreno_vm_now_us)(void);
 extern uint64_t (*native_adreno_gpu_ticks)(void);
 extern volatile uint32_t native_adreno_wc_enabled;
 IOService *native_adreno_published_service(void);
+extern volatile uint32_t native_adreno_smmu_coherent_walk;   /* T970 patch of NativeAdrenoSmmuContext.cpp */
 int pong_t970_gpu_start(char *reply, size_t cap);
 int pong_t970_gpu_selftest(char *reply, size_t cap);
 }
 
 namespace {
-/* IOVAs and sizes as PongAdrenoCp.cpp: SQE, ring 0, memptrs, restore list (unused on the A650), scratch */
-constexpr uint64_t iovas[] = {0x100000, 0x200000, 0x300000, 0x301000, 0x302000};
+/* Sizes as PongAdrenoCp.cpp (SQE, ring 0, memptrs, restore list (unused on the A650), scratch), IOVAs at 32 MiB: PongAdrenoCp's
+ * 0x100000.. puts the SQE inside the A650's UCHE GMEM window (base 0, 1 MiB + 128 KiB), the reason GpuProbe.cpp moved its kernel
+ * buffers up; `gpuprobe cpinit` ran from 32 MiB on this tablet. The ring stays 32 KiB aligned. */
+constexpr uint64_t iovas[] = {0x02000000, 0x02020000, 0x02030000, 0x02031000, 0x02032000};
 constexpr size_t sizes[] = {0x13000, 0x8000, 0x1000, 0x1000, 0x1000};
 constexpr uint16_t gpu_sids[] = {0, 1, 0x400, 0x401};
 constexpr unsigned gpu_stream_count = sizeof(gpu_sids) / sizeof(*gpu_sids);
@@ -167,34 +170,47 @@ IOReturn prepare()
     const unsigned code = (id2 >> 4) & 15;
     if ((id1 >> 31) || ex || count < gpu_stream_count + 1 || code >= 6) {stop("smmu_ids"); return kIOReturnUnsupported;}
     gpu->output_bits = bits[code] > 40 ? 40 : bits[code];
-    /* free slots: SMR invalid and S2CR of type FAULT (the GMU holds SMR 2 for stream 5 under mask 0x400) */
+    /* memory before any register: a failure here may run again (8 MiB of contiguous tables after boot may not be there) */
+    IOReturn status = gpu->tables.allocate(2053 * 4096, gpu->output_bits, true, 2053 * 4096);
+    if (status) {stop("tables_alloc"); gpu->step = 0; return status;}
+    gpu->step = 1;   /* from here on registers change */
+    /* free slots, the precedent's {0,1,4,5} first (GpuProbe.cpp:582), then 3; SMR invalid and S2CR of type FAULT (the GMU holds
+     * SMR 2 for stream 5 under mask 0x400); every valid SMR checked for overlap with the GPU's streams */
+    for (unsigned i = 0; i < count; i++) {
+        const uint32_t smr = sr(0x800 + 4 * i);
+        if (!(smr & 0x80000000u)) continue;
+        const uint32_t mask = (smr >> 16) & 0x7fff, sid = smr & 0x7fff;
+        for (uint16_t wanted : gpu_sids)
+            if (!((sid ^ wanted) & ~mask & 0x7fff)) {stop("stream_owned"); return kIOReturnBusy;}
+    }
+    static const unsigned order[] = {0, 1, 4, 5, 3, 2, 6, 7};
     unsigned found = 0;
-    for (unsigned i = 0; i < count && found < gpu_stream_count; i++) {
-        const uint32_t smr = sr(0x800 + 4 * i), s2 = sr(0xc00 + 4 * i);
-        if (smr & 0x80000000u) {
-            const uint32_t mask = (smr >> 16) & 0x7fff, sid = smr & 0x7fff;
-            for (uint16_t wanted : gpu_sids)
-                if (!((sid ^ wanted) & ~mask & 0x7fff)) {stop("stream_owned"); return kIOReturnBusy;}
-            continue;
-        }
-        if ((s2 & 0x30000u) != 0x20000u) continue;
-        if (!sw(0xc00 + 4 * i, 0x20000u) || sr(0xc00 + 4 * i) != 0x20000u) {stop("s2cr_normalize"); return kIOReturnIOError;}
+    for (unsigned k = 0; k < sizeof order / sizeof *order && found < gpu_stream_count; k++) {
+        const unsigned i = order[k];
+        if (i >= count || (sr(0x800 + 4 * i) & 0x80000000u) || (sr(0xc00 + 4 * i) & 0x30000u) != 0x20000u) continue;
         gpu->slots[found++] = i;
     }
     if (found != gpu_stream_count) {stop("no_slots"); return kIOReturnNoResources;}
+    for (unsigned k = 0; k < gpu_stream_count; k++) {
+        const unsigned i = gpu->slots[k];
+        if (!sw(0xc00 + 4 * i, 0x20000u) || sr(0xc00 + 4 * i) != 0x20000u) {stop("s2cr_normalize"); return kIOReturnIOError;}
+    }
     const size_t bank = bank0();
     if (!sw(bank, 0) || (sr(bank) & 1)) {stop("bank_busy"); return kIOReturnIOError;}
-    /* ACTLR without CPRE (arm_mmu500_reset), as GpuProbe.cpp:680-688 on this tablet */
+    /* ACTLR without CPRE (arm_mmu500_reset), as GpuProbe.cpp:680-688 on this tablet; read back (cpinit saw 0x3 -> 0x1) */
     const uint32_t actlr = sr(bank + 4);
-    if (!sw(bank + 4, actlr & ~2u)) {stop("actlr"); return kIOReturnIOError;}
-    IOReturn status = gpu->tables.allocate(2053 * 4096, gpu->output_bits, true, 2053 * 4096);
-    if (!status) status = gpu->context.prepare(&gpu->tables, 0, 0, UINT64_C(0x100000000), 1048576, 0, 2, 4096, gpu->output_bits, 32);
+    if (!sw(bank + 4, actlr & ~2u) || (sr(bank + 4) & 2u)) {stop("actlr"); return kIOReturnIOError;}
+    status = gpu->context.prepare(&gpu->tables, 0, 0, UINT64_C(0x100000000), 1048576, 0, 2, 4096, gpu->output_bits, 32);
     if (!status) gpu->context.setAliasScratch(gpu->alias_scratch, 262144);
     if (!status) status = gpu->context.program(&gpu->smmu_io);
     ArmSmmu4KStream streams[gpu_stream_count] = {};
     for (unsigned i = 0; i < gpu_stream_count; i++) streams[i] = {gpu->slots[i], gpu_sids[i]};
     if (!status) status = gpu->context.attach(streams, gpu_stream_count);
     if (status) {stop("context"); return status;}
+    /* TLBIALL of bank 0 (ArmSmmu4KProgramDisabledContext only invalidates the ASID), as GpuProbe.cpp:686-688 */
+    if (!sw(bank + 0x618, 0) || !sw(bank + 0x7f0, 0)) {stop("tlbiall"); return kIOReturnIOError;}
+    for (unsigned i = 0; i < 1000 && (sr(bank + 0x7f4) & 1); i++) IODelay(1);
+    if (sr(bank + 0x7f4) & 1) {stop("tlbsync"); return kIOReturnTimeout;}
     NativeAdrenoVmRegion lower = {&gpu->tables, gpu->context.arenaHandle(), gpu->context.stateHandle()};
     status = gpu->vm.attach(&gpu->smmu_io, gpu->context.configHandle(), gpu->context.streamsHandle(), &lower, nullptr, 131072, 262144);
     for (unsigned i = 0; i < 5 && !status; i++) {
@@ -219,7 +235,7 @@ IOReturn prepare()
 IOReturn start(char *zap, size_t zap_cap)
 {
     gpu->step = 2;
-    pong_gpu_a650_hw_init();
+    if (pong_gpu_a650_hw_init()) {stop("hw_init"); return kIOReturnIOError;}
     NativeAdrenoRingCache cache = {nullptr, publish_ring, acquire_fence};
     IOReturn status = gpu->ring.setGeneration(6);
     if (!status) status = gpu->ring.attach(&gpu->regs, &cache, gpu->buffers[1].mapping(), sizes[1], iovas[1],
@@ -352,6 +368,14 @@ int uc_round(IOService *svc, unsigned *pass, unsigned *steps, uint32_t *first_er
     }
     for (auto *m : maps) if (m) m->release();
     for (auto *d : desc) if (d) d->release();
+    if (ib.handle) {
+        NativeAdrenoAbiBoFree f{ib.handle};
+        step(uc_call(uc, NativeAdrenoMethodBoFree, &f, nullptr));
+    }
+    if (tgt.handle) {
+        NativeAdrenoAbiBoFree f{tgt.handle};
+        step(uc_call(uc, NativeAdrenoMethodBoFree, &f, nullptr));
+    }
     step(uc->clientClose());
     uc->release();
     return matched;
@@ -376,10 +400,20 @@ extern "C" int pong_t970_gpu_start(char *reply, size_t cap)
     gpu->core = core;
     gpu->smmu = smmu;
     gpu->regs = {nullptr, reg_write, reg_read, barrier};
-    gpu->smmu_io = {nullptr, 0x10000, smmu_read, smmu_read64, smmu_write, smmu_write64, barrier, 1};
+    /* polled_faults 0: ArmSmmu4KStreams global() then expects sCR0 & 0x407 == 0x406, what this tablet reads (the hypervisor
+     * keeps GFRE); 1 would require 0x402 and fail every attach (review 11-15) */
+    gpu->smmu_io = {nullptr, 0x10000, smmu_read, smmu_read64, smmu_write, smmu_write64, barrier, 0};
+    native_adreno_smmu_coherent_walk = 0;   /* SM8250's GPU SMMU walks are non-coherent (GpuProbe.cpp:644, our cpinit TCR) */
     native_adreno_vm_now_us = vm_now;
-    gpu->step = 1;
+    gpu->step = 0;
     IOReturn status = prepare();
+    if (status && gpu->step == 0) {
+        snprintf(reply, cap, "gpustart: stop=%s status=%#x (no register touched; may run again)\n", gpu->why, status);
+        delete gpu;
+        gpu = nullptr;
+        tries = 0;
+        return -1;
+    }
     if (!status) status = start(zap, sizeof zap);
     uint32_t sqe_pc = 0, sqe_op = 0;
     if (status && gpu->step >= 3 && wr(RegSqeStatAddr, 0)) {sqe_pc = rd(RegSqeStatData); sqe_op = rd(RegSqeStatData);}
