@@ -1,0 +1,352 @@
+diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
+index accf765..2e282ec 100644
+--- a/bsd/dev/pong_gpu_gmu.c
++++ b/bsd/dev/pong_gpu_gmu.c
+@@ -31,6 +31,14 @@
+  * window at 0), Linux v6.6 hw_init for the A650 (clock gating, CP protect, APRIV), a650_sqe.fw without its first dword, ring 0
+  * with NO_UPDATE, CP_ME_INIT with its fence, then one CP_MEM_WRITE of 0xA6500C0D into the scratch page that the CPU reads back.
+  * No zap shader (stage C2). Once per boot. Design: work/gpu_stage_c/DESIGN.md.
++ *
++ * `gpuprobe cpzap` (stage C2, after cpinit): the zap shader through TrustZone and the CP out of secure mode, as GpuProbe.cpp
++ * mode 10 (zapLoad, leaveSecure; qcom_mdt_load + a6xx_zap_shader_init): a650_zap.elf (fwput; the vendor .mdt and .b02
++ * reassembled on the host) parsed for its hash and loadable segments, init_image (PAS 13) with the ELF header and hash
++ * segment as physically contiguous metadata, mem_setup for the relocatable image, the segment copied into the DT's
++ * pil_gpu_region 0x9031a000 (+0x2000) through a device mapping that is gone before auth_and_reset, then
++ * CP_SET_SECURE_MODE(0) through ring 0 and one more CP_MEM_WRITE. Needs pong_gpu_zap=1 (arm_vm_init.c keeps XNU out of the
++ * region). Never PAS_SHUTDOWN: on this SoC a shutdown of a never-loaded image does not come back. Once per boot.
+  */
+ #include <pexpert/arm64/board_config.h>
+ #if defined(PONG)
+@@ -59,6 +67,7 @@ int pong_gpu_gmu_start(char *reply, size_t cap);
+ int pong_gpu_gmu_attempted(void);
+ int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);
+ int pong_gpu_cp_init(char *reply, size_t cap);
++int pong_gpu_cp_zap(char *reply, size_t cap);
+ 
+ /* ---- the windows (device tree: qcom,gmu@3d6a000, gmu rscc 0x3de0000, gpu pdc 0xb290000, kgsl-smmu@3da0000) ---- */
+ #define GG_CORE_PHYS    0x03d6a000UL
+@@ -622,7 +631,7 @@ static struct {
+ 	uint8_t *buf;
+ 	uint64_t *table;
+ 	IOPhysicalAddress table_pa;
+-	uint32_t rb_off, rb_got, s2_orig, actlr, sqe_bad, step, routes;
++	uint32_t rb_off, rb_got, s2_orig, actlr, sqe_bad, step, routes, wptr;
+ 	int mem_ok;
+ } gc;
+ 
+@@ -1099,6 +1108,7 @@ pong_gpu_cp_init(char *reply, size_t cap)
+ 		goto out;
+ 	}
+ 	gc.step = 8;
++	gc.wptr = at;
+ 	rc = 0;
+ out:
+ 	gg_mark('d', gc.step, (uint32_t)rc);
+@@ -1129,4 +1139,262 @@ out:
+ 	return rc;
+ }
+ 
++/* ---- stage C2: the zap shader (PAS 13) and CP_SET_SECURE_MODE(0) ---- */
++extern unsigned int pong_adreno_zap_reserved;            /* osfmk/arm64/arm_vm_init.c, pong_gpu_zap=1 */
++extern uint64_t vm_first_phys, vm_last_phys;             /* the memory XNU manages */
++extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++#define GZ_PHYS         0x9031a000ull                /* live FDT pil_gpu_region@8681a000 reg (Samsung moved it), no-map */
++#define GZ_BYTES        0x2000u
++#define GZ_PAS          13u                          /* DT qcom,kgsl-hyp qcom,pas-id */
++#define GZ_PIL(cmd)     (0x42000000ull | (0x02u << 8) | (cmd))   /* SMC64 SIP, PIL service 2 */
++
++static uint32_t gz_resumes;
++
++/* qcom_scm SMC: INTERRUPTED (1) resumes with x0 = 1 and the returned x6, V2_EBUSY (-12) retries after 30 ms up to 20 times;
++ * interrupts masked across the call and its resumes (GpuProbe.cpp:976-998) */
++static int64_t
++gz_scm(uint64_t fn, uint64_t arginfo, uint64_t p0, uint64_t p1, uint64_t p2, uint64_t *r1)
++{
++	const boolean_t was = ml_set_interrupts_enabled(FALSE);
++	int64_t out = -1000;
++	uint64_t first = fn, a6 = 0;
++	unsigned int busy = 0;
++
++	*r1 = 0;
++	for (gz_resumes = 0; gz_resumes < 10000;) {
++		register uint64_t x0 __asm__("x0") = first, x1 __asm__("x1") = arginfo, x2 __asm__("x2") = p0;
++		register uint64_t x3 __asm__("x3") = p1, x4 __asm__("x4") = p2, x5 __asm__("x5") = 0, x6 __asm__("x6") = a6;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    :: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		if (x0 == 1) {
++			first = 1;
++			a6 = x6;
++			gz_resumes++;
++			continue;
++		}
++		if ((int64_t)x0 == -12 && busy++ < 20) {
++			first = fn;
++			a6 = 0;
++			IODelay(30000);
++			continue;
++		}
++		out = (int64_t)x0;
++		*r1 = x1;
++		break;
++	}
++	(void)ml_set_interrupts_enabled(was);
++	return out;
++}
++
++static inline uint32_t
++gz_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++int
++pong_gpu_cp_zap(char *reply, size_t cap)
++{
++	static int tries;
++	const uint8_t *fw = NULL;
++	uint32_t size = 0, polls = 0, mark = 0, trust0 = 0, trust1 = 0;
++	int step = 0, why = 0, relocate = 0;
++	int64_t ia = 0, ma = 0, aa = 0;
++	uint64_t i1 = 0, m1 = 0, a1 = 0, lo = ~0ull, hi = 0, meta_pa = 0;
++	unsigned int phnum = 0, hash = 0;
++	uint32_t phoff = 0;
++
++	if (gc.step != 8) {
++		snprintf(reply, cap, "cpzap: stop=no_cp cpinit_step=%u (gmustart, gxon, cpinit first)\n", gc.step);
++		return -1;
++	}
++	if (pong_adreno_zap_reserved != 1 || (GZ_PHYS + GZ_BYTES > vm_first_phys && GZ_PHYS < vm_last_phys)) {
++		snprintf(reply, cap, "cpzap: stop=region reserved=%u managed=%#llx..%#llx (boot with pong_gpu_zap=1)\n",
++		    pong_adreno_zap_reserved, (unsigned long long)vm_first_phys, (unsigned long long)vm_last_phys);
++		return -1;
++	}
++	if (tries) {
++		snprintf(reply, cap, "cpzap: stop=once_per_boot\n");
++		return -1;
++	}
++	if (pong_fw_lookup("a650_zap.elf", &fw, &size) != 0 || !fw || size < 52 || fw[0] != 0x7f || fw[1] != 'E' ||
++	    fw[2] != 'L' || fw[3] != 'F' || fw[4] != 1) {
++		snprintf(reply, cap, "cpzap: stop=elf_missing len=%u\n", size);
++		return -1;
++	}
++	/* the ELF: header, program headers, the hash segment and the loadable ones (qcom_mdt_load, GpuProbe.cpp:1042-1064) */
++	phoff = gz_le32(fw + 28);
++	phnum = (unsigned int)(fw[44] | fw[45] << 8);
++	if ((fw[42] | fw[43] << 8) != 32 || phnum < 2 || phnum > 16 || (uint64_t)phoff + phnum * 32ull > size) {
++		why = -2;
++		goto out;
++	}
++#define GZ_PH(i, f) gz_le32(fw + phoff + (i) * 32u + (f) * 4u)   /* type off va pa filesz memsz flags */
++	if (GZ_PH(0, 0) == 1) {
++		why = -3;
++		goto out;
++	}
++	for (unsigned int i = 1; i < phnum && !hash; i++) {
++		if (((GZ_PH(i, 6) >> 24) & 7u) == 2u) {
++			hash = i;
++		}
++	}
++	if (!hash) {
++		why = -4;
++		goto out;
++	}
++	for (unsigned int i = 0; i < phnum; i++) {
++		if (GZ_PH(i, 0) != 1 || ((GZ_PH(i, 6) >> 24) & 7u) == 2u || !GZ_PH(i, 5)) {
++			continue;
++		}
++		if (GZ_PH(i, 6) & (1u << 27)) {
++			relocate = 1;
++		}
++		lo = lo < GZ_PH(i, 3) ? lo : GZ_PH(i, 3);
++		hi = hi > (((uint64_t)GZ_PH(i, 3) + GZ_PH(i, 5) + 0xfffu) & ~0xfffull) ? hi :
++		    (((uint64_t)GZ_PH(i, 3) + GZ_PH(i, 5) + 0xfffu) & ~0xfffull);
++	}
++	if (lo >= hi || hi - lo > GZ_BYTES) {
++		why = -5;
++		goto out;
++	}
++	{
++		const uint32_t ehdr = GZ_PH(0, 4), hbytes = GZ_PH(hash, 4), hoff = GZ_PH(hash, 1);
++		IOPhysicalAddress pa = 0;
++		uint8_t *meta;
++
++		if (ehdr > size || (uint64_t)hoff + hbytes > size || (uint64_t)ehdr + hbytes > 0x4000u) {
++			why = -6;
++			goto out;
++		}
++		/* the metadata: physically contiguous, written back to the point of coherency, below 2^40 */
++		step = 2;
++		meta = IOMallocContiguous(0x4000, 0x1000, &pa);
++		if (!meta || !pa || pa + 0x4000 > (1ull << 40)) {
++			why = -7;
++			goto out;
++		}
++		meta_pa = pa;
++		bzero(meta, 0x4000);
++		for (uint32_t i = 0; i < ehdr; i++) {
++			meta[i] = fw[i];
++		}
++		for (uint32_t i = 0; i < hbytes; i++) {
++			meta[ehdr + i] = fw[hoff + i];
++		}
++		for (uintptr_t p = (uintptr_t)meta; p < (uintptr_t)meta + 0x4000; p += 64) {
++			__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	tries = 1;                                           /* from here on TrustZone holds state for PAS 13 */
++	trust0 = gc_r(0xf400);                               /* RBBM_SECVID_TRUST_CNTL as found */
++	step = 3;                                            /* init_image: ARGS(2, VAL, RW) */
++	gg_mark('z', 3, 0);
++	ia = gz_scm(GZ_PIL(0x01), 2u | (2u << 6), GZ_PAS, meta_pa, 0, &i1);
++	gg_mark('z', 30, (uint32_t)ia);
++	if (ia || i1) {
++		goto out;
++	}
++	if (relocate) {
++		step = 4;                                    /* mem_setup: ARGS(3) */
++		gg_mark('z', 4, 0);
++		ma = gz_scm(GZ_PIL(0x02), 3, GZ_PAS, GZ_PHYS, hi - lo, &m1);
++		gg_mark('z', 40, (uint32_t)ma);
++		if (ma || m1) {
++			goto out;
++		}
++	}
++	step = 5;                                            /* the loadable segments into the region, device mapping, then unmapped */
++	gg_mark('z', 5, 0);
++	{
++		const vm_offset_t region = ml_io_map(GZ_PHYS, GZ_BYTES);
++		const uint64_t base = relocate ? lo : GZ_PHYS;
++
++		if (!region) {
++			why = -9;
++			goto out;
++		}
++		for (unsigned int i = 0; i < phnum && !why; i++) {
++			if (GZ_PH(i, 0) != 1 || ((GZ_PH(i, 6) >> 24) & 7u) == 2u || !GZ_PH(i, 5)) {
++				continue;
++			}
++			const uint64_t at = (uint64_t)GZ_PH(i, 3) - base, file = GZ_PH(i, 4), mem = GZ_PH(i, 5), off = GZ_PH(i, 1);
++
++			if (GZ_PH(i, 3) < base || at + mem > GZ_BYTES || file > mem || off + file > size) {
++				why = -10;
++				break;
++			}
++			for (uint64_t b = 0; b < mem; b++) {
++				*(volatile uint8_t *)(region + at + b) = b < file ? fw[off + b] : 0;
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(region, GZ_BYTES);
++		if (why) {
++			goto out;
++		}
++	}
++	step = 6;                                            /* auth_and_reset: ARGS(1) */
++	gg_mark('z', 6, 0);
++	aa = gz_scm(GZ_PIL(0x05), 1, GZ_PAS, 0, 0, &a1);
++	gg_mark('z', 60, (uint32_t)aa);
++	if (aa || a1) {
++		goto out;
++	}
++	step = 7;                                            /* CP_SET_SECURE_MODE(0) through the ring, fence 3 */
++	gg_mark('z', 7, 0);
++	{
++		const uint32_t w[2] = { gc_pkt7(0x66, 1), 0 };
++
++		gc.wptr = gc_submit(gc.wptr, w, 2, 3);
++	}
++	if (gc_wait(3, &polls)) {
++		why = -11;
++		goto out;
++	}
++	step = 8;                                            /* one more CP_MEM_WRITE, now non-secure: fence 4 */
++	{
++		volatile uint32_t *scr = (volatile uint32_t *)(void *)(gc.buf + GC_SCR_OFF);
++		const uint64_t dst = GC_IOVA + GC_SCR_OFF;
++		const uint32_t w[4] = { gc_pkt7(0x3d, 3), (uint32_t)dst, (uint32_t)(dst >> 32), GC_MARK + 1 };
++		uint32_t p2 = 0;
++
++		scr[0] = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		gc.wptr = gc_submit(gc.wptr, w, 4, 4);
++		if (gc_wait(4, &p2)) {
++			why = -12;
++			goto out;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		mark = scr[0];
++		if (mark != GC_MARK + 1) {
++			why = -13;
++			goto out;
++		}
++	}
++	step = 9;
++#undef GZ_PH
++out:
++	gg_mark('Z', (uint32_t)step, (uint32_t)why);
++	trust1 = gc_r(0xf400);
++	{
++		const vm_offset_t cb0 = gc_cb0();
++
++		snprintf(reply, cap,
++		    "cpzap: status=%d step=%d why=%d phnum=%u hash=%u reloc=%d span=%#llx meta=%#llx init=%lld/%#llx mem=%lld/%#llx"
++		    " auth=%lld/%#llx resumes=%u trust=%#x>%#x wptr=%u rptr=%#x polls=%u mark=%#x hwfault=%#x int0=%#x"
++		    " cb0_fsr=%#x gfsr=%#x\n",
++		    step == 9 ? 0 : -1, step, why, phnum, hash, relocate, (unsigned long long)(hi > lo ? hi - lo : 0),
++		    (unsigned long long)meta_pa, (long long)ia, (unsigned long long)i1, (long long)ma, (unsigned long long)m1,
++		    (long long)aa, (unsigned long long)a1, gz_resumes, trust0, trust1, gc.wptr, gc_r(0x0806), polls, mark,
++		    gc_r(0x0821), gc_r(0x0201), gg_rd(cb0, GG_CB_FSR), gg_rd(gg.smmu, 0x48));
++	}
++	return step == 9 ? 0 : -1;
++}
++
+ #endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index b728c3d..4a8d801 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -97,6 +97,7 @@ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `e
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
+ extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpuprobe gxon` (pong_gpu_gmu.c) */
+ extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpuprobe cpinit` (pong_gpu_gmu.c) */
++extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpuprobe cpzap` (pong_gpu_gmu.c) */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+ extern int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);   /* `stackshot <pid>`, `stackget <offset>` */
+ extern int pong_publish_bare_accelerator(void);   /* drivers/PongAdreno/PongAdrenoAccelerator.cpp */
+@@ -2013,6 +2014,12 @@ dispatch_command(const char *cmd)
+ 		cp_reply[0] = '\0';
+ 		(void)pong_gpu_cp_init(cp_reply, sizeof(cp_reply));
+ 		send_str(cp_reply[0] ? cp_reply : "cpinit: no reply\n");
++	} else if (strcmp(cmd, "gpuprobe cpzap") == 0) {
++		static char zap_reply[640];
++
++		zap_reply[0] = '\0';
++		(void)pong_gpu_cp_zap(zap_reply, sizeof(zap_reply));
++		send_str(zap_reply[0] ? zap_reply : "cpzap: no reply\n");
+ 	} else if (strcmp(cmd, "adspup") == 0) {
+ 		/* the audio DSP's shared memory, read only (bsd/dev/pong_adsp.c) */
+ 		char adsp_reply[896];
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index a8f1025..0373155 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2146,9 +2146,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	first_avail_phys = avail_start = args->topOfKernelData;
+ 
+ #if defined(PONG)
+-	unsigned int pong_gpu_requested = 0;
+-	if (PE_parse_boot_argn("pong_adreno_start", &pong_gpu_requested,
+-	    sizeof(pong_gpu_requested)) && pong_gpu_requested == 1) {
++	unsigned int pong_gpu_requested = 0, pong_gpu_zap = 0;
++	/* pong_gpu_zap=1: the same reservation for `gpuprobe cpzap` (pong_gpu_gmu.c) without pong_adreno_start, which also
++	 * makes ArmDTPlatform start the PongAdreno driver */
++	(void)PE_parse_boot_argn("pong_gpu_zap", &pong_gpu_zap, sizeof(pong_gpu_zap));
++	if ((PE_parse_boot_argn("pong_adreno_start", &pong_gpu_requested,
++	    sizeof(pong_gpu_requested)) && pong_gpu_requested == 1) || pong_gpu_zap == 1) {
+ 		/* SM-T970 (SM8250): pil_gpu_region@8681a000 reg = <0x0 0x9031a000 0x0 0x2000> (gts7xlwifi.dts:34582-34585) */
+ 		const uint64_t zap = 0x9031a000ULL, zap_end = zap + 0x2000;
+ 		if (zap_end <= gPhysBase || zap >= gPhysBase + mem_size) {
