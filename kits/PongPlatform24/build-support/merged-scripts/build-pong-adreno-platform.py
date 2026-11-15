@@ -179,7 +179,9 @@ def main():
               '__ZN15IOAcceleratorESD2Ev':'destructor',
               '__ZN15IOAcceleratorES10gMetaClassE':'metaclass',
               '_PongIOAcceleratorMetaConstruct':'metaclass_constructor'}
-    if 'fixed_prelink_base' in fixed and os.environ.get('PONG_STORAGE_BINDING','self')!='self':
+    # SM-T970: the local prelink merges no IOGPUFamily, so original IOAcceleratorES addresses are empty there (z80 panic,
+    # pc in the unmerged IOGPUFamily range). Bind it to the original only when that kext is merged: PONG_IOGPU_BINDING=original.
+    if 'fixed_prelink_base' in fixed and os.environ.get('PONG_IOGPU_BINDING','self')!='self':
         if fixed.get('build', '20G81') != a.guest_build:raise RuntimeError('GPU and storage prelink guests differ')
         slide=int(fixed['fixed_prelink_base'],16)-int(abi['original_prelink_base'],16)
         assembly=out/'PongIOAcceleratorBindings.S'
