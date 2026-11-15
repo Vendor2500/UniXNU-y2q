@@ -1,0 +1,136 @@
+diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
+index b67f921..43ef395 100644
+--- a/bsd/dev/pong_gpu_gmu.c
++++ b/bsd/dev/pong_gpu_gmu.c
+@@ -68,6 +68,9 @@ int pong_gpu_gmu_attempted(void);
+ int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);
+ int pong_gpu_cp_init(char *reply, size_t cap);
+ int pong_gpu_cp_zap(char *reply, size_t cap);
++int pong_gpu_zap_auth(char *reply, size_t cap);
++int pong_gpu_t970_ready(vm_offset_t *core, vm_offset_t *smmu);
++void pong_gpu_a650_hw_init(void);
+ 
+ /* ---- the windows (device tree: qcom,gmu@3d6a000, gmu rscc 0x3de0000, gpu pdc 0xb290000, kgsl-smmu@3da0000) ---- */
+ #define GG_CORE_PHYS    0x03d6a000UL
+@@ -1196,8 +1199,23 @@ gz_le32(const uint8_t *p)
+ 	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+ }
+ 
++static int gz_run(int ring, char *reply, size_t cap);
++
+ int
+ pong_gpu_cp_zap(char *reply, size_t cap)
++{
++	return gz_run(1, reply, cap);
++}
++
++/* init_image .. auth_and_reset only: PongAdrenoCpT970.cpp sends CP_SET_SECURE_MODE(0) through its own ring */
++int
++pong_gpu_zap_auth(char *reply, size_t cap)
++{
++	return gz_run(0, reply, cap);
++}
++
++static int
++gz_run(int ring, char *reply, size_t cap)
+ {
+ 	static int tries;
+ 	const uint8_t *fw = NULL;
+@@ -1208,7 +1226,7 @@ pong_gpu_cp_zap(char *reply, size_t cap)
+ 	unsigned int phnum = 0, hash = 0;
+ 	uint32_t phoff = 0;
+ 
+-	if (gc.step != 8) {
++	if (ring && gc.step != 8) {
+ 		snprintf(reply, cap, "cpzap: stop=no_cp cpinit_step=%u (gmustart, gxon, cpinit first)\n", gc.step);
+ 		return -1;
+ 	}
+@@ -1225,7 +1243,7 @@ pong_gpu_cp_zap(char *reply, size_t cap)
+ 		uint32_t sptp = 0;
+ 
+ 		/* GX powered and clocked, the ring drained and no CP fault before TrustZone is asked anything */
+-		if (gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp) || (sptp & 0xc0u) || gc_r(0x0806) != gc.wptr || gc_r(0x0821)) {
++		if (gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp) || (sptp & 0xc0u) || (ring && gc_r(0x0806) != gc.wptr) || gc_r(0x0821)) {
+ 			snprintf(reply, cap, "cpzap: stop=gpu_state sptprac=%#x rptr=%#x wptr=%u hwfault=%#x\n", sptp, gc_r(0x0806),
+ 			    gc.wptr, gc_r(0x0821));
+ 			return -1;
+@@ -1358,6 +1376,10 @@ pong_gpu_cp_zap(char *reply, size_t cap)
+ 	if (aa || a1) {
+ 		goto out;
+ 	}
++	if (!ring) {
++		step = 9;                                    /* authenticated; the caller's ring does the rest */
++		goto out;
++	}
+ 	step = 7;                                            /* CP_SET_SECURE_MODE(0) through the ring, fence 3 */
+ 	gg_mark('z', 7, 0);
+ 	{
+@@ -1410,4 +1432,36 @@ out:
+ 	return step == 9 ? 0 : -1;
+ }
+ 
++/* ---- stage D0: what PongAdrenoCpT970.cpp (libPongAdrenoPlatform.a) takes from this file ---- */
++/* GMU up and GX powered and clocked this boot, and this file's own CP path (cpinit) not used: the GPU core window (mapped here)
++ * and the GPU SMMU window */
++int
++pong_gpu_t970_ready(vm_offset_t *core, vm_offset_t *smmu)
++{
++	uint32_t sptp = 0;
++
++	if (gg.attempted != 1 || !gg_gx_ok || gc.step != 0 || !gg.smmu) {
++		return -1;
++	}
++	if (gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp) || (sptp & 0xc0u)) {
++		return -1;
++	}
++	if (!gc.core) {
++		gc.core = ml_io_map(GC_CORE_PHYS, GC_CORE_BYTES);
++	}
++	if (!gc.core) {
++		return -1;
++	}
++	*core = gc.core;
++	*smmu = gg.smmu;
++	return 0;
++}
++
++void
++pong_gpu_a650_hw_init(void)
++{
++	gg_mark('h', 0, 0);
++	gc_hw_init();
++}
++
+ #endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 4a8d801..9d355ad 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -98,6 +98,8 @@ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);
+ extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpuprobe gxon` (pong_gpu_gmu.c) */
+ extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpuprobe cpinit` (pong_gpu_gmu.c) */
+ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpuprobe cpzap` (pong_gpu_gmu.c) */
++extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
++extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+ extern int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);   /* `stackshot <pid>`, `stackget <offset>` */
+ extern int pong_publish_bare_accelerator(void);   /* drivers/PongAdreno/PongAdrenoAccelerator.cpp */
+@@ -2020,6 +2022,18 @@ dispatch_command(const char *cmd)
+ 		zap_reply[0] = '\0';
+ 		(void)pong_gpu_cp_zap(zap_reply, sizeof(zap_reply));
+ 		send_str(zap_reply[0] ? zap_reply : "cpzap: no reply\n");
++	} else if (strcmp(cmd, "gpuprobe gpustart") == 0) {
++		static char gs_reply[1024];
++
++		gs_reply[0] = '\0';
++		(void)pong_t970_gpu_start(gs_reply, sizeof(gs_reply));
++		send_str(gs_reply[0] ? gs_reply : "gpustart: no reply\n");
++	} else if (strcmp(cmd, "gpuprobe selftest") == 0) {
++		static char st_reply[512];
++
++		st_reply[0] = '\0';
++		(void)pong_t970_gpu_selftest(st_reply, sizeof(st_reply));
++		send_str(st_reply[0] ? st_reply : "selftest: no reply\n");
+ 	} else if (strcmp(cmd, "adspup") == 0) {
+ 		/* the audio DSP's shared memory, read only (bsd/dev/pong_adsp.c) */
+ 		char adsp_reply[896];

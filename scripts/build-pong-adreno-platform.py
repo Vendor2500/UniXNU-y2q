@@ -163,6 +163,13 @@ def main():
         cmd[cmd.index('-c')+1]=str(source/(name+'.cpp'));cmd[-1]=str(obj)
         cmd+=['-I'+str(source/'submit')]
         subprocess.run(cmd,env=env,check=True);commands.append(cmd);objects.append(obj)
+    # SM-T970: PongAdreno's backend on the A650 (drivers/T970Adreno, MIT), entered by the kernel's `gpuprobe gpustart`
+    t970=ROOT/'drivers/T970Adreno/PongAdrenoCpT970.cpp'
+    if t970.is_file():
+        obj=out/'PongAdrenoCpT970.o';cmd=cpp_template.copy()
+        cmd[cmd.index('-c')+1]=str(t970);cmd[-1]=str(obj)
+        cmd+=['-I'+str(source/'submit')]
+        subprocess.run(cmd,env=env,check=True);commands.append(cmd);objects.append(obj)
     # Sheng's late accelerator class: bind the selected guest's IOAcceleratorES
     # ancestry, and defer its constructor until IOGPUFamily is loaded.
     abi=json.loads((ROOT/('configs/pong-iogpu-'+a.guest_build+'.json')).read_text())
