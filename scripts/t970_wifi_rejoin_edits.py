@@ -20,6 +20,18 @@ REJOIN_EDITS = (
      '      memset(pass, 0, sizeof pass); memset(&a, 0, sizeof a);\n      if(!r)pong_wifi_wake();\n'),
     ('case kDisassociate: case kDeauth: gUserJoin = true;',
      'case kDisassociate: case kDeauth: gUserJoin = true; gDaemonJoinOps++;'),
+    # z95: the module's start_connect() begins only from idle or scanning and returns without a word when joined, so a
+    # switch to another network (11-16: wi_gen_5G_56 -> wi_gen_2.4G_45) was taken and never done; iOS timed out with
+    # "cannot join". Leave the current network first (as kDisassociate does), then ask for the join.
+    ('      gKeyed = hasKey; int r = nw_wifi_connect(',
+     '      { nw_wifi_status cur; nw_wifi_status_get(&cur);\n'
+     '        if (cur.state >= NW_STA_AUTH) {\n'
+     '          log(6, "wifi-net: join while joined (state %u): leaving the current network first", cur.state);\n'
+     '          nw_wifi_disconnect(); pong_wifi_wake(); notify_locked(NotifyLinkDown);\n'
+     '          for (int i = 0; i < 100 && cur.state >= NW_STA_AUTH; i++) { IOSleep(20); nw_wifi_status_get(&cur); }\n'
+     '          log(6, "wifi-net: left, state %u", cur.state);\n'
+     '        } }\n'
+     '      gKeyed = hasKey; int r = nw_wifi_connect('),
 )
 
 REJOIN_TAIL = r'''
