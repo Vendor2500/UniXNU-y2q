@@ -1,0 +1,255 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 9d355ad..a5ec61c 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -99,6 +99,8 @@ extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpupro
+ extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpuprobe cpinit` (pong_gpu_gmu.c) */
+ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpuprobe cpzap` (pong_gpu_gmu.c) */
+ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
++extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
++extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+ extern int pong_surf_usb(char *reply, size_t cap, const char *cmd);   /* `surfstat`, `surflog`, `surftrace` (MiniIOSurface.cpp) */
+ extern int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);   /* `stackshot <pid>`, `stackget <offset>` */
+@@ -1800,7 +1802,7 @@ pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len)
+             return 0;
+         }
+     }
+-    return -1;
++    return pong_gpu_store_lookup(name, data, len);   /* the GPU firmware loaded at boot from the Data volume (pong_wifi_tools.c) */
+ }
+ 
+ /*
+@@ -2028,6 +2030,12 @@ dispatch_command(const char *cmd)
+ 		gs_reply[0] = '\0';
+ 		(void)pong_t970_gpu_start(gs_reply, sizeof(gs_reply));
+ 		send_str(gs_reply[0] ? gs_reply : "gpustart: no reply\n");
++	} else if (strcmp(cmd, "gpuauto") == 0 || strcmp(cmd, "gpusave") == 0) {
++		static char ga_reply[1500];
++
++		ga_reply[0] = '\0';
++		(void)pong_gpu_tools_usb(ga_reply, sizeof(ga_reply), strcmp(cmd, "gpusave") == 0);
++		send_str(ga_reply[0] ? ga_reply : "gpuauto: no reply\n");
+ 	} else if (strcmp(cmd, "gpuprobe selftest") == 0) {
+ 		static char st_reply[512];
+ 
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index fafe08b..300f26b 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -34,6 +34,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);     /* pong_usb_ctl.c: fwput slots */
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);              /* pong_wifi_stack.c */
+ extern void native_wifi_logf(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+ 
+@@ -47,8 +48,15 @@ int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);
+ extern int pong_publish_bare_accelerator(void);   /* iokit/Kernel/PongBareAccel.cpp */
+ void pong_exit_note(int pid, const char *name, int rv, uint32_t ns, uint64_t code, const char *why);
+ void pong_wifi_tools_init(void);
++int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
++int pong_gpu_tools_usb(char *reply, size_t cap, int what);
++extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
++extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);
++extern int pong_t970_gpu_start(char *reply, size_t cap);
++extern int pong_t970_gpu_selftest(char *reply, size_t cap);
+ 
+ #define FW_DIR       "/private/var/mobile/Library/Pong/qca6390-"
++#define GPU_DIR      "/private/var/mobile/Library/Pong/gpu-"   /* the A650 firmware: a650_gmu.bin, a650_sqe.fw, a650_zap.elf */
+ #define FW_MAX       (8u << 20)
+ #define FW_COUNT     4u
+ 
+@@ -68,7 +76,7 @@ static struct {
+ static void
+ fw_path(char *out, size_t cap, const char *name)
+ {
+-	(void)snprintf(out, cap, "%s%s", FW_DIR, name);
++	(void)snprintf(out, cap, "%s%s", strncmp(name, "a650_", 5) == 0 ? GPU_DIR : FW_DIR, name);
+ }
+ 
+ static int
+@@ -374,6 +382,166 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 	wt_idle_forever();
+ }
+ 
++/*
++ * The GPU without hands (stage D2a): `gpusave` writes the A650 firmware uploaded with `fwput` to the Data volume (GPU_DIR, read
++ * back and compared); with boot argument pong_gpu_auto=1 a thread loads it at boot and runs, before the Wi-Fi stack maps its windows,
++ * what the USB commands do by hand: gpuprobe gmustart (mode 11), gxon, gpustart (PongAdrenoCpT970.cpp), selftest. Each result line
++ * is kept for USB `gpuauto` and written to pmsg. Default off.
++ */
++#define GPU_FW_COUNT 3u
++static const char *const gpu_fw_names[GPU_FW_COUNT] = { "a650_gmu.bin", "a650_sqe.fw", "a650_zap.elf" };
++static struct {
++	uint8_t *data[GPU_FW_COUNT];
++	uint32_t len[GPU_FW_COUNT];
++	volatile int loaded;
++	int state, tries, rc;           /* state: 0 off, 1 waiting, 2 ran, 3 no firmware */
++	char line[4][320];
++} gs;
++
++int
++pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len)
++{
++	if (!name || !__atomic_load_n(&gs.loaded, __ATOMIC_ACQUIRE)) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < GPU_FW_COUNT; i++) {
++		if (strcmp(name, gpu_fw_names[i]) == 0) {
++			if (data) {
++				*data = gs.data[i];
++			}
++			if (len) {
++				*len = gs.len[i];
++			}
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++gpu_fw_load_all(void)
++{
++	uint8_t *data[GPU_FW_COUNT] = { NULL };
++	uint32_t len[GPU_FW_COUNT] = { 0 };
++	int e = 0;
++
++	for (uint32_t i = 0; i < GPU_FW_COUNT && e == 0; i++) {
++		e = fw_read(gpu_fw_names[i], &data[i], &len[i]);
++	}
++	if (e != 0) {
++		for (uint32_t i = 0; i < GPU_FW_COUNT; i++) {
++			if (data[i]) {
++				kfree_data(data[i], len[i]);
++			}
++		}
++		return e;
++	}
++	for (uint32_t i = 0; i < GPU_FW_COUNT; i++) {
++		gs.data[i] = data[i];
++		gs.len[i] = len[i];
++	}
++	__atomic_store_n(&gs.loaded, 1, __ATOMIC_RELEASE);
++	return 0;
++}
++
++static void
++gpu_keep(unsigned i, const char *text)
++{
++	(void)strlcpy(gs.line[i], text, sizeof(gs.line[i]));
++	pong_ramoops_diagnostic_write(gs.line[i], (int)strlen(gs.line[i]));
++}
++
++static void
++gpu_auto_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static char reply[1024];
++
++	gs.state = 1;
++	delay_for_interval(20000, 1000000u);
++	for (gs.tries = 0; gs.tries < 150; gs.tries++) {
++		gs.rc = gpu_fw_load_all();
++		if (gs.rc == 0) {
++			break;
++		}
++		delay_for_interval(2000, 1000000u);
++	}
++	if (gs.rc != 0) {
++		gs.state = 3;
++		wt_idle_forever();
++	}
++	reply[0] = '\0';
++	(void)pong_gpu_probe_usb(reply, sizeof(reply), 11);
++	{
++		const char *g = strstr(reply, "gmustart[");
++
++		gpu_keep(0, g ? g : reply);
++	}
++	if (strstr(reply, "gmustart[status=0 ")) {
++		reply[0] = '\0';
++		(void)pong_gpu_gmu_gx(1, reply, sizeof(reply));
++		gpu_keep(1, reply);
++		if (strstr(reply, "status=0 ")) {
++			reply[0] = '\0';
++			(void)pong_t970_gpu_start(reply, sizeof(reply));
++			gpu_keep(2, reply);
++			if (strstr(reply, "status=0 ")) {
++				reply[0] = '\0';
++				(void)pong_t970_gpu_selftest(reply, sizeof(reply));
++				gpu_keep(3, reply);
++			}
++		}
++	}
++	gs.state = 2;
++	wt_idle_forever();
++}
++
++/* what 0: `gpuauto` (the boot-time results), 1: `gpusave` */
++int
++pong_gpu_tools_usb(char *reply, size_t cap, int what)
++{
++	size_t n = 0;
++	int bad = 0;
++
++	if (what == 1) {
++		n = fw_add(cap, n, snprintf(reply + n, cap - n, "gpusave:"));
++		for (uint32_t i = 0; i < GPU_FW_COUNT; i++) {
++			const uint8_t *data = NULL;
++			uint32_t len = 0;
++			uint8_t *back = NULL;
++			uint32_t back_len = 0;
++			int e;
++
++			if (pong_fw_lookup(gpu_fw_names[i], &data, &len) != 0 || !data || !len) {
++				n = fw_add(cap, n, snprintf(reply + n, cap - n, " %s missing", gpu_fw_names[i]));
++				bad++;
++				continue;
++			}
++			e = fw_write(gpu_fw_names[i], data, len);
++			if (e == 0) {
++				e = fw_read(gpu_fw_names[i], &back, &back_len);
++				if (e == 0 && (back_len != len || memcmp(back, data, len) != 0)) {
++					e = EIO;
++				}
++				if (back) {
++					kfree_data(back, back_len);
++				}
++			}
++			n = fw_add(cap, n, snprintf(reply + n, cap - n, " %s %u %s", gpu_fw_names[i], len, e ? "FAIL" : "ok"));
++			bad += e != 0;
++		}
++		(void)snprintf(reply + n, cap - n, "%s\n", bad ? " -> not saved" : " -> saved (pong_gpu_auto=1 starts the GPU at boot)");
++		return bad ? -1 : 0;
++	}
++	n = fw_add(cap, n, snprintf(reply + n, cap - n, "gpuauto: state=%d tries=%d rc=%d\n", gs.state, gs.tries, gs.rc));
++	for (unsigned i = 0; i < 4; i++) {
++		if (gs.line[i][0]) {
++			n = fw_add(cap, n, snprintf(reply + n, cap - n, "%s%s", gs.line[i],
++			    gs.line[i][strlen(gs.line[i]) - 1] == '\n' ? "" : "\n"));
++		}
++	}
++	return 0;
++}
++
+ /* The IOAcceleratorES stand-in, a few seconds into boot (before Safari, widgets and posters first draw). */
+ static void
+ accel_standin_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -397,6 +565,15 @@ pong_wifi_tools_init(void)
+ 			thread_deallocate(at);
+ 		}
+ 	}
++	{
++		uint32_t gpu = 0;   /* pong_gpu_auto=1: the A650 started at boot from the firmware `gpusave` stored */
++		thread_t gt = THREAD_NULL;
++
++		(void)PE_parse_boot_argn("pong_gpu_auto", &gpu, sizeof(gpu));
++		if (gpu && kernel_thread_start(gpu_auto_thread, NULL, &gt) == KERN_SUCCESS) {
++			thread_deallocate(gt);
++		}
++	}
+ 	(void)PE_parse_boot_argn("pong_wifi_auto", &on, sizeof(on));
+ 	if (!on) {
+ 		return;

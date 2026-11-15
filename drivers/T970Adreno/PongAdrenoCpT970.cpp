@@ -20,6 +20,7 @@
 #include "submit/NativeAdrenoSmmuContext.h"
 #include "submit/NativeAdrenoCpInit.h"
 #include "submit/AdrenoPM4.h"
+#include "submit/NativeAdrenoIrq.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
@@ -27,6 +28,8 @@
 #include <libkern/libkern.h>
 #include <string.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
+#include <machine/machine_routines.h>
 #include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
 
@@ -41,6 +44,9 @@ extern uint64_t (*native_adreno_gpu_ticks)(void);
 extern volatile uint32_t native_adreno_wc_enabled;
 IOService *native_adreno_published_service(void);
 extern volatile uint32_t native_adreno_smmu_coherent_walk;   /* T970 patch of NativeAdrenoSmmuContext.cpp */
+extern volatile uint32_t native_adreno_irq_mask_override;    /* T970 patch of NativeAdrenoIrq.cpp */
+IOReturn armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);
+int get_preemption_level(void);
 int pong_t970_gpu_start(char *reply, size_t cap);
 int pong_t970_gpu_selftest(char *reply, size_t cap);
 }
@@ -72,7 +78,11 @@ struct Device {
     NativeAdrenoSubmit submit;
     NativeAdrenoTimer timer;
     NativeAdrenoStatus status;
+    NativeAdrenoIrq irq;
     PongCpBackend backend{};
+    uint32_t irq_count = 0, irq_fatal = 0, irq_route = 0;
+    uint64_t irq_affinity = 0;
+    bool irq_attached = false;
     unsigned output_bits = 0, slots[gpu_stream_count] = {};
     uint32_t alias_scratch[262144]{};
     bool started = false, poisoned = false;
@@ -84,7 +94,19 @@ int tries, selftests;
 
 uint64_t now(void *) {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000;}
 uint64_t vm_now() {return now(nullptr);}
-int idle(void *) {IODelay(20); return 0;}   /* no GPU interrupt yet (D1) */
+/* With the GPU interrupt attached a waiter sleeps until the next one or 1 ms (PongAdrenoCp.cpp idle); before that it spins 20 us */
+int idle(void *)
+{
+    if (gpu && gpu->irq_attached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && !get_preemption_level()) {
+        const uint32_t before = __atomic_load_n(&gpu->irq_count, __ATOMIC_ACQUIRE);
+        assert_wait_timeout(event_t(&gpu->irq_count), THREAD_UNINT, 1, NSEC_PER_MSEC);
+        if (__atomic_load_n(&gpu->irq_count, __ATOMIC_ACQUIRE) != before) thread_wakeup(event_t(&gpu->irq_count));
+        thread_block(THREAD_CONTINUE_NULL);
+    } else {
+        IODelay(20);
+    }
+    return 0;
+}
 int barrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 int reg_write(void *, uint32_t reg, uint32_t v)
 {
@@ -121,7 +143,21 @@ bool faulted()
     if ((fsr & SmmuContextFaultMask) || global || cp) {gpu->poisoned = true; gpu->status.noteFault();}
     return gpu->poisoned;
 }
-bool client_healthy() {return gpu && gpu->started && !faulted();}
+bool client_healthy() {return gpu && gpu->started && !gpu->irq_fatal && !faulted();}
+/* SPI 300 (INTID 332, DT kgsl_3d0_irq, level high): no logging or allocation here; NativeAdrenoIrq reads and clears RBBM status,
+ * a fatal status masks the GPU interrupts and poisons the client (PongAdrenoCp.cpp interrupt) */
+void interrupt(void *)
+{
+    NativeAdrenoIrqResult result = {};
+    const IOReturn st = gpu->irq.handle(&result);
+    __atomic_fetch_add(&gpu->irq_count, 1, __ATOMIC_RELAXED);
+    thread_wakeup(event_t(&gpu->irq_count));
+    if (st || (result.flags & NativeAdrenoIrqFatal)) {
+        __atomic_fetch_or(&gpu->irq_fatal, result.status ? result.status : 0x80000000u, __ATOMIC_RELEASE);
+        gpu->regs.write32(gpu->regs.cookie, 0x0038, 0);   /* RBBM_INT_0_MASK */
+        gpu->regs.barrier(gpu->regs.cookie);
+    }
+}
 
 int publish_ring(void *, const volatile uint32_t *words, size_t bytes)
 {
@@ -266,6 +302,17 @@ IOReturn start(char *zap, size_t zap_cap)
     }
     __asm__ volatile("dsb sy" ::: "memory");
     if (scratch[0] != write[3]) {stop("first_write"); return kIOReturnIOError;}
+    /* the GPU interrupt (D1): pong_gpu_irq=0 keeps the polled waits */
+    unsigned irq_on = 1;
+    PE_parse_boot_argn("pong_gpu_irq", &irq_on, sizeof irq_on);
+    if (irq_on) {
+        native_adreno_irq_mask_override = 0x03d0e242u;   /* A6XX_INT_MASK */
+        status = gpu->irq.attach(&gpu->regs);
+        if (!status) status = armcpu_spi_attach(332, false, interrupt, nullptr, &gpu->irq_route, &gpu->irq_affinity);
+        if (!status) status = gpu->irq.programMask(nullptr);
+        if (status) {wr(0x0038, 0); stop("irq_attach"); return status;}
+        gpu->irq_attached = true;
+    }
     gpu->step = 6;
     status = gpu->submit.attach(&gpu->vm, &gpu->ring);
     NativeAdrenoTimeIo timer = {nullptr, reg_read};
@@ -444,8 +491,8 @@ extern "C" int pong_t970_gpu_selftest(char *reply, size_t cap)
     for (int i = 0; i < 2; i++) matched[i] = uc_round(svc, &pass[i], &steps[i], &first_error[i], &first_step[i]);
     const bool ok = matched[0] == 4 && matched[1] == 4;
     snprintf(reply, cap, "selftest: status=%d run=%d round1=%d/4 steps=%u/%u err=%#x@%u round2=%d/4 steps=%u/%u err=%#x@%u"
-        " rptr=%#x wptr=%#x hwfault=%#x cb0_fsr=%#x gfsr=%#x\n", ok ? 0 : -1, selftests, matched[0], pass[0], steps[0], first_error[0],
-        first_step[0], matched[1], pass[1], steps[1], first_error[1], first_step[1], rd(RegRbRptr), rd(RegRbWptr), rd(RegCpHwFault),
-        sr(bank0() + 0x58), sr(0x48));
+        " rptr=%#x wptr=%#x hwfault=%#x cb0_fsr=%#x gfsr=%#x irq=%u/%u fatal=%#x route=%#x\n", ok ? 0 : -1, selftests, matched[0],
+        pass[0], steps[0], first_error[0], first_step[0], matched[1], pass[1], steps[1], first_error[1], first_step[1], rd(RegRbRptr),
+        rd(RegRbWptr), rd(RegCpHwFault), sr(bank0() + 0x58), sr(0x48), gpu->irq_attached, gpu->irq_count, gpu->irq_fatal, gpu->irq_route);
     return ok ? 0 : -1;
 }

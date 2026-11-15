@@ -151,6 +151,16 @@ SMMUCTX_CPP_REPLACEMENTS = (
     ('.asid=asid,.coherent_walk=1,', '.asid=asid,.coherent_walk=native_adreno_smmu_coherent_walk?1u:0u,'),
 )
 
+IRQ_CPP_REPLACEMENTS = (
+    ('uint32_t NativeAdrenoIrq::mask()\n{\n    return kEnable;\n}\n',
+     '/* nonzero: the RBBM mask to program instead of A7XX_INT_MASK (the SM-T970 backend sets A6XX_INT_MASK 0x03d0e242) */\n'
+     'extern "C" {volatile uint32_t native_adreno_irq_mask_override=0;}\n'
+     'uint32_t NativeAdrenoIrq::mask()\n{\n    return native_adreno_irq_mask_override?native_adreno_irq_mask_override:kEnable;\n}\n'),
+    ('    if(io_.write32(io_.cookie,IrqRbbmMask,kEnable))return poison();\n',
+     '    const uint32_t want=mask();\n    if(io_.write32(io_.cookie,IrqRbbmMask,want))return poison();\n'),
+    ('    if(readback!=kEnable)return poison();\n', '    if(readback!=want)return poison();\n'),
+)
+
 
 def apply_replacements(path: Path, pairs: tuple[tuple[str, str], ...]) -> bool:
     if not path.is_file():
@@ -185,6 +195,7 @@ def patch_pong_adreno(adreno_source: Path) -> None:
         ('submit/NativeAdrenoCpInit.h', CPINIT_H_REPLACEMENTS),
         ('submit/NativeAdrenoCpInit.cpp', CPINIT_CPP_REPLACEMENTS),
         ('submit/NativeAdrenoSmmuContext.cpp', SMMUCTX_CPP_REPLACEMENTS),
+        ('submit/NativeAdrenoIrq.cpp', IRQ_CPP_REPLACEMENTS),
     ):
         target = root / rel
         if apply_replacements(target, pairs):
