@@ -314,6 +314,19 @@ def add_ipi_timing(txt: str) -> str:
     return txt
 
 
+def relax_spi_group(txt: str) -> str:
+    """armcpu_spi_attach: do not require IGROUPR to read back the group-1 bit. On this tablet the distributor reads it as 0 for
+    the GPU's SPI 332 (RAZ/WI from this side), yet UniXNU-gts7xlwifi drivers/ArmCpu (same tablet) attaches the same SPI without
+    that check and its interrupt is delivered (GpuProbe.cpp mode 10). half68 stopped at irq_attach with kIOReturnNotPermitted."""
+    old = '      if(!waitClear(gDist,0,1u<<31) || !(read32(gDist,0x80+word)&bit))result=kIOReturnNotPermitted;\n'
+    new = ('      // T970: IGROUPR may read the group bit as 0 (RAZ/WI from here) and the SPI still arrives (UniXNU-gts7xlwifi)\n'
+           '      if(!waitClear(gDist,0,1u<<31))result=kIOReturnTimeout;\n')
+    if new in txt:
+        return txt
+    assert txt.count(old) == 1, 'expected exactly one IGROUPR readback check in armcpu_spi_attach'
+    return txt.replace(old, new)
+
+
 def patch_armcpu(armcpu_source: Path):
     armcpu_source = armcpu_source.resolve()
     target = armcpu_source / 'ArmCpu.cpp' if armcpu_source.is_dir() else armcpu_source
@@ -428,7 +441,7 @@ static void spiIpiSend(uintptr_t dist, uint32_t core)
       if (ipi_handler) ipi_handler();"""
     txt = txt.replace(needle_irq, replacement_irq)
 
-    txt = add_ipi_timing(add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt)))))
+    txt = relax_spi_group(add_ipi_timing(add_ipi_late(add_tick_fallback(add_gic_bench(add_ipi_counters(txt))))))
     target.write_text(txt, encoding='utf-8')
     print(f'Applied SM-T970 ArmCpu patch to {target}', flush=True)
 

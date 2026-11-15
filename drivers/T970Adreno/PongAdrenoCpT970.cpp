@@ -80,7 +80,7 @@ struct Device {
     NativeAdrenoStatus status;
     NativeAdrenoIrq irq;
     PongCpBackend backend{};
-    uint32_t irq_count = 0, irq_fatal = 0, irq_route = 0;
+    uint32_t irq_count = 0, irq_fatal = 0, irq_route = 0, irq_status = 0;
     uint64_t irq_affinity = 0;
     bool irq_attached = false;
     unsigned output_bits = 0, slots[gpu_stream_count] = {};
@@ -310,8 +310,9 @@ IOReturn start(char *zap, size_t zap_cap)
         status = gpu->irq.attach(&gpu->regs);
         if (!status) status = armcpu_spi_attach(332, false, interrupt, nullptr, &gpu->irq_route, &gpu->irq_affinity);
         if (!status) status = gpu->irq.programMask(nullptr);
-        if (status) {wr(0x0038, 0); stop("irq_attach"); return status;}
-        gpu->irq_attached = true;
+        /* without the interrupt the backend still works with polled waits: note why and go on */
+        if (status) {wr(0x0038, 0); gpu->irq_status = uint32_t(status); status = kIOReturnSuccess;}
+        else gpu->irq_attached = true;
     }
     gpu->step = 6;
     status = gpu->submit.attach(&gpu->vm, &gpu->ring);
@@ -491,8 +492,8 @@ extern "C" int pong_t970_gpu_selftest(char *reply, size_t cap)
     for (int i = 0; i < 2; i++) matched[i] = uc_round(svc, &pass[i], &steps[i], &first_error[i], &first_step[i]);
     const bool ok = matched[0] == 4 && matched[1] == 4;
     snprintf(reply, cap, "selftest: status=%d run=%d round1=%d/4 steps=%u/%u err=%#x@%u round2=%d/4 steps=%u/%u err=%#x@%u"
-        " rptr=%#x wptr=%#x hwfault=%#x cb0_fsr=%#x gfsr=%#x irq=%u/%u fatal=%#x route=%#x\n", ok ? 0 : -1, selftests, matched[0],
+        " rptr=%#x wptr=%#x hwfault=%#x cb0_fsr=%#x gfsr=%#x irq=%u/%u fatal=%#x route=%#x irqerr=%#x\n", ok ? 0 : -1, selftests, matched[0],
         pass[0], steps[0], first_error[0], first_step[0], matched[1], pass[1], steps[1], first_error[1], first_step[1], rd(RegRbRptr),
-        rd(RegRbWptr), rd(RegCpHwFault), sr(bank0() + 0x58), sr(0x48), gpu->irq_attached, gpu->irq_count, gpu->irq_fatal, gpu->irq_route);
+        rd(RegRbWptr), rd(RegCpHwFault), sr(bank0() + 0x58), sr(0x48), gpu->irq_attached, gpu->irq_count, gpu->irq_fatal, gpu->irq_route, gpu->irq_status);
     return ok ? 0 : -1;
 }
