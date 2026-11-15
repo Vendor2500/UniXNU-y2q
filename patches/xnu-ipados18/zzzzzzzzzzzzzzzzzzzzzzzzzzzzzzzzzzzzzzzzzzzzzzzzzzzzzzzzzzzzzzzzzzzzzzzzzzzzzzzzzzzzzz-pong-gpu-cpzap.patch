@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
-index accf765..2e282ec 100644
+index accf765..b67f921 100644
 --- a/bsd/dev/pong_gpu_gmu.c
 +++ b/bsd/dev/pong_gpu_gmu.c
 @@ -31,6 +31,14 @@
@@ -42,7 +42,7 @@ index accf765..2e282ec 100644
  	rc = 0;
  out:
  	gg_mark('d', gc.step, (uint32_t)rc);
-@@ -1129,4 +1139,262 @@ out:
+@@ -1129,4 +1139,275 @@ out:
  	return rc;
  }
  
@@ -51,6 +51,7 @@ index accf765..2e282ec 100644
 +extern uint64_t vm_first_phys, vm_last_phys;             /* the memory XNU manages */
 +extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 +#define GZ_PHYS         0x9031a000ull                /* live FDT pil_gpu_region@8681a000 reg (Samsung moved it), no-map */
 +#define GZ_BYTES        0x2000u
 +#define GZ_PAS          13u                          /* DT qcom,kgsl-hyp qcom,pas-id */
@@ -126,6 +127,16 @@ index accf765..2e282ec 100644
 +	if (tries) {
 +		snprintf(reply, cap, "cpzap: stop=once_per_boot\n");
 +		return -1;
++	}
++	{
++		uint32_t sptp = 0;
++
++		/* GX powered and clocked, the ring drained and no CP fault before TrustZone is asked anything */
++		if (gg_read32(NULL, A650GmuCore, 0x50d0u * 4u, &sptp) || (sptp & 0xc0u) || gc_r(0x0806) != gc.wptr || gc_r(0x0821)) {
++			snprintf(reply, cap, "cpzap: stop=gpu_state sptprac=%#x rptr=%#x wptr=%u hwfault=%#x\n", sptp, gc_r(0x0806),
++			    gc.wptr, gc_r(0x0821));
++			return -1;
++		}
 +	}
 +	if (pong_fw_lookup("a650_zap.elf", &fw, &size) != 0 || !fw || size < 52 || fw[0] != 0x7f || fw[1] != 'E' ||
 +	    fw[2] != 'L' || fw[3] != 'F' || fw[4] != 1) {
@@ -218,7 +229,9 @@ index accf765..2e282ec 100644
 +	step = 5;                                            /* the loadable segments into the region, device mapping, then unmapped */
 +	gg_mark('z', 5, 0);
 +	{
-+		const vm_offset_t region = ml_io_map(GZ_PHYS, GZ_BYTES);
++		/* kernel_map, write-combining (as GpuProbe.cpp:1099-1101): ml_io_map's io_submap entries are permanent and
++		 * ml_io_unmap would panic freeing one (vm_map_delete on a permanent entry; review 11-15) */
++		const vm_offset_t region = ml_io_map_unmappable(GZ_PHYS, GZ_BYTES, GG_WIMG_WCOMB);
 +		const uint64_t base = relocate ? lo : GZ_PHYS;
 +
 +		if (!region) {
