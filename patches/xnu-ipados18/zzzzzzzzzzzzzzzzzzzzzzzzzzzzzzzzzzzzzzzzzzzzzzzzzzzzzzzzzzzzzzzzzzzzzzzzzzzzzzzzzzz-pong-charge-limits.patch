@@ -1,0 +1,127 @@
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index 45383f0..ceb2ac1 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -589,8 +589,9 @@ IOPMPowerSource::legacyIOBatteryInfo(void)
+ 
+ /*
+  * SM-T970 MAX77705 telemetry. Every transaction below is an I2C read except
+- * one: the charger watchdog kick (kickChargerWatchdog). No other charger
+- * configuration, regulator, or MUIC command is written by this feature.
++ * the charger watchdog kick (kickChargerWatchdog) and, with a cable in, the
++ * input / charge current limits (applyChargeLimits, 11-15) with the one USBC
++ * firmware command they need (autoIbusOff).
+  *
+  * DT evidence: work/gts7xlwifi.dtb, /soc/i2c@980000 (QUP SE0, Linux bus 2),
+  * with North TLMM GPIO 28 SDA / 29 SCL. Fuel gauge 0x36 and charger 0x69
+@@ -755,6 +756,72 @@ static int kickChargerWatchdog(uint8_t *before) {
+ 	rc = writeReg(kT970Charger, 0xbd, uint8_t((cnfg06 & ~3u) | 1u));
+ 	return rc ? rc - 10 : 0;
+ }
++/*
++ * Input and charge current (11-15). The boot loader leaves CHGIN_ILIM (CHG_CNFG_09 0xc0 bits 6:0, (n + 1) * 25 mA) at 0x13 =
++ * 500 mA and CHG_CC (CHG_CNFG_02 0xb9 bits 5:0, n * 50 mA) at 500 mA (USB `temp`: chg ... 4a ... 13), below what the screen
++ * and the SoC draw, so the battery ran down with a 45 W charger in. As UniXNU-gts7xlwifi package/T970Battery.cpp:17-28,
++ * 245-290 (same tablet, after Samsung's max77705_charger.c): the limits come from the cable, USBC (0x25) CC_STATUS0 0x0a
++ * bits 5:4 (Rp 1 default / 2 1.5 A / 3 3.0 A) and BC_STATUS 0x08 bits 1:0 (BC1.2 1 SDP / 2 CDP / 3 DCP, with bit 7 VBUS),
++ * the larger winning, with this tablet's battery node values (rp 475/1400/3000 mA, DCP input 1800 / charge 2100, USB 475,
++ * charge at most 3150), derated by the gauge temperature (>= 45 C 1000 mA, >= 50 C or < 0 C 100 mA). The protected charger
++ * registers are unlocked first (CHG_CNFG_06 bits 3:2 CHGPROT = 11), CHG_EN (CHG_CNFG_09 bit 7) stays set, and CHG_CNFG_12
++ * VCHGIN_REG goes to 4.5 V (bits 4:3 = 00) as the precedent's combo11a. 5 V only: no PD / AFC request.
++ * pong_charger_limits=0 leaves all of this out.
++ */
++extern "C" { extern int pong_charger_limit_ma[3]; int pong_charger_limit_ma[3]; }   /* input mA, charge mA, applies */
++static int autoIbusOff(void) {
++	/* SAMSUNG_FW_AUTOIBUS (0x57) data 0x01 (firmware on, auto-IBUS off) so CHGIN_ILIM is ours to set; skipped when
++	 * CHG_DETAILS_00 bit 7 already says the charger sets it (T970Battery.cpp:137-143). 1 sent and echoed, 2 not needed. */
++	uint8_t d00 = 0, echo = 0;
++	if (!readReg(kT970Charger, 0xb3, &d00, 1) && (d00 & 0x80)) return 2;
++	if (!readReg(0x25, 0x51, &echo, 1) && echo == 0x57) return 3;   /* the chip keeps its last reply: already sent */
++	if (writeReg(0x25, 0x21, 0x57) || writeReg(0x25, 0x22, 0x01) || writeReg(0x25, 0x41, 0x00)) return -1;
++	for (unsigned t = 0; t < 10; ++t) {
++		IOSleep(10);
++		if (!readReg(0x25, 0x51, &echo, 1) && echo == 0x57) return 1;
++	}
++	return -2;
++}
++static int applyChargeLimits(int decic, uint8_t *cc0Out, uint8_t *bcOut) {
++	uint8_t cc0 = 0, bc = 0, c06 = 0, c09 = 0, c02 = 0, c12 = 0;
++	int in = 500, chg = 500, rpIn = 0, rpChg = 0, bcIn = 0, bcChg = 0;
++	(void)readReg(0x25, 0x0a, &cc0, 1);
++	(void)readReg(0x25, 0x08, &bc, 1);
++	*cc0Out = cc0;
++	*bcOut = bc;
++	switch ((cc0 >> 4) & 3) {
++	case 1: rpIn = 475; rpChg = 475; break;
++	case 2: rpIn = 1400; rpChg = 2100; break;
++	case 3: rpIn = 3000; rpChg = 3150; break;
++	}
++	if (bc & 0x80) {
++		switch (bc & 3) {
++		case 1: bcIn = 475; bcChg = 475; break;
++		case 2: bcIn = 1500; bcChg = 1500; break;
++		case 3: bcIn = 1800; bcChg = 2100; break;
++		}
++	}
++	if (rpIn || bcIn) {
++		in = rpIn > bcIn ? rpIn : bcIn;
++		chg = rpChg > bcChg ? rpChg : bcChg;
++	}
++	if (decic >= 500 || decic < 0) chg = 100;
++	else if (decic >= 450 && chg > 1000) chg = 1000;
++	if (in > 3200) in = 3200;
++	if (chg > 3150) chg = 3150;
++	pong_charger_limit_ma[0] = in;
++	pong_charger_limit_ma[1] = chg;
++	if (readReg(kT970Charger, 0xbd, &c06, 1)) return -1;
++	if ((c06 & 0x0c) != 0x0c && writeReg(kT970Charger, 0xbd, uint8_t(c06 | 0x0c))) return -2;
++	const uint8_t ilim = uint8_t(in / 25 - 1), cc = uint8_t(chg / 50);
++	if (readReg(kT970Charger, 0xc0, &c09, 1) || readReg(kT970Charger, 0xb9, &c02, 1)) return -3;
++	int rc = 0;
++	if (uint8_t(c09 & 0x7f) != ilim || !(c09 & 0x80)) rc |= writeReg(kT970Charger, 0xc0, uint8_t(0x80 | ilim)) ? 4 : 0;
++	if (uint8_t(c02 & 0x3f) != cc) rc |= writeReg(kT970Charger, 0xb9, uint8_t((c02 & 0xc0) | cc)) ? 8 : 0;
++	if (!readReg(kT970Charger, 0xc3, &c12, 1) && (c12 & 0x18)) rc |= writeReg(kT970Charger, 0xc3, uint8_t(c12 & ~0x18u)) ? 16 : 0;
++	if (!rc) pong_charger_limit_ma[2]++;
++	return -rc;
++}
+ static int readWord(uint8_t address, uint8_t reg, uint16_t *value) {
+ 	uint8_t b[2] = {};
+ 	const int rc = readReg(address, reg, b, 2);
+@@ -867,6 +934,10 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 	PE_parse_boot_argn("pong_batt_sample_ticks", &sampleTicks, sizeof(sampleTicks));
+ 	if (sampleTicks < 1 || sampleTicks > 360) sampleTicks = 6;
+ 	PE_parse_boot_argn("pong_batt_spin", &gT970Spin, sizeof(gT970Spin));
++	unsigned limits = 1, lastIn = 0, lastChg = 0;
++	int ibus = 0;
++	uint8_t lastCc0 = 0xff, lastBc = 0xff;
++	PE_parse_boot_argn("pong_charger_limits", &limits, sizeof(limits));
+ 	batteryPmsg("PONG_BATT cfg kick=%u sample_ticks=%u spin=%u\n", kick, sampleTicks, gT970Spin);
+ 	for (;;) {
+ 		if (kick == 1) {
+@@ -878,6 +949,26 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 				batteryPmsg("PONG_BATT wdt first kick cnfg06=%02x\n", cnfg06);
+ 			}
+ 		}
++		if (limits == 1) {   /* every tick (10 s) with a cable in, so a watchdog or firmware reset cannot keep 500 mA */
++			uint8_t ok = 0;
++			if (!readReg(kT970Charger, 0xb2, &ok, 1) && (ok & 0x40)) {
++				if (ibus == 0 && tick >= 6) {   /* a minute after boot, once, as the precedent (after the MUIC settles) */
++					ibus = autoIbusOff();
++					batteryPmsg("PONG_BATT autoibus %d\n", ibus);
++				}
++				uint8_t cc0 = 0, bc = 0;
++				const int lrc = applyChargeLimits(pong_battery_last_decic == -32768 ? 250 : pong_battery_last_decic, &cc0, &bc);
++				if (lrc || cc0 != lastCc0 || bc != lastBc || unsigned(pong_charger_limit_ma[0]) != lastIn ||
++				    unsigned(pong_charger_limit_ma[1]) != lastChg) {
++					batteryPmsg("PONG_BATT limits in=%d chg=%d cc0=%02x bc=%02x rc=%d n=%d\n", pong_charger_limit_ma[0],
++					    pong_charger_limit_ma[1], cc0, bc, lrc, pong_charger_limit_ma[2]);
++				}
++				lastCc0 = cc0; lastBc = bc;
++				lastIn = unsigned(pong_charger_limit_ma[0]); lastChg = unsigned(pong_charger_limit_ma[1]);
++			} else {
++				lastCc0 = lastBc = 0xff;
++			}
++		}
+ 		if (tick++ % sampleTicks) {
+ 			IOSleep(10000);
+ 			continue;
