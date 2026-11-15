@@ -1,13 +1,12 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index c3d1fdd..8f25562 100644
+index c3d1fdd..130a063 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -411,6 +411,12 @@ bsd/dev/pong_wifi_survey.c		standard
+@@ -411,6 +411,11 @@ bsd/dev/pong_wifi_survey.c		standard
  bsd/dev/pong_wifi_link.c		standard
  bsd/dev/pong_wifi_stack.c		standard
  bsd/dev/pong_wifi_tools.c		standard
 +bsd/dev/pong_gpu_gmu.c		standard
-+bsd/dev/adreno/AdrenoFirmware.c		standard
 +bsd/dev/adreno/AdrenoHfi.c		standard
 +bsd/dev/adreno/AdrenoHfiStartup.c		standard
 +bsd/dev/adreno/AdrenoHfiVotes.c		standard
@@ -17,10 +16,10 @@ index c3d1fdd..8f25562 100644
  bsd/dev/pong_backlight_t970.c		standard
 diff --git a/bsd/dev/adreno/A650Gmu.c b/bsd/dev/adreno/A650Gmu.c
 new file mode 100644
-index 0000000..ccdb9c6
+index 0000000..2eaced2
 --- /dev/null
 +++ b/bsd/dev/adreno/A650Gmu.c
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,397 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +#include "A650Gmu.h"
 +#include "AdrenoFirmware.h"
@@ -86,11 +85,12 @@ index 0000000..ccdb9c6
 +    last = start;
 +    for (unsigned i = 0; i < budget; ++i) {
 +        if (d->services.now_us(d->services.cookie, &now) || now < last) return A650GmuClockError;
-+        if (now - start >= 10000) return A650GmuTimeout;
 +        last = now; ++r->poll_reads;
 +        if (faults) {A650GmuStatus f = check_faults(d, r); if (f != A650GmuSuccess) return f;}
 +        if (read32(d, w, dword, observed, r)) return A650GmuIoError;
 +        if ((*observed & mask) == expected) return d->io.barrier(d->io.cookie) ? A650GmuIoError : A650GmuSuccess;
++        /* PONG: the deadline after the read, so a preempted poll still sees a ready word once (review 11-15) */
++        if (now - start >= 10000) return A650GmuTimeout;
 +        if (i + 1 < budget && d->services.wait_us(d->services.cookie, 100)) return A650GmuClockError;
 +    }
 +    return A650GmuTimeout;
@@ -520,81 +520,6 @@ index 0000000..84c690e
 +}
 +#endif
 +#endif
-diff --git a/bsd/dev/adreno/AdrenoFirmware.c b/bsd/dev/adreno/AdrenoFirmware.c
-new file mode 100644
-index 0000000..e776c80
---- /dev/null
-+++ b/bsd/dev/adreno/AdrenoFirmware.c
-@@ -0,0 +1,69 @@
-+/* SPDX-License-Identifier: BSD-2-Clause-Patent */
-+#include "AdrenoFirmware.h"
-+
-+static uint32_t le32(const uint8_t *p)
-+{
-+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
-+         (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-+}
-+
-+AdrenoFirmwareResult AdrenoFirmwarePlanGmu(
-+    const uint8_t *firmware, size_t bytes,
-+    const AdrenoFirmwareRegion *regions, size_t region_count,
-+    AdrenoFirmwareBlock *blocks, size_t capacity, size_t *count)
-+{
-+  if (!count) return AdrenoFirmwareInvalid;
-+  *count = 0;
-+  if (!firmware || !regions || !blocks || !region_count || region_count > 64)
-+    return AdrenoFirmwareInvalid;
-+  if (bytes < 16) return AdrenoFirmwareTruncated;
-+  for (size_t i = 0; i < region_count; ++i) {
-+    const AdrenoFirmwareRegion *a = regions + i;
-+    if (!a->bytes || (a->address & 3) || (a->bytes & 3) ||
-+        a->bytes > UINT64_C(0x100000000) - a->address || a->identifier == UINT32_MAX)
-+      return AdrenoFirmwareInvalid;
-+    for (size_t j = 0; j < i; ++j) {
-+      const AdrenoFirmwareRegion *b = regions + j;
-+      if (a->identifier == b->identifier ||
-+          ((uint64_t)a->address < (uint64_t)b->address + b->bytes &&
-+           (uint64_t)b->address < (uint64_t)a->address + a->bytes))
-+        return AdrenoFirmwareInvalid;
-+    }
-+  }
-+  for (unsigned pass = 0; pass < 2; ++pass) {
-+    size_t offset = 0, n = 0;
-+    while (offset < bytes) {
-+      if (bytes - offset < 16) return AdrenoFirmwareTruncated;
-+      uint32_t address = le32(firmware + offset);
-+      uint32_t length = le32(firmware + offset + 4);
-+      uint32_t identifier = UINT32_MAX;
-+      if (length > bytes - offset - 16) return AdrenoFirmwareTruncated;
-+      if (length) {
-+        if ((address & 3) || (length & 3) ||
-+            length > UINT64_C(0x100000000) - address)
-+          return AdrenoFirmwareInvalid;
-+        for (size_t i = 0; i < region_count; ++i) {
-+          if (address >= regions[i].address && length <= regions[i].bytes &&
-+              (uint64_t)address - regions[i].address <= regions[i].bytes - length) {
-+            identifier = regions[i].identifier;
-+            break;
-+          }
-+        }
-+        if (identifier == UINT32_MAX) return AdrenoFirmwareUnmapped;
-+      }
-+      if (n == capacity) return AdrenoFirmwareNoSpace;
-+      if (pass) {
-+        blocks[n].address = address;
-+        blocks[n].bytes = length;
-+        blocks[n].type = le32(firmware + offset + 8);
-+        blocks[n].value = le32(firmware + offset + 12);
-+        blocks[n].payload_offset = offset + 16;
-+        blocks[n].region_identifier = identifier;
-+      }
-+      n++;
-+      offset += 16 + (size_t)length;
-+    }
-+    if (pass) *count = n;
-+  }
-+  return AdrenoFirmwareSuccess;
-+}
 diff --git a/bsd/dev/adreno/AdrenoFirmware.h b/bsd/dev/adreno/AdrenoFirmware.h
 new file mode 100644
 index 0000000..9588fa7
@@ -1275,10 +1200,10 @@ index 0000000..217b4df
 +POSSIBILITY OF SUCH DAMAGE.
 diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
 new file mode 100644
-index 0000000..fb3e299
+index 0000000..6b2f526
 --- /dev/null
 +++ b/bsd/dev/pong_gpu_gmu.c
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,548 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/*
 + * SM-T970 (SM8250, Adreno 650): the GMU cold start, `gpuprobe gmustart` (mode 11 of pong_gpu_probe.c).
@@ -1291,8 +1216,9 @@ index 0000000..fb3e299
 + *      the device tree's mask 0x400 (0x84000005: this SMMU took that pair and refused the precedent's two exact routes,
 + *      `gpuprobe gsmmu` 11-13). Non-coherent table walks and Normal non-cacheable memory, as the precedent;
 + *   2. the GMU's four memory regions (a6xx_gmu_init for the a650): the instruction cache region at IOVA 0x4000
-+ *      (to 0x160000, executable: the firmware's blocks and working RAM reach 0x15ffff), the dummy page at 0x60000000, the log (16 KiB) at 0x60004000 and the HFI
-+ *      queues (16 KiB) at 0x60008000, in one wired kernel block whose pages are write-combining for the CPU;
++ *      (to 0x160000, executable: the firmware's blocks and working RAM reach 0x15ffff), the dummy region (16 KiB) at
++ *      0x60000000, the log (16 KiB) at 0x60004000 and the HFI queues (16 KiB) at 0x60008000, each region mapped at its
++ *      own IOVA, in one wired kernel block whose pages are write-combining for the CPU;
 + *   3. the HFI startup tables from the AOP command DB: the gfx/mx/cx ARC level tables and the MC0/SH0/ACV/CN0 BCM
 + *      addresses (A650GmuBuildStartup);
 + *   4. a650_gmu.bin from the USB `fwput` slots, then A650GmuColdStart: the RSC, the firmware into ITCM/DTCM and the
@@ -1320,8 +1246,11 @@ index 0000000..fb3e299
 +extern unsigned int pmap_cache_attributes(ppnum_t pn);
 +extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
 +extern uint64_t mach_absolute_time(void);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern vm_offset_t g_cmd_db_page;   /* pong_gpu_probe.c: mode 6 maps the AOP command DB (0x80860000, 0x20000) */
 +
 +int pong_gpu_gmu_start(char *reply, size_t cap);
++int pong_gpu_gmu_attempted(void);
 +
 +/* ---- the windows (device tree: qcom,gmu@3d6a000, gmu rscc 0x3de0000, gpu pdc 0xb290000, kgsl-smmu@3da0000) ---- */
 +#define GG_CORE_PHYS    0x03d6a000UL
@@ -1329,8 +1258,7 @@ index 0000000..fb3e299
 +#define GG_PDC_PHYS     0x0b290000UL
 +#define GG_SMMU_PHYS    0x03da0000UL
 +#define GG_SMMU_BYTES   0x10000UL
-+#define GG_CMDDB_PHYS   0x80860000UL
-+#define GG_CMDDB_BYTES  0x20000UL
++#define GG_CMDDB_BYTES  0x20000UL           /* mapped by pong_gpu_probe.c mode 6 */
 +#define GG_CMDDB_MAGIC  0x0c0330dbu
 +#define GG_CMDDB_DATA   0x90u
 +
@@ -1362,8 +1290,10 @@ index 0000000..fb3e299
 +#define GG_TCR          0x00800020u         /* T0SZ 32, non-cacheable non-shareable walks, EPD1 */
 +#define GG_MAIR0        0x44u               /* attr 0: Normal non-cacheable */
 +#define GG_SCTLR        0x27u               /* CFRE AFE TRE M */
-+#define GG_LEAF         0x0060000000000c43ull   /* 4 KiB page, AP EL0 RW, AF, nG, XN; non-shareable, attr 0 */
-+#define GG_LEAF_X       0x0000000000000c43ull   /* the same, executable: the icache region (the GMU fetches from it) */
++#define GG_LEAF         0x0060000000000c03ull   /* 4 KiB page, AF, nG, EL1-only RW (AP 00), XN; non-shareable, attr 0 */
++#define GG_LEAF_X       0x0000000000000c03ull   /* the same, executable: the icache region. AP must stay 00: an EL0-writable
++                                                 * page is implicitly privileged-execute-never (the GMU fetches as privileged;
++                                                 * CakeAL GmuTables.h, rui ArmSmmu4K.c and Linux MSM_BO_MAP_PRIV agree). SCTLR.WXN = 0. */
 +#define GG_WIMG_WCOMB   0x6u
 +
 +/* ---- the GMU's memory: one block, its IOVAs ---- */
@@ -1372,12 +1302,14 @@ index 0000000..fb3e299
 +                                             * at 0x144000 (0x13000) and 0x157000 (0x9000), where the GMU runs code (CakeAL
 +                                             * UniXNU-sm-t970 v127: privileged fetches at 0x153e00/0x154600) */
 +#define GG_DUMMY_IOVA   0x60000000ull
-+#define GG_DUMMY_BYTES  0x1000u
++#define GG_DUMMY_BYTES  0x4000u             /* 16 KiB: log and HFI start at 0x60004000 / 0x60008000 */
 +#define GG_LOG_IOVA     0x60004000ull
 +#define GG_LOG_BYTES    0x4000u
 +#define GG_HFI_IOVA     0x60008000ull
 +#define GG_HFI_BYTES    0x4000u
 +#define GG_BLOCK_BYTES  (GG_ICACHE_BYTES + GG_DUMMY_BYTES + GG_LOG_BYTES + GG_HFI_BYTES)
++_Static_assert(GG_HFI_IOVA + GG_HFI_BYTES - GG_DUMMY_IOVA <= 0x200000u, "one L3 table covers 0x60000000..");
++_Static_assert(GG_ICACHE_IOVA + GG_ICACHE_BYTES <= 0x200000u, "one L3 table covers 0..2 MiB");
 +#define GG_TABLE_BYTES  0x8000u             /* L1, L2 for 0..1 GiB, L2 for 1..2 GiB, L3 for 0..2 MiB, L3 for 0x60000000.. */
 +
 +static struct {
@@ -1393,7 +1325,35 @@ index 0000000..fb3e299
 +	A650GmuStartupResult result;
 +	uint8_t aux[3][64];
 +	uint32_t aux_len[3], bcm[4];
++	uint32_t s2_orig, rb_off, rb_got, gfsr0;
 +} gg;
++
++/* `[PONG_GPU] G<tag> a b` to pmsg, then dsb: a hang or SError leaves the last step in pstore */
++static void
++gg_mark(char tag, uint32_t a, uint32_t b)
++{
++	char line[48];
++	int n = snprintf(line, sizeof(line), "[PONG_GPU] G%c %x %x\n", tag, a, b);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
++
++static uint32_t gg_last_phase = 0xffffffffu, gg_last_stage = 0xffffffffu;
++
++static void
++gg_progress(unsigned w, size_t at)
++{
++	const uint32_t ph = gg.result.load.phase, stg = (uint32_t)gg.result.protocol.stage;
++
++	if (ph != gg_last_phase || stg != gg_last_stage) {
++		gg_last_phase = ph;
++		gg_last_stage = stg;
++		gg_mark('P', (ph << 16) | (stg & 0xffffu), ((uint32_t)w << 24) | (uint32_t)(at & 0xffffffu));
++	}
++}
 +
 +static inline uint32_t
 +gg_rd(vm_offset_t base, uint32_t off)
@@ -1404,6 +1364,7 @@ index 0000000..fb3e299
 +static inline void
 +gg_wr(vm_offset_t base, uint32_t off, uint32_t v)
 +{
++	gg_mark('S', off, v);
 +	*(volatile uint32_t *)(base + off) = v;
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
@@ -1416,6 +1377,7 @@ index 0000000..fb3e299
 +	if (w >= A650GmuWindows || !gg.win[w] || (at & 3) || at + 4 > gg.dev.io.bytes[w]) {
 +		return 1;
 +	}
++	gg_progress(w, at);
 +	*v = *(volatile uint32_t *)(gg.win[w] + at);
 +	return 0;
 +}
@@ -1427,7 +1389,9 @@ index 0000000..fb3e299
 +	if (w >= A650GmuWindows || !gg.win[w] || (at & 3) || at + 4 > gg.dev.io.bytes[w]) {
 +		return 1;
 +	}
++	gg_progress(w, at);
 +	*(volatile uint32_t *)(gg.win[w] + at) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
 +	return 0;
 +}
 +
@@ -1553,10 +1517,17 @@ index 0000000..fb3e299
 +		t[1536 + ((GG_ICACHE_IOVA >> 12) & 511u) + i] = (pa_of[i] & 0x0000fffffffff000ull) | GG_LEAF_X;
 +	}
 +	{
-+		const uint32_t first = GG_ICACHE_BYTES / 4096, pages = (GG_DUMMY_BYTES + GG_LOG_BYTES + GG_HFI_BYTES) / 4096;
++		/* each region at its own IOVA (review 11-15: a run-on mapping put log and HFI 12 KiB below their IOVAs) */
++		static const struct { uint32_t off, bytes; uint64_t iova; } rg[3] = {
++			{ GG_ICACHE_BYTES, GG_DUMMY_BYTES, GG_DUMMY_IOVA },
++			{ GG_ICACHE_BYTES + GG_DUMMY_BYTES, GG_LOG_BYTES, GG_LOG_IOVA },
++			{ GG_ICACHE_BYTES + GG_DUMMY_BYTES + GG_LOG_BYTES, GG_HFI_BYTES, GG_HFI_IOVA },
++		};
 +
-+		for (uint32_t i = 0; i < pages; i++) {   /* dummy, log and hfi follow one another at 0x60000000 */
-+			t[2048 + ((GG_DUMMY_IOVA >> 12) & 511u) + i] = (pa_of[first + i] & 0x0000fffffffff000ull) | GG_LEAF;
++		for (unsigned int r = 0; r < 3; r++) {
++			for (uint32_t i = 0; i < rg[r].bytes / 4096; i++) {
++				t[2048 + ((rg[r].iova >> 12) & 511u) + i] = (pa_of[rg[r].off / 4096 + i] & 0x0000fffffffff000ull) | GG_LEAF;
++			}
 +		}
 +	}
 +	for (uintptr_t p = (uintptr_t)t; p < (uintptr_t)t + GG_TABLE_BYTES; p += 64) {
@@ -1574,7 +1545,7 @@ index 0000000..fb3e299
 +	const uint32_t page = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
 +	const uint32_t cbs = page << (((idr1 >> 28) & 7u) + 1u);
 +	vm_offset_t cb;
-+	uint32_t tcr2;
++	uint32_t tcr2, s2_orig;
 +
 +	*why = 0;
 +	if (cbs + (GG_BANK + 1u) * page > GG_SMMU_BYTES) {
@@ -1586,38 +1557,78 @@ index 0000000..fb3e299
 +		*why = 2;
 +		return -1;
 +	}
++	s2_orig = gg_rd(gg.smmu, GG_S2CR(GG_SLOT));
++	gg.s2_orig = s2_orig;
 +	if (gg_rd(cb, GG_CB_SCTLR) & 1u) {
 +		*why = 3;
 +		return -1;
 +	}
-+	gg_wr(gg.smmu, page + 0x800 + GG_CBAR(GG_BANK), 1u);         /* CBA2R: VA64 */
-+	gg_wr(gg.smmu, page + GG_CBAR(GG_BANK), GG_CBAR_VAL);
-+	tcr2 = (gg_rd(cb, GG_CB_TCR2) & ~0x38017u) | 0x38010u | (idr2 & 0xfu);
-+	gg_wr(cb, GG_CB_TCR2, tcr2);
-+	gg_wr(cb, GG_CB_TTBR0, (uint32_t)gg.table_pa);
-+	gg_wr(cb, GG_CB_TTBR0 + 4, (uint32_t)(gg.table_pa >> 32) | (GG_ASID << 16));
-+	gg_wr(cb, GG_CB_TTBR1, 0);
-+	gg_wr(cb, GG_CB_TTBR1 + 4, 0);
-+	gg_wr(cb, GG_CB_TCR, GG_TCR);
-+	gg_wr(cb, GG_CB_CONTEXTIDR, GG_ASID);
-+	gg_wr(cb, GG_CB_MAIR0, GG_MAIR0);
++	/* each write read back, as `wifis3b bank` on the apps SMMU (pong_wifi_link.c); the bank is still off (SCTLR 0) */
++	{
++		struct { vm_offset_t base; uint32_t off, val; } w[10];
++		unsigned int n = 0;
++
++		tcr2 = (gg_rd(cb, GG_CB_TCR2) & ~0x38017u) | 0x38010u | (idr2 & 0xfu);
++		w[n++] = (__typeof__(w[0])){ gg.smmu, page + 0x800 + GG_CBAR(GG_BANK), 1u };   /* CBA2R: VA64 */
++		w[n++] = (__typeof__(w[0])){ gg.smmu, page + GG_CBAR(GG_BANK), GG_CBAR_VAL };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_TCR2, tcr2 };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_TTBR0, (uint32_t)gg.table_pa };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_TTBR0 + 4, (uint32_t)(gg.table_pa >> 32) | (GG_ASID << 16) };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_TTBR1, 0 };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_TTBR1 + 4, 0 };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_TCR, GG_TCR };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_CONTEXTIDR, GG_ASID };
++		w[n++] = (__typeof__(w[0])){ cb, GG_CB_MAIR0, GG_MAIR0 };
++		for (unsigned int i = 0; i < n; i++) {
++			gg_wr(w[i].base, w[i].off, w[i].val);
++			if (gg_rd(w[i].base, w[i].off) != w[i].val) {
++				gg.rb_off = w[i].off;
++				gg.rb_got = gg_rd(w[i].base, w[i].off);
++				*why = 10u + i;
++				return -1;
++			}
++		}
++	}
 +	gg_wr(cb, GG_CB_FSR, ~0u);
 +	gg_wr(cb, GG_CB_TLBIALL, 0);
 +	gg_wr(cb, GG_CB_TLBSYNC, 0);
 +	for (unsigned int i = 0; i < 1000 && (gg_rd(cb, GG_CB_TLBSTATUS) & 1u); i++) {
 +		IODelay(1);
 +	}
++	if (gg_rd(cb, GG_CB_TLBSTATUS) & 1u) {
++		*why = 7;                                  /* SCTLR still 0: the bank is off */
++		return -1;
++	}
 +	gg_wr(cb, GG_CB_SCTLR, GG_SCTLR);
 +	if (gg_rd(cb, GG_CB_SCTLR) != GG_SCTLR) {
++		gg_wr(cb, GG_CB_SCTLR, 0);
 +		*why = 4;
 +		return -1;
 +	}
++	/* S2CR first (harmless while the SMR is invalid) and read back: a dropped write would leave the slot in bypass
++	 * and a valid SMR would then let the GMU write physical memory directly */
 +	gg_wr(gg.smmu, GG_S2CR(GG_SLOT), GG_BANK);                 /* type translate, bank 1 */
++	if ((gg_rd(gg.smmu, GG_S2CR(GG_SLOT)) & 0x0c0300ffu) != GG_BANK) {
++		gg.rb_got = gg_rd(gg.smmu, GG_S2CR(GG_SLOT));
++		gg_wr(gg.smmu, GG_S2CR(GG_SLOT), s2_orig);
++		gg_wr(cb, GG_CB_SCTLR, 0);
++		*why = 8;
++		return -1;
++	}
 +	gg_wr(gg.smmu, GG_SMR(GG_SLOT), GG_SMR_VAL);
 +	if (gg_rd(gg.smmu, GG_SMR(GG_SLOT)) != GG_SMR_VAL) {
 +		gg_wr(gg.smmu, GG_SMR(GG_SLOT), 0);
-+		gg_wr(gg.smmu, GG_S2CR(GG_SLOT), GG_S2CR_FREE);
++		gg_wr(gg.smmu, GG_S2CR(GG_SLOT), s2_orig);
++		gg_wr(cb, GG_CB_SCTLR, 0);
 +		*why = 5;
++		return -1;
++	}
++	if (gg_rd(cb, GG_CB_FSR) & 0xc000003eu) {        /* a fault already, before the GMU runs */
++		gg.rb_got = gg_rd(cb, GG_CB_FSR);
++		gg_wr(gg.smmu, GG_SMR(GG_SLOT), 0);
++		gg_wr(gg.smmu, GG_S2CR(GG_SLOT), s2_orig);
++		gg_wr(cb, GG_CB_SCTLR, 0);
++		*why = 9;
 +		return -1;
 +	}
 +	return 0;
@@ -1630,6 +1641,12 @@ index 0000000..fb3e299
 +	const uint32_t page = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
 +
 +	return gg.smmu + (page << (((idr1 >> 28) & 7u) + 1u)) + GG_BANK * page;
++}
++
++int
++pong_gpu_gmu_attempted(void)
++{
++	return gg.attempted != 0;
 +}
 +
 +int
@@ -1647,19 +1664,22 @@ index 0000000..fb3e299
 +		snprintf(reply, cap, " gmustart[stop=once_per_boot status=%d phase=%u]", gg.attempted, gg.result.load.phase);
 +		return -1;
 +	}
-+	gg.attempted = -1;
 +	if (pong_fw_lookup("a650_gmu.bin", &fw, &fw_len) != 0 || !fw || fw_len < 16) {
 +		snprintf(reply, cap, " gmustart[stop=firmware_missing]");
 +		return -1;
 +	}
-+	gg.win[A650GmuCore] = (volatile uint8_t *)ml_io_map(GG_CORE_PHYS, A650_GMU_CORE_BYTES);
-+	gg.win[A650GmuRscc] = (volatile uint8_t *)ml_io_map(GG_RSCC_PHYS, A650_GMU_RSCC_BYTES);
-+	gg.win[A650GmuPdc] = (volatile uint8_t *)ml_io_map(GG_PDC_PHYS, A650_GMU_PDC_BYTES);
-+	gg.smmu = ml_io_map(GG_SMMU_PHYS, GG_SMMU_BYTES);
-+	gg.cmddb = ml_io_map(GG_CMDDB_PHYS, GG_CMDDB_BYTES);
-+	if (!gg.win[0] || !gg.win[1] || !gg.win[2] || !gg.smmu || !gg.cmddb) {
-+		snprintf(reply, cap, " gmustart[stop=map]");
++	gg.cmddb = g_cmd_db_page;
++	if (!gg.cmddb) {
++		snprintf(reply, cap, " gmustart[stop=cmddb_unmapped]");
 +		return -1;
++	}
++	if (!gg.smmu) {   /* once: a retry after a stop below must not map again. ml_io_map panics when the I/O map is
++	                  * full (half26), so run gmustart early in a fresh boot, before Wi-Fi's large mappings */
++		gg_mark('M', 0, 0);
++		gg.win[A650GmuCore] = (volatile uint8_t *)ml_io_map(GG_CORE_PHYS, A650_GMU_CORE_BYTES);
++		gg.win[A650GmuRscc] = (volatile uint8_t *)ml_io_map(GG_RSCC_PHYS, A650_GMU_RSCC_BYTES);
++		gg.win[A650GmuPdc] = (volatile uint8_t *)ml_io_map(GG_PDC_PHYS, A650_GMU_PDC_BYTES);
++		gg.smmu = ml_io_map(GG_SMMU_PHYS, GG_SMMU_BYTES);
 +	}
 +	for (unsigned int i = 0; i < 3; i++) {
 +		uint32_t addr = 0;
@@ -1680,15 +1700,20 @@ index 0000000..fb3e299
 +		snprintf(reply, cap, " gmustart[stop=hfi_tables aux=%u/%u/%u]", gg.aux_len[0], gg.aux_len[1], gg.aux_len[2]);
 +		return -1;
 +	}
++	gg.attempted = -1;   /* from here on the hardware or the kernel's memory changes: one attempt per boot */
++	gg_mark('A', 0, 0);
 +	rc = gg_memory();
 +	if (rc) {
 +		snprintf(reply, cap, " gmustart[stop=memory rc=%d]", rc);
 +		return -1;
 +	}
 +	if (gg_smmu(&why)) {
-+		snprintf(reply, cap, " gmustart[stop=smmu why=%u smr2=%#x]", why, gg_rd(gg.smmu, GG_SMR(GG_SLOT)));
++		snprintf(reply, cap, " gmustart[stop=smmu why=%u smr2=%#x s2cr=%#x s2was=%#x rb=%#x:%#x sgfsr=%#x sgfsynr0=%#x]", why,
++		    gg_rd(gg.smmu, GG_SMR(GG_SLOT)), gg_rd(gg.smmu, GG_S2CR(GG_SLOT)), gg.s2_orig, gg.rb_off, gg.rb_got,
++		    gg_rd(gg.smmu, 0x48), gg_rd(gg.smmu, 0x50));
 +		return -1;
 +	}
++	gg.gfsr0 = gg_rd(gg.smmu, 0x48);   /* sGFSR before the GMU runs (read only: clearing it would erase other devices' records) */
 +	gg.dev.io = (A650GmuIo){ NULL, { A650_GMU_CORE_BYTES, A650_GMU_RSCC_BYTES, A650_GMU_PDC_BYTES },
 +		                 gg_read32, gg_write32, gg_barrier };
 +	gg.dev.services = (A650GmuServices){ NULL, gg_now_us, gg_wait_us };
@@ -1702,7 +1727,10 @@ index 0000000..fb3e299
 +	gg.cfg.hfi = (A650GmuMemory){ (volatile uint32_t *)(void *)(gg.block + GG_ICACHE_BYTES + GG_DUMMY_BYTES + GG_LOG_BYTES),
 +		                      GG_HFI_BYTES, GG_HFI_IOVA };
 +	gg.cfg.poll_budget = 100;
++	gg_last_phase = gg_last_stage = 0xffffffffu;
++	gg_mark('C', 0, 0);
 +	st = A650GmuColdStart(&gg.dev, &gg.cfg, &gg.startup, &limits, &gg.result);
++	gg_mark('D', (uint32_t)st, gg.result.load.phase);
 +	gg.attempted = (int)st + 1;
 +	{
 +		const vm_offset_t cb = gg_cb();
@@ -1711,30 +1739,42 @@ index 0000000..fb3e299
 +
 +		snprintf(reply, cap,
 +		    " gmustart[status=%d phase=%u blocks=%u fwver=%#x init=%#x hfi=%#x rscstop=%u ack=%#x ao=%#x cm3=%#x"
-+		    " proto=%d stage=%d fwerr=%#x acks=%#x cmds=%u health=%d cb_fsr=%#x far=%#x:%#x fsynr=%#x bcm=%#x/%#x/%#x/%#x]",
++		    " proto=%d stage=%d fwerr=%#x acks=%#x cmds=%u health=%d cb_fsr=%#x far=%#x:%#x fsynr=%#x bcm=%#x/%#x/%#x/%#x"
++		    " s2cr=%#x gfsr=%#x>%#x gfsynr0=%#x]",
 +		    (int)st, l->phase, l->blocks, l->firmware_version, l->firmware_init_result, l->hfi_status, l->rsc_stop_status,
 +		    l->rscc_ack, l->ao_fault_status, l->cm3_fault_status, (int)gg.result.protocol_status, (int)p->stage,
 +		    p->firmware_error, p->acknowledged_stages, p->published_commands, (int)gg.result.health_status,
 +		    gg_rd(cb, GG_CB_FSR), gg_rd(cb, GG_CB_FAR + 4), gg_rd(cb, GG_CB_FAR), gg_rd(cb, GG_CB_FSYNR0),
-+		    gg.bcm[0], gg.bcm[1], gg.bcm[2], gg.bcm[3]);
++		    gg.bcm[0], gg.bcm[1], gg.bcm[2], gg.bcm[3],
++		    gg_rd(gg.smmu, GG_S2CR(GG_SLOT)), gg.gfsr0, gg_rd(gg.smmu, 0x48), gg_rd(gg.smmu, 0x50));
 +	}
 +	return st == A650GmuSuccess ? 0 : -1;
 +}
 +
 +#endif /* PONG */
 diff --git a/bsd/dev/pong_gpu_probe.c b/bsd/dev/pong_gpu_probe.c
-index cecddfb..b0cd633 100644
+index cecddfb..a5ce030 100644
 --- a/bsd/dev/pong_gpu_probe.c
 +++ b/bsd/dev/pong_gpu_probe.c
-@@ -66,6 +66,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -66,6 +66,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  extern void pong_ramoops_diagnostic_write(const char *buf, int len);
  extern uint64_t mach_absolute_time(void);
  extern int pong_fw_lookup(const char *name, const uint8_t **data, uint32_t *len);
 +extern int pong_gpu_gmu_start(char *reply, size_t cap);   /* pong_gpu_gmu.c, mode 11 `gpuprobe gmustart` */
++extern int pong_gpu_gmu_attempted(void);
  
  int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
  
-@@ -934,7 +935,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+@@ -218,7 +220,7 @@ static vm_offset_t g_smmu_gr0_page;
+ static vm_offset_t g_gmu_14k_page;
+ static vm_offset_t g_gmu_24k_page;
+ static vm_offset_t g_gpu_rbbm_page;
+-static vm_offset_t g_cmd_db_page;
++vm_offset_t g_cmd_db_page;   /* also used by pong_gpu_gmu.c */
+ static vm_offset_t g_rscc_page;
+ static vm_offset_t g_gmu_tcm_page;
+ static vm_offset_t g_pdc_page;
+@@ -934,7 +936,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
  	 */
  	char gsmmu_extra[440];
  	gsmmu_extra[0] = '\0';
@@ -1743,7 +1783,16 @@ index cecddfb..b0cd633 100644
  		uint32_t smr[6], s2cr[6];
  
  		for (unsigned int i = 0; i < 6; i++) {
-@@ -1041,7 +1042,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+@@ -943,6 +945,8 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+ 		}
+ 		if (smr_count < 1u || smr_count > 6u) {
+ 			snprintf(gsmmu_extra, sizeof(gsmmu_extra), " gsmmu[stop=slots n=%u]", smr_count);
++		} else if (pong_gpu_gmu_attempted()) {
++			snprintf(gsmmu_extra, sizeof(gsmmu_extra), " gsmmu[stop=gmustart_ran]");
+ 		} else if (smr[smr_count - 1u] & 0x80000000u) {
+ 			snprintf(gsmmu_extra, sizeof(gsmmu_extra), " gsmmu[stop=last_slot_in_use n=%u smr=%#x]", smr_count,
+ 			    smr[smr_count - 1u]);
+@@ -1041,7 +1045,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
  		 * window; the icache/dummy blocks need the GMU's SMMU context and are only summarized.
  		 * Precondition is mode 7's `ready` (sysreset==1, sequencer idle, no stale HFI, no faults).
  		 */
@@ -1752,7 +1801,7 @@ index cecddfb..b0cd633 100644
  			const uint32_t ao_f8  = gmu_irq & GMU_AO_FATAL_BITS;
  			const uint32_t cm3_f8 = gmu_intr & GMU_CM3_FATAL_BITS;
  			const bool ready8 = (gmu_rst == 1u) && (rscc_seq == 0u) &&
-@@ -1136,7 +1137,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+@@ -1136,7 +1140,7 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
  		 * per boot: a later call only reads. A failure puts the GMU back in reset as reset_after_failure does
  		 * and there is no second attempt.
  		 */
@@ -1761,7 +1810,7 @@ index cecddfb..b0cd633 100644
  			if (!g_pdc_page) {
  				g_pdc_page = ml_io_map(GMU_PDC_PAGE_PHYS, GMU_PDC_PAGE_SIZE);
  			}
-@@ -1202,6 +1203,22 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+@@ -1202,6 +1206,28 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
  		}
  	}
  
@@ -1769,12 +1818,18 @@ index cecddfb..b0cd633 100644
 +	char gmus_extra[600];
 +	gmus_extra[0] = '\0';
 +	if (mode == 11) {
++		cc_cxo = gpu_probe_rd32(g_gpucc_page, GPUCC_CXO_CBCR_OFF);
++		gcc_ddrss_axi = gpu_probe_rd32(g_gcc_gpu_page, GCC_DDRSS_GPU_AXI_CBCR_OFF);
++		gcc_memnoc = gpu_probe_rd32(g_gcc_gpu_page, GCC_GPU_MEMNOC_GFX_CBCR_OFF);
++		const bool ddr11 = ((cc_cxo | gcc_ddrss_axi | gcc_memnoc) & CBCR_CLK_OFF_BIT) == 0u &&
++		    (gcc_ddrss_axi & gcc_memnoc & CBCR_CLK_ENABLE_BIT) != 0u;
 +		const bool ready11 = gmu_read && gmupre_read && gmu_rst == 1u && rscc_seq == 0u && (gmu_hfi & 1u) == 0u &&
-+		    (gmu_irq & GMU_AO_FATAL_BITS) == 0u && (gmu_intr & GMU_CM3_FATAL_BITS) == 0u;
++		    (gmu_irq & GMU_AO_FATAL_BITS) == 0u && (gmu_intr & GMU_CM3_FATAL_BITS) == 0u && ddr11;
 +
 +		if (!ready11) {
-+			snprintf(gmus_extra, sizeof(gmus_extra), " gmustart[stop=not_ready read=%d/%d rst=%u seq=%u hfi=%u]",
-+			    gmu_read, gmupre_read, gmu_rst, rscc_seq, gmu_hfi & 1u);
++			snprintf(gmus_extra, sizeof(gmus_extra),
++			    " gmustart[stop=not_ready read=%d/%d rst=%u seq=%u hfi=%u axi=%#x memnoc=%#x cxo=%#x]",
++			    gmu_read, gmupre_read, gmu_rst, rscc_seq, gmu_hfi & 1u, gcc_ddrss_axi, gcc_memnoc, cc_cxo);
 +		} else {
 +			gpu_probe_pmsg("[PONG_GPU] P11 gmustart\n");
 +			(void)pong_gpu_gmu_start(gmus_extra, sizeof(gmus_extra));
@@ -1784,7 +1839,7 @@ index cecddfb..b0cd633 100644
  	char gmuclk_extra[760];
  	size_t extra_len = 0;
  	gmuclk_extra[0] = '\0';
-@@ -1232,6 +1249,9 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
+@@ -1232,6 +1258,9 @@ pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode)
  		extra_len += (size_t)snprintf(gmuclk_extra + extra_len, sizeof(gmuclk_extra) - extra_len,
  		    "%s", rsc_extra);
  	}
