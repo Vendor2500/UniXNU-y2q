@@ -20,18 +20,30 @@ EDITS = (
 )
 
 
-def main():
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
-    plugin = root / 'drivers/PongMetal/PongMetalPlugin.mm'
-    text = plugin.read_text()
-    for old, new in EDITS:
+# 3. The bridge does not answer the two alignment selectors (UniXNU-gts7xlwifi adreno-metal 0001, same tablet: with Turnip's
+#    4-byte constant / 64-byte linear texture alignments answered, CoreAnimation's frames came out row-smeared on the A650).
+BRIDGE_EDITS = (
+    ('    ("minConstantBufferAlignmentBytes", 0),\n    ("deviceLinearReadOnlyTextureAlignmentBytes", 0),\n',
+     '    // T970: minConstantBufferAlignmentBytes, deviceLinearReadOnlyTextureAlignmentBytes left unanswered (A650)\n'),
+)
+
+
+def apply(path, edits):
+    text = path.read_text()
+    for old, new in edits:
         if new in text:
             continue
         if text.count(old) != 1:
-            raise SystemExit('expected exactly one %r in %s' % (old[:40], plugin))
+            raise SystemExit('expected exactly one %r in %s' % (old[:40], path))
         text = text.replace(old, new)
-    plugin.write_text(text)
-    print('patched:', plugin)
+    path.write_text(text)
+    print('patched:', path)
+
+
+def main():
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
+    apply(root / 'drivers/PongMetal/PongMetalPlugin.mm', EDITS)
+    apply(root / 'drivers/PongMetal/bridge/NativeMetalObjects.rs', BRIDGE_EDITS)
 
 
 if __name__ == '__main__':
