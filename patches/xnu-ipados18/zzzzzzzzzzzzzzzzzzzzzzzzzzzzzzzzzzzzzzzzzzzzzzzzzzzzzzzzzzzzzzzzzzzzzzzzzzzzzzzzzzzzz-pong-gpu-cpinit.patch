@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
-index bbd3708..2fdba64 100644
+index bbd3708..accf765 100644
 --- a/bsd/dev/pong_gpu_gmu.c
 +++ b/bsd/dev/pong_gpu_gmu.c
 @@ -24,6 +24,13 @@
@@ -40,7 +40,7 @@ index bbd3708..2fdba64 100644
  	gg_mark('Y', (uint32_t)st, r.gx_after);
  	{
  		const vm_offset_t cb = gg_cb();
-@@ -585,4 +595,536 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
+@@ -585,4 +595,538 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
  	return st == A650GmuSuccess ? 0 : -1;
  }
  
@@ -201,7 +201,9 @@ index bbd3708..2fdba64 100644
 +		*why = 4;
 +		return -1;
 +	}
-+	tcr2 = (gg_rd(cb, GG_CB_TCR2) & ~0x38017u) | 0x38010u | ((idr2 >> 4) & 0xfu);
++	/* a clean TCR2 as ArmSmmu4KContext.c (SEP 7, AS 16-bit, PASize = OAS): bank 0 resets to garbage (half63 read 0x4003c064
++	 * there), so no read-modify-write */
++	tcr2 = 0x38010u | ((idr2 >> 4) & 0xfu);
 +	{
 +		struct { vm_offset_t base; uint32_t off, val, ignore; } w[11] = {
 +			{ gg.smmu, page + 0x800 + GG_CBAR(GC_BANK), 1u, 0 },
@@ -219,7 +221,7 @@ index bbd3708..2fdba64 100644
 +
 +		for (unsigned int i = 0; i < 11; i++) {
 +			gg_wr(w[i].base, w[i].off, w[i].val);
-+			if ((gg_rd(w[i].base, w[i].off) & ~w[i].ignore) != w[i].val) {
++			if ((gg_rd(w[i].base, w[i].off) & ~w[i].ignore) != (w[i].val & ~w[i].ignore)) {
 +				gc.rb_off = w[i].off;
 +				gc.rb_got = gg_rd(w[i].base, w[i].off);
 +				*why = 10u + i;
