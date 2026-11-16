@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/pong_fastrpc.c b/bsd/dev/pong_fastrpc.c
+index 6fecc05..64c553d 100644
+--- a/bsd/dev/pong_fastrpc.c
++++ b/bsd/dev/pong_fastrpc.c
+@@ -275,6 +275,17 @@ fr_path(const char *path)
+ 		snprintf(fr.paths + at, sizeof(fr.paths) - at, "%s%s", at ? " " : "", path);
+ 	}
+ }
++/* True when the path has a ".." anywhere (the kernel has no strstr). */
++static bool
++fr_dotdot(const char *s)
++{
++	for (; *s; s++) {
++		if (s[0] == '.' && s[1] == '.') {
++			return true;
++		}
++	}
++	return false;
++}
+ /* A DSP path to a Data volume path; 0 when it is one of the mapped ones. */
+ static int
+ fr_map(const char *dsp, char *out, size_t cap)
+@@ -287,7 +298,7 @@ fr_map(const char *dsp, char *out, size_t cap)
+ 	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+ 		const size_t n = strlen(map[i].from);
+ 
+-		if (!strncmp(dsp, map[i].from, n) && (dsp[n] == '\0' || dsp[n] == '/') && !strstr(dsp, "..")) {
++		if (!strncmp(dsp, map[i].from, n) && (dsp[n] == '\0' || dsp[n] == '/') && !fr_dotdot(dsp)) {
+ 			snprintf(out, cap, "%s%s%s", SR_ROOT, map[i].to, dsp + n);
+ 			return 0;
+ 		}
