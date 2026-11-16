@@ -1,0 +1,719 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f6299d5..8b91b35 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -409,6 +409,7 @@ bsd/dev/pong_usb_ctl.c			standard
+ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_haptic.c			standard
++bsd/dev/pong_usbhost.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index c102dd4..1d035f5 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -445,6 +445,48 @@ muic_write_reg(uint8_t slave_addr, uint8_t reg, const uint8_t *val, unsigned len
+ 	return true;
+ }
+ 
++static bool
++bus_get(uint8_t *out, bool ack)
++{
++	uint8_t v = 0;
++	sda(true);
++	for (int bit = 7; bit >= 0; bit--) {
++		if (!scl_release()) return false;
++		if (rd(GPIO_IO(tlmm_base, PIN_SDA)) & 1) v |= (uint8_t)(1u << bit);
++		scl_low();
++	}
++	sda(!ack);
++	if (!scl_release()) return false;
++	scl_low();
++	sda(true);
++	*out = v;
++	return true;
++}
++
++/* For pong_usbhost.c (z109), which runs while the battery worker is paused: one register read / a burst write. */
++bool pong_usbc_i2c_write(uint8_t addr, uint8_t reg, const uint8_t *val, unsigned len);
++bool pong_usbc_i2c_read(uint8_t addr, uint8_t reg, uint8_t *val);
++bool
++pong_usbc_i2c_write(uint8_t addr, uint8_t reg, const uint8_t *val, unsigned len)
++{
++	return tlmm_base && muic_write_reg(addr, reg, val, len);
++}
++
++bool
++pong_usbc_i2c_read(uint8_t addr, uint8_t reg, uint8_t *val)
++{
++	bool ok;
++	if (!tlmm_base || !bus_recover()) return false;
++	bus_start();
++	ok = bus_put((uint8_t)(addr << 1)) && bus_put(reg);
++	if (ok) {
++		bus_start();                     /* repeated start */
++		ok = bus_put((uint8_t)((addr << 1) | 1)) && bus_get(val, false);
++	}
++	bus_stop();
++	return ok;
++}
++
+ static bool
+ pong_muic_route(void)
+ {
+@@ -1572,6 +1614,8 @@ cmd_handle_usbrole(const char *args)
+ 	send_str(reply);
+ }
+ 
++static void cmd_handle_usbhost(const char *args);   /* z109, below the event loop */
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -2095,6 +2139,8 @@ dispatch_command(const char *cmd)
+ 		hp_reply[0] = '\0';
+ 		(void)pong_haptic_usb(hp_reply, sizeof(hp_reply), cmd + 4);
+ 		send_str(hp_reply[0] ? hp_reply : "buzz: no reply\n");
++	} else if (strcmp(cmd, "usbhost") == 0 || strncmp(cmd, "usbhost ", 8) == 0) {
++		cmd_handle_usbhost(cmd + 7);
+ 	} else if (strcmp(cmd, "usbrole") == 0 || strncmp(cmd, "usbrole ", 8) == 0) {
+ 		cmd_handle_usbrole(cmd + 7);
+ 	} else if (strcmp(cmd, "dpu") == 0) {
+@@ -2686,6 +2732,104 @@ process_events(void)
+ 	}
+ }
+ 
++/* Steps 12-19 of the bring-up: the CDC-ACM device from a halted controller. Also run after a USB host session (z109). */
++static void
++device_start(void)
++{
++	pmsg_log("[PONG_USB] step 12: writing GUSB2PHYCFG0 (clearing SUSPHY/ENBLSLPM)...\n");
++	core_w(DWC3_GUSB2PHYCFG(0), core_r(DWC3_GUSB2PHYCFG(0)) & ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM));
++
++	pmsg_log("[PONG_USB] step 13: writing DCFG (device speed=high/full)...\n");
++	core_w(DWC3_DCFG, (core_r(DWC3_DCFG) & ~7u) | 0);
++
++	pmsg_log("[PONG_USB] step 14: setting event ring (phys=0x%llx, size=4096)...\n", (uint64_t)dma_phys);
++	core_w(DWC3_GEVNTADRLO(0), (uint32_t)dma_phys);
++	core_w(DWC3_GEVNTADRHI(0), (uint32_t)(dma_phys >> 32));
++	core_w(DWC3_GEVNTSIZ(0), 4096u | (1u << 31));
++	core_w(DWC3_GEVNTCOUNT(0), 0);
++	ctl_event_offset = 0;
++
++	pmsg_log("[PONG_USB] step 15: writing GCTL (PRTCAPDIR=device, DSBLCLKGTNG)...\n");
++	core_w(DWC3_GCTL, (core_r(DWC3_GCTL) & ~(3u << 12)) | (2u << 12) | DWC3_GCTL_DSBLCLKGTNG);
++
++	pmsg_log("[PONG_USB] step 16: calling reset_endpoints (DEPSTARTCFG/SETEPCONFIG)...\n");
++	reset_endpoints();
++
++	pmsg_log("[PONG_USB] step 17: writing DEVTEN=0x0f...\n");
++	core_w(DWC3_DEVTEN, 0x0f);
++
++	pmsg_log("[PONG_USB] step 18: applying QSCRATCH VBUS override...\n");
++	qs_w(0x30, qs_r(0x30) | (1u << 24));
++	qs_w(0x10, qs_r(0x10) | (1u << 20) | (1u << 28));
++	pmsg_log("[PONG_USB] qscratch: override latched (0x10=0x%08x 0x30=0x%08x)\n",
++	    qs_r(0x10), qs_r(0x30));
++
++	pmsg_log("[PONG_USB] step 19: starting controller (DCTL | RUN_STOP)...\n");
++	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
++}
++
++/* Steps 8-10: halt the device controller and mask its events. */
++static void
++device_stop(void)
++{
++	core_w(DWC3_DCTL, core_r(DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
++	for (unsigned i = 0; i < 25000; i++) {
++		if (core_r(DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) break;
++		spin_us(10);
++	}
++	core_w(DWC3_DEVTEN, 0);
++	core_w(DWC3_DALEPENA, 0);
++}
++
++/*
++ * usbhost (z109, boot-arg pong_usb_host bit 0; device-untested): `usbhost on N` gives the controller to USB host mode
++ * for N seconds (default 120, at most 300) after this reply; pong_usbhost.c says what it does. The CDC-ACM device is
++ * off meanwhile: unplug the PC, plug the OTG adapter and the device, plug the PC back afterwards and `usbhost` shows
++ * the report (also in ramoops as [usbhost] lines). pong_usb_host bit 1 skips the GCTL core soft reset around the role
++ * change, bit 2 never boosts VBUS (a device with its own power).
++ */
++int pong_usbhost_session(vm_offset_t core, vm_offset_t qscratch, unsigned seconds, unsigned flags, char *reply, size_t cap);
++static unsigned usbhost_flags, usbhost_pending;
++static char usbhost_report[720];
++
++static void
++cmd_handle_usbhost(const char *args)
++{
++	const char *p;
++	char reply[220];
++
++	PE_parse_boot_argn("pong_usb_host", &usbhost_flags, sizeof(usbhost_flags));
++	if (!(usbhost_flags & 1)) {
++		send_str("usbhost: off (boot-arg pong_usb_host=1 turns it on)\n");
++		return;
++	}
++	if (strncmp(args, " on", 3) != 0) {
++		send_str(usbhost_report[0] ? usbhost_report : "usbhost: no session yet\n");
++		return;
++	}
++	p = args + 3;
++	usbhost_pending = parse_uint(&p);
++	if (!usbhost_pending) usbhost_pending = 120;
++	if (usbhost_pending > 300) usbhost_pending = 300;
++	snprintf(reply, sizeof(reply), "usbhost: device off for %u s now: unplug the PC, plug the OTG adapter + device; "
++	    "afterwards plug the PC back and send `usbhost`\n", usbhost_pending);
++	send_str(reply);
++}
++
++static void
++usbhost_run_pending(void)
++{
++	unsigned seconds = usbhost_pending;
++
++	usbhost_pending = 0;
++	pmsg_log("[PONG_USB] usbhost session %u s\n", seconds);
++	device_stop();
++	(void)pong_usbhost_session(core_base, qscratch_base, seconds, usbhost_flags, usbhost_report, sizeof(usbhost_report));
++	core_w(DWC3_GEVNTCOUNT(0), core_r(DWC3_GEVNTCOUNT(0)) & 0xfffcu);   /* ack leftovers; step 14 resets the ring */
++	device_start();
++	pmsg_log("[PONG_USB] usbhost back in device mode\n");
++}
++
+ /* Deferred USB Control Thread */
+ static void
+ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+@@ -2793,42 +2937,16 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 	/* Soft reset is SKIPPED to preserve UEFI PHY clocks and state */
+ 	pmsg_log("[PONG_USB] step 11: skipping CSFTRST (preserving UEFI PHY/core state)\n");
+ 
+-	pmsg_log("[PONG_USB] step 12: writing GUSB2PHYCFG0 (clearing SUSPHY/ENBLSLPM)...\n");
+-	core_w(DWC3_GUSB2PHYCFG(0), core_r(DWC3_GUSB2PHYCFG(0)) & ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM));
+-
+-	pmsg_log("[PONG_USB] step 13: writing DCFG (device speed=high/full)...\n");
+-	core_w(DWC3_DCFG, (core_r(DWC3_DCFG) & ~7u) | 0);
+-
+-	pmsg_log("[PONG_USB] step 14: setting event ring (phys=0x%llx, size=4096)...\n", (uint64_t)dma_phys);
+-	core_w(DWC3_GEVNTADRLO(0), (uint32_t)dma_phys);
+-	core_w(DWC3_GEVNTADRHI(0), (uint32_t)(dma_phys >> 32));
+-	core_w(DWC3_GEVNTSIZ(0), 4096u | (1u << 31));
+-	core_w(DWC3_GEVNTCOUNT(0), 0);
+-	ctl_event_offset = 0;
+-
+-	pmsg_log("[PONG_USB] step 15: writing GCTL (PRTCAPDIR=device, DSBLCLKGTNG)...\n");
+-	core_w(DWC3_GCTL, (core_r(DWC3_GCTL) & ~(3u << 12)) | (2u << 12) | DWC3_GCTL_DSBLCLKGTNG);
+-
+-	pmsg_log("[PONG_USB] step 16: calling reset_endpoints (DEPSTARTCFG/SETEPCONFIG)...\n");
+-	reset_endpoints();
+-
+-	pmsg_log("[PONG_USB] step 17: writing DEVTEN=0x0f...\n");
+-	core_w(DWC3_DEVTEN, 0x0f);
+-
+-	pmsg_log("[PONG_USB] step 18: applying QSCRATCH VBUS override...\n");
+-	qs_w(0x30, qs_r(0x30) | (1u << 24));
+-	qs_w(0x10, qs_r(0x10) | (1u << 20) | (1u << 28));
+-	pmsg_log("[PONG_USB] qscratch: override latched (0x10=0x%08x 0x30=0x%08x)\n",
+-	    qs_r(0x10), qs_r(0x30));
+-
+-	pmsg_log("[PONG_USB] step 19: starting controller (DCTL | RUN_STOP)...\n");
+-	core_w(DWC3_DCTL, core_r(DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
++	device_start();
+ 
+ 	pmsg_log("[PONG_USB] step 20: ready: listening on CDC-ACM\n");
+ 	printf("Pong USB: ready, listening on CDC-ACM\n");
+ 
+ 	while (1) {
+ 		process_events();
++		if (usbhost_pending) {
++			usbhost_run_pending();
++		}
+ 		fwput_check_timeout();
+ 		{
+ 			static char boot_timeout_reply[96];
+diff --git a/bsd/dev/pong_usbhost.c b/bsd/dev/pong_usbhost.c
+new file mode 100644
+index 0000000..38e8f38
+--- /dev/null
++++ b/bsd/dev/pong_usbhost.c
+@@ -0,0 +1,452 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SM-T970 USB-C host mode, steps 3-6 of iOSPort work/usbhost_scope/PLAN.md (z109). Device-untested.
++ *
++ * One bounded session, started from the debug channel (USB `usbhost on N`, boot-arg pong_usb_host=1) and run by
++ * pong_usb_ctl.c's thread with the device controller stopped:
++ *   1. MAX77705 USBC (I2C 0x25): mailbox opcode 0x55 data 0x03 (SET_ALTERNATEMODE, as stock and JeyKul's driver send
++ *      at probe; without it the CCIC never completes a source attach) and the D+/D- route 0x06 0x09 again.
++ *   2. Wait for CHGIN to go away (the PC unplugged) and CC_STATUS0 CCStat = 2 (tablet is source: OTG adapter, device,
++ *      unpowered hub), then the OTG boost: CHG_CNFG_00 (0x69 reg 0xb7) mode nibble | 0x0a (0x5 -> 0xf), never mode
++ *      0xa. Refused while CHGIN_OK (0xb2 bit 6) is set. Removed again (mode & ~0x0a) at the end of the session.
++ *   3. DWC3 to host (GCTL PRTCAPDIR = 1, around a GCTL core soft reset as Linux __dwc3_set_mode does for DWC_usb3),
++ *      QSCRATCH VBUS-valid override off, xHCI reset and run, polled (no interrupt).
++ *   4. The first port that connects: port reset, Enable Slot, Address Device, GET_DESCRIPTOR device (18) and
++ *      configuration (up to 255): VID:PID, class, first interface class. Nothing is bound to the device.
++ *   5. Back: xHCI halt and reset, boost off, PRTCAPDIR = device; pong_usb_ctl.c restarts its CDC-ACM device.
++ * Register facts: xHCI 1.1 spec; DWC3 at 0x0a600000 (xHCI capability registers at +0); MAX77705 values from
++ * ref/gts7xl-mainline (origin) docs/usbc-dp-research.md and linux-patches/0052 (MIT/GPL sources read, code ours).
++ * The battery worker is paused for the session (pong_batt_pause), so this file owns the bit-bang I2C bus.
++ * Risk: a panic with the boost on leaves VBUS up through the reset (S8+: no boot until a charger is attached).
++ */
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <IOKit/IOLib.h>
++
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern bool pong_usbc_i2c_write(uint8_t addr, uint8_t reg, const uint8_t *val, unsigned len);
++extern bool pong_usbc_i2c_read(uint8_t addr, uint8_t reg, uint8_t *val);
++extern volatile uint32_t pong_batt_pause, pong_batt_paused;   /* IOPMPowerSource.cpp */
++
++int pong_usbhost_session(vm_offset_t core, vm_offset_t qscratch, unsigned seconds, unsigned flags, char *reply,
++    size_t cap);
++
++#define CCIC 0x25
++#define CHG  0x69
++
++/* one 64 KiB physically contiguous, write-combined (uncached) block, as the device side's DMA buffer */
++#define HB_BYTES      0x10000u
++#define HB_DCBAA      0x0000u   /* 9 slots x 8 */
++#define HB_SPARRAY    0x0800u   /* scratchpad pointers */
++#define HB_CMD        0x1000u   /* 64 TRBs, last = link */
++#define HB_EVT        0x2000u   /* 64 TRBs */
++#define HB_ERST       0x3000u
++#define HB_OUTCTX     0x4000u
++#define HB_INCTX      0x5000u
++#define HB_EP0        0x6000u   /* 64 TRBs, last = link */
++#define HB_DATA       0x7000u   /* descriptors */
++#define HB_SCRATCH    0x8000u   /* up to 8 pages */
++#define RING_TRBS     64u
++
++#define TRB_NORMAL 1
++#define TRB_SETUP 2
++#define TRB_DATA 3
++#define TRB_STATUS 4
++#define TRB_LINK 6
++#define TRB_ENABLE_SLOT 9
++#define TRB_ADDRESS_DEV 11
++#define TRB_EV_TRANSFER 32
++#define TRB_EV_CMD 33
++#define TRB_EV_PORT 34
++
++/* PORTSC: bits kept as they are when writing (RO + RWS), everything else written 0 (RW1C change bits, PED) */
++#define PORTSC_KEEP  0x4e00ffe9u   /* RO: CCS OCA speed DR; RWS: PLS PP PIC WCE/WDE/WOE (Linux xhci_port_state_to_neutral) */
++#define PORTSC_CCS   (1u << 0)
++#define PORTSC_PED   (1u << 1)
++#define PORTSC_PR    (1u << 4)
++#define PORTSC_PP    (1u << 9)
++#define PORTSC_CHANGE 0x00fe0000u  /* CSC PEC WRC OCC PRC PLC CEC */
++#define PORTSC_PRC   (1u << 21)
++
++static IOPhysicalAddress hb_phys;
++static vm_offset_t hb;           /* uncached view */
++static vm_offset_t hc_op, hc_rt, hc_db;
++static unsigned hc_ctx_bytes, hc_slots, hc_ports;
++static unsigned cmd_idx, cmd_cycle, evt_idx, evt_cycle, ep0_idx, ep0_cycle;
++
++static void
++hlog(const char *fmt, ...)
++{
++	char buf[160];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1);
++	}
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++static inline uint32_t r32(vm_offset_t a) { uint32_t v = *(volatile uint32_t *)a; __asm__ volatile("dmb oshld" ::: "memory"); return v; }
++static inline void w32(vm_offset_t a, uint32_t v) { __asm__ volatile("dsb sy" ::: "memory"); *(volatile uint32_t *)a = v; __asm__ volatile("dsb sy" ::: "memory"); }
++static inline void w64(vm_offset_t a, uint64_t v) { w32(a, (uint32_t)v); w32(a + 4, (uint32_t)(v >> 32)); }
++static inline volatile uint32_t *mem32(unsigned off) { return (volatile uint32_t *)(hb + off); }
++
++/* wait until (r32(a) & mask) == want, at most ms; 0 = done */
++static int
++wait_bits(vm_offset_t a, uint32_t mask, uint32_t want, unsigned ms)
++{
++	uint64_t end = now_ms() + ms;
++	while ((r32(a) & mask) != want) {
++		if (now_ms() > end) return -1;
++		IODelay(50);
++	}
++	return 0;
++}
++
++/* ---- MAX77705 ------------------------------------------------------------------------------ */
++
++static int
++ccic_opcode(uint8_t op, uint8_t data, uint8_t *echo)
++{
++	uint8_t cmd[2] = { op, data }, end = 0;
++	if (!pong_usbc_i2c_write(CCIC, 0x21, cmd, 2) || !pong_usbc_i2c_write(CCIC, 0x41, &end, 1)) return -1;
++	for (unsigned i = 0; i < 100; i++) {   /* APCmdRes is an interrupt flag we leave alone: watch the echo instead */
++		IODelay(10000);
++		if (pong_usbc_i2c_read(CCIC, 0x51, echo) && *echo == op) return 0;
++	}
++	return -2;
++}
++
++static int
++boost(bool on, uint8_t *mode_out)
++{
++	uint8_t ok = 0, c00 = 0, back = 0;
++	if (!pong_usbc_i2c_read(CHG, 0xb7, &c00)) return -1;
++	if (on) {
++		if (!pong_usbc_i2c_read(CHG, 0xb2, &ok)) return -2;
++		if (ok & 0x40) return -3;                    /* a charger input: never boost into it */
++		if ((c00 & 0x0a) == 0x0a) return 0;
++		c00 |= 0x0a;
++	} else {
++		if (!(c00 & 0x0a)) return 0;
++		c00 &= (uint8_t)~0x0a;
++	}
++	if (!pong_usbc_i2c_write(CHG, 0xb7, &c00, 1) || !pong_usbc_i2c_read(CHG, 0xb7, &back)) return -4;
++	*mode_out = back;
++	return (back & 0x0a) == (on ? 0x0a : 0) ? 0 : -5;
++}
++
++/* ---- xHCI rings ---------------------------------------------------------------------------- */
++
++static void
++ring_init(unsigned off)
++{
++	bzero((void *)(hb + off), RING_TRBS * 16);
++	volatile uint32_t *link = mem32(off + (RING_TRBS - 1) * 16);
++	link[0] = (uint32_t)(hb_phys + off);
++	link[1] = (uint32_t)((uint64_t)(hb_phys + off) >> 32);
++	link[3] = (TRB_LINK << 10) | (1u << 1);   /* toggle cycle; the cycle bit itself is set when the ring wraps */
++}
++
++static void
++ring_put(unsigned off, unsigned *idx, unsigned *cycle, uint64_t param, uint32_t status, uint32_t control)
++{
++	volatile uint32_t *t = mem32(off + *idx * 16);
++	t[0] = (uint32_t)param;
++	t[1] = (uint32_t)(param >> 32);
++	t[2] = status;
++	__asm__ volatile("dsb sy" ::: "memory");
++	t[3] = control | *cycle;
++	if (++*idx == RING_TRBS - 1) {
++		volatile uint32_t *link = mem32(off + *idx * 16);
++		link[3] = (link[3] & ~1u) | *cycle;
++		*idx = 0;
++		*cycle ^= 1;
++	}
++}
++
++/* next event of `type` (others are logged and skipped); returns 0 and the event's dwords, or -1 on timeout */
++static int
++event_wait(unsigned type, unsigned ms, uint32_t ev[4])
++{
++	uint64_t end = now_ms() + ms;
++	for (;;) {
++		volatile uint32_t *t = mem32(HB_EVT + evt_idx * 16);
++		__asm__ volatile("dsb sy" ::: "memory");
++		if ((t[3] & 1) == evt_cycle) {
++			for (int i = 0; i < 4; i++) ev[i] = t[i];
++			if (++evt_idx == RING_TRBS) {
++				evt_idx = 0;
++				evt_cycle ^= 1;
++			}
++			w64(hc_rt + 0x20 + 0x18, (hb_phys + HB_EVT + evt_idx * 16) | (1u << 3));   /* ERDP, EHB */
++			unsigned t_type = (ev[3] >> 10) & 0x3f;
++			if (t_type == type) return 0;
++			if (t_type != TRB_EV_PORT) hlog("[usbhost] event type %u cc %u skipped\n", t_type, ev[2] >> 24);
++			continue;
++		}
++		if (now_ms() > end) return -1;
++		IODelay(100);
++	}
++}
++
++static int
++command(uint64_t param, uint32_t control, uint32_t ev[4])
++{
++	ring_put(HB_CMD, &cmd_idx, &cmd_cycle, param, 0, control);
++	w32(hc_db, 0);
++	if (event_wait(TRB_EV_CMD, 1000, ev)) return -1;
++	return (ev[2] >> 24) == 1 ? 0 : -(int)(ev[2] >> 24) - 100;
++}
++
++/* control IN on EP0 of `slot`: 8-byte setup, `len` bytes into HB_DATA; returns bytes received or < 0 */
++static int
++control_in(unsigned slot, uint8_t type, uint8_t req, uint16_t value, uint16_t index, uint16_t len)
++{
++	uint32_t ev[4];
++	uint64_t setup = (uint64_t)type | ((uint64_t)req << 8) | ((uint64_t)value << 16) | ((uint64_t)index << 32) |
++	    ((uint64_t)len << 48);
++	ring_put(HB_EP0, &ep0_idx, &ep0_cycle, setup, 8, (TRB_SETUP << 10) | (1u << 6) | (3u << 16));   /* IDT, TRT IN */
++	ring_put(HB_EP0, &ep0_idx, &ep0_cycle, hb_phys + HB_DATA, len, (TRB_DATA << 10) | (1u << 16) | (1u << 2)); /* IN, ISP */
++	ring_put(HB_EP0, &ep0_idx, &ep0_cycle, 0, 0, (TRB_STATUS << 10) | (1u << 5));                  /* OUT, IOC */
++	w32(hc_db + 4 * slot, 1);
++	int got = len;
++	for (;;) {   /* a short data stage reports first (ISP, residual in the length field), then the status stage (IOC) */
++		if (event_wait(TRB_EV_TRANSFER, 1000, ev)) return -1;
++		unsigned cc = ev[2] >> 24;
++		if (cc == 13) { got = (int)len - (int)(ev[2] & 0xffffff); continue; }
++		if (cc != 1) return -(int)cc - 100;
++		return got;
++	}
++}
++
++/* ---- session ------------------------------------------------------------------------------- */
++
++static int
++xhci_start(vm_offset_t core, char *why, size_t why_cap)
++{
++	uint32_t cap = r32(core), hcs1 = r32(core + 4), hcs2 = r32(core + 8), hcc1 = r32(core + 0x10);
++	unsigned caplen = cap & 0xff, scratch = ((hcs2 >> 27) & 0x1f) | (((hcs2 >> 21) & 0x1f) << 5);
++
++	hc_op = core + caplen;
++	hc_rt = core + (r32(core + 0x18) & ~0x1fu);
++	hc_db = core + (r32(core + 0x14) & ~0x3u);
++	hc_slots = (hcs1 & 0xff) < 8 ? (hcs1 & 0xff) : 8;
++	hc_ports = hcs1 >> 24;
++	hc_ctx_bytes = (hcc1 & (1u << 2)) ? 64 : 32;
++	hlog("[usbhost] xhci cap %08x hcs1 %08x hcs2 %08x hcc1 %08x scratch %u\n", cap, hcs1, hcs2, hcc1, scratch);
++	if (caplen < 0x20 || caplen > 0x80 || !hc_slots || !hc_ports || scratch > 8 || !(r32(hc_op + 8) & 1)) {
++		snprintf(why, why_cap, "xhci regs cap %08x hcs1 %08x hcs2 %08x page %08x", cap, hcs1, hcs2, r32(hc_op + 8));
++		return -1;
++	}
++	w32(hc_op, r32(hc_op) & ~1u);                        /* USBCMD.RS = 0 */
++	if (wait_bits(hc_op + 4, 1, 1, 100)) { snprintf(why, why_cap, "halt sts %08x", r32(hc_op + 4)); return -2; }
++	w32(hc_op, r32(hc_op) | 2u);                         /* HCRST */
++	if (wait_bits(hc_op, 2, 0, 1000) || wait_bits(hc_op + 4, 1u << 11, 0, 1000)) {
++		snprintf(why, why_cap, "reset cmd %08x sts %08x", r32(hc_op), r32(hc_op + 4));
++		return -3;
++	}
++	bzero((void *)hb, HB_BYTES);
++	for (unsigned i = 0; i < scratch; i++) {
++		mem32(HB_SPARRAY)[2 * i] = (uint32_t)(hb_phys + HB_SCRATCH + 0x1000 * i);
++		mem32(HB_SPARRAY)[2 * i + 1] = (uint32_t)((uint64_t)(hb_phys + HB_SCRATCH + 0x1000 * i) >> 32);
++	}
++	if (scratch) {
++		mem32(HB_DCBAA)[0] = (uint32_t)(hb_phys + HB_SPARRAY);
++		mem32(HB_DCBAA)[1] = (uint32_t)((uint64_t)(hb_phys + HB_SPARRAY) >> 32);
++	}
++	ring_init(HB_CMD);
++	cmd_idx = 0; cmd_cycle = 1; evt_idx = 0; evt_cycle = 1;
++	mem32(HB_ERST)[0] = (uint32_t)(hb_phys + HB_EVT);
++	mem32(HB_ERST)[1] = (uint32_t)((uint64_t)(hb_phys + HB_EVT) >> 32);
++	mem32(HB_ERST)[2] = RING_TRBS;
++	w32(hc_op + 0x38, hc_slots);                                 /* CONFIG.MaxSlotsEn */
++	w64(hc_op + 0x30, hb_phys + HB_DCBAA);                       /* DCBAAP */
++	w64(hc_op + 0x18, (hb_phys + HB_CMD) | 1);                   /* CRCR, RCS = 1 */
++	w32(hc_rt + 0x20 + 0x08, 1);                                 /* ERSTSZ */
++	w64(hc_rt + 0x20 + 0x18, hb_phys + HB_EVT);                  /* ERDP */
++	w64(hc_rt + 0x20 + 0x10, hb_phys + HB_ERST);                 /* ERSTBA last */
++	w32(hc_op, r32(hc_op) | 1u);                                 /* RS, no INTE: polled */
++	if (wait_bits(hc_op + 4, 1, 0, 100)) { snprintf(why, why_cap, "run sts %08x", r32(hc_op + 4)); return -4; }
++	for (unsigned p = 0; p < hc_ports; p++) {
++		vm_offset_t ps = hc_op + 0x400 + 0x10 * p;
++		uint32_t v = r32(ps);
++		if (!(v & PORTSC_PP)) w32(ps, (v & PORTSC_KEEP) | PORTSC_PP);
++	}
++	return 0;
++}
++
++static void
++xhci_stop(void)
++{
++	w32(hc_op, r32(hc_op) & ~1u);
++	(void)wait_bits(hc_op + 4, 1, 1, 100);
++	w32(hc_op, r32(hc_op) | 2u);
++	(void)wait_bits(hc_op, 2, 0, 1000);
++}
++
++/* enumerate the device on port p (0-based) far enough to name it */
++static int
++enumerate(unsigned p, char *out, size_t cap)
++{
++	vm_offset_t ps = hc_op + 0x400 + 0x10 * p;
++	uint32_t ev[4], v;
++	int rc;
++
++	w32(ps, (r32(ps) & PORTSC_KEEP) | PORTSC_PR);
++	if (wait_bits(ps, PORTSC_PRC, PORTSC_PRC, 500)) { snprintf(out, cap, "port %u reset timeout %08x", p + 1, r32(ps)); return -1; }
++	v = r32(ps);
++	w32(ps, (v & PORTSC_KEEP) | (v & PORTSC_CHANGE));            /* clear the change bits */
++	unsigned speed = (v >> 10) & 0xf;
++	if (!(v & PORTSC_PED)) { snprintf(out, cap, "port %u not enabled %08x", p + 1, v); return -2; }
++
++	if ((rc = command(0, TRB_ENABLE_SLOT << 10, ev))) { snprintf(out, cap, "enable slot %d", rc); return -3; }
++	unsigned slot = ev[3] >> 24;
++	if (!slot || slot > hc_slots) { snprintf(out, cap, "slot %u", slot); return -4; }
++
++	unsigned c = hc_ctx_bytes;
++	bzero((void *)(hb + HB_INCTX), 0x1000);
++	bzero((void *)(hb + HB_OUTCTX), 0x1000);
++	ring_init(HB_EP0);
++	ep0_idx = 0; ep0_cycle = 1;
++	unsigned mps = speed == 3 ? 64 : speed == 4 ? 512 : 8;
++	mem32(HB_INCTX)[1] = 3;                                         /* add slot + EP0 */
++	mem32(HB_INCTX + c)[0] = (speed << 20) | (1u << 27);           /* slot: speed, context entries 1 */
++	mem32(HB_INCTX + c)[1] = (p + 1) << 16;                        /* root hub port */
++	mem32(HB_INCTX + 2 * c)[1] = (3u << 1) | (4u << 3) | (mps << 16); /* EP0: CErr 3, control, MPS */
++	mem32(HB_INCTX + 2 * c)[2] = (uint32_t)(hb_phys + HB_EP0) | 1;   /* dequeue, DCS 1 */
++	mem32(HB_INCTX + 2 * c)[3] = (uint32_t)((uint64_t)(hb_phys + HB_EP0) >> 32);
++	mem32(HB_INCTX + 2 * c)[4] = 8;                                /* average TRB length */
++	mem32(HB_DCBAA)[2 * slot] = (uint32_t)(hb_phys + HB_OUTCTX);
++	mem32(HB_DCBAA)[2 * slot + 1] = (uint32_t)((uint64_t)(hb_phys + HB_OUTCTX) >> 32);
++	if ((rc = command(hb_phys + HB_INCTX, (TRB_ADDRESS_DEV << 10) | (slot << 24), ev))) {
++		snprintf(out, cap, "port %u speed %u address device %d", p + 1, speed, rc);
++		return -5;
++	}
++	/* Full/low speed starts with EP0 = 8 bytes. A full-speed device whose EP0 is 64 sends a longer packet and this read
++	 * fails with babble: decision point for the next step (Evaluate Context with byte 7 of an 8-byte read). */
++	int n = control_in(slot, 0x80, 6, 0x0100, 0, 18);
++	if (n < 8) { snprintf(out, cap, "port %u speed %u slot %u device descriptor %d", p + 1, speed, slot, n); return -6; }
++	volatile uint8_t *d = (volatile uint8_t *)(hb + HB_DATA);
++	unsigned vid = d[8] | (d[9] << 8), pid = d[10] | (d[11] << 8), bcd = d[2] | (d[3] << 8), dclass = d[4], mps0 = d[7];
++	unsigned ifclass = 0xff;
++	n = control_in(slot, 0x80, 6, 0x0200, 0, 255);
++	for (int i = 0; n > 0 && i + 1 < n; i += d[i] ? d[i] : n) {
++		if (d[i + 1] == 4 && i + 5 < n) { ifclass = d[i + 5]; break; }   /* first interface descriptor */
++	}
++	snprintf(out, cap, "port %u speed %u slot %u usb %x.%02x vid %04x pid %04x class %02x if %02x mps0 %u cfg %d",
++	    p + 1, speed, slot, bcd >> 8, bcd & 0xff, vid, pid, dclass, ifclass, mps0, n);
++	return 0;
++}
++
++int
++pong_usbhost_session(vm_offset_t core, vm_offset_t qscratch, unsigned seconds, unsigned flags, char *reply, size_t cap)
++{
++	char step[200] = "";
++	uint8_t echo = 0, cc0 = 0, ok = 0, mode = 0, route[2] = { 0x06, 0x09 }, end = 0;
++	int n = 0, k, rc = 0, boost_rc = 1, chgin_seen = 0;
++	bool boosted = false, host = false;
++	uint64_t deadline = now_ms() + (uint64_t)seconds * 1000;
++	uint32_t gctl0 = r32(core + 0xc110), qs10 = r32(qscratch + 0x10), qs30 = r32(qscratch + 0x30);
++
++#define ADD(...) do { k = snprintf(reply + n, cap - (size_t)n, __VA_ARGS__); if (k > 0) n += k < (int)(cap - (size_t)n) ? k : (int)(cap - (size_t)n) - 1; } while (0)
++	reply[0] = '\0';
++	ADD("usbhost: %us flags %u", seconds, flags);
++	if (!hb) {
++		void *v = IOMallocContiguous(HB_BYTES, 0x1000, &hb_phys);
++		hb = v && hb_phys ? ml_io_map_wcomb((vm_offset_t)hb_phys, HB_BYTES) : 0;
++		if (!hb) { ADD(" | no dma\n"); return -1; }
++	}
++
++	/* the battery worker leaves the I2C bus to us (it checks every 200 ms while paused, otherwise every 10 s) */
++	pong_batt_pause = 1;
++	for (unsigned i = 0; i < 150 && !pong_batt_paused; i++) IODelay(100000);
++	if (!pong_batt_paused) { pong_batt_pause = 0; ADD(" | battery worker did not pause\n"); return -2; }
++
++	rc = ccic_opcode(0x55, 0x03, &echo);
++	(void)pong_usbc_i2c_read(CCIC, 0x0a, &cc0);
++	ADD(" | op55 %d echo %02x cc0 %02x", rc, echo, cc0);
++	hlog("[usbhost] op55 rc=%d echo=%02x cc0=%02x\n", rc, echo, cc0);
++
++	/* wait for the PC to go and a sink to come */
++	while (now_ms() < deadline) {
++		if (pong_usbc_i2c_read(CHG, 0xb2, &ok) && (ok & 0x40)) chgin_seen = 1;
++		else if (pong_usbc_i2c_read(CCIC, 0x0a, &cc0) && (cc0 & 7) == 2) break;
++		IODelay(200000);
++	}
++	ADD(" | chgin %d cc0 %02x", chgin_seen, cc0);
++	if ((cc0 & 7) != 2) { ADD(" | no sink attached\n"); goto out; }
++	(void)pong_usbc_i2c_write(CCIC, 0x21, route, 2);
++	(void)pong_usbc_i2c_write(CCIC, 0x41, &end, 1);
++	if (!(flags & 4)) {
++		boost_rc = boost(true, &mode);
++		boosted = boost_rc == 0;
++		ADD(" | boost %d mode %02x", boost_rc, mode);
++		hlog("[usbhost] boost rc=%d mode=%02x\n", boost_rc, mode);
++		if (!boosted) goto out;
++	}
++
++	/* DWC3 to host */
++	if (!(flags & 2)) {
++		w32(core + 0xc110, r32(core + 0xc110) | (1u << 11));   /* GCTL.CORESOFTRESET */
++		IODelay(100000);
++	}
++	w32(core + 0xc110, (r32(core + 0xc110) & ~(3u << 12) & ~(1u << 11)) | (1u << 12));
++	w32(qscratch + 0x10, qs10 & ~((1u << 20) | (1u << 28)));
++	w32(qscratch + 0x30, qs30 & ~(1u << 24));
++	host = true;
++	IODelay(10000);
++	if ((rc = xhci_start(core, step, sizeof(step)))) { ADD(" | xhci %d %s", rc, step); goto out; }
++	ADD(" | xhci ports %u slots %u ctx %u", hc_ports, hc_slots, hc_ctx_bytes);
++
++	rc = -1;
++	while (now_ms() < deadline && rc) {
++		for (unsigned p = 0; p < hc_ports && rc; p++) {
++			if (r32(hc_op + 0x400 + 0x10 * p) & PORTSC_CCS) {
++				IODelay(100000);                         /* debounce */
++				rc = enumerate(p, step, sizeof(step));
++				ADD(" | %s", step);
++				hlog("[usbhost] enumerate rc=%d %s\n", rc, step);
++				if (rc) rc = 0;                          /* one attempt: the report says why */
++			}
++		}
++		IODelay(50000);
++	}
++	if (rc) ADD(" | nothing connected");
++	for (unsigned p = 0; p < hc_ports && p < 4; p++) ADD(" p%u %08x", p + 1, r32(hc_op + 0x400 + 0x10 * p));
++	xhci_stop();
++
++out:
++	if (host) {
++		if (!(flags & 2)) {
++			w32(core + 0xc110, r32(core + 0xc110) | (1u << 11));
++			IODelay(100000);
++		}
++		w32(core + 0xc110, (gctl0 & ~(1u << 11)));           /* PRTCAPDIR back as it was (device) */
++		w32(qscratch + 0x10, qs10);
++		w32(qscratch + 0x30, qs30);
++	}
++	if (boosted) {
++		boost_rc = boost(false, &mode);
++		ADD(" | boost off %d mode %02x", boost_rc, mode);
++		hlog("[usbhost] boost off rc=%d mode=%02x\n", boost_rc, mode);
++	}
++	pong_batt_pause = 0;
++	ADD("\n");
++	return 0;
++#undef ADD
++}
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index 32d1541..918774f 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -610,6 +610,8 @@ extern "C" { extern uint8_t pong_charger_cnfg[14]; uint8_t pong_charger_cnfg[14]
+ extern "C" { extern uint8_t pong_ccic_regs[13]; uint8_t pong_ccic_regs[13]; }
+ extern "C" { extern volatile uint32_t pong_ccic_want; volatile uint32_t pong_ccic_want; }
+ extern "C" { extern uint64_t pong_ccic_stamp; uint64_t pong_ccic_stamp; }   /* mach time of the last full read; 0 = none */
++/* z109: a USB host session (bsd/dev/pong_usbhost.c) owns the I2C bus while pong_batt_pause is set; paused = at rest */
++extern "C" { extern volatile uint32_t pong_batt_pause, pong_batt_paused; volatile uint32_t pong_batt_pause, pong_batt_paused; }
+ namespace {
+ constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
+ constexpr vm_size_t kT970TlmmBytes = 0x100000;
+@@ -973,6 +975,12 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 	if (gChargeStop < 50 || gChargeStop > 99) gChargeStop = 0;
+ 	batteryPmsg("PONG_BATT cfg kick=%u sample_ticks=%u spin=%u\n", kick, sampleTicks, gT970Spin);
+ 	for (;;) {
++		if (pong_batt_pause) {
++			pong_batt_paused = 1;
++			IOSleep(200);
++			continue;
++		}
++		pong_batt_paused = 0;
+ 		if (kick == 1) {
+ 			uint8_t cnfg06 = 0;
+ 			const int krc = kickChargerWatchdog(&cnfg06);
