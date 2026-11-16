@@ -280,7 +280,7 @@ static id icon_metal_context(void)
             if(context)context=((id(*)(id,SEL))objc_msgSend)(context,sel_registerName("retain"));
             if(opts)CFRelease(opts);
         }
-        bool metal=context!=nil;
+        bool on_gpu=context!=nil;
         if(device)((void(*)(id,SEL))objc_msgSend)(device,sel_registerName("release"));
         // No Metal device (SM-T970: Preferences is not a PongAdrenoMetal client). The stock helper's
         // CIContext then takes CoreImage's CPU renderer; do the same instead of returning no image,
@@ -294,7 +294,7 @@ static id icon_metal_context(void)
             if(context)context=((id(*)(id,SEL))objc_msgSend)(context,sel_registerName("retain"));
             if(opts)CFRelease(opts);
         }
-        record(metal?"native Metal CoreImage icon context created":
+        record(on_gpu?"native Metal CoreImage icon context created":
             context?"CoreImage CPU icon context created (no Metal device)":"icon context unavailable");
     });
     return context;
