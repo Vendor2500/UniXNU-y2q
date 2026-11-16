@@ -280,8 +280,22 @@ static id icon_metal_context(void)
             if(context)context=((id(*)(id,SEL))objc_msgSend)(context,sel_registerName("retain"));
             if(opts)CFRelease(opts);
         }
+        bool metal=context!=nil;
         if(device)((void(*)(id,SEL))objc_msgSend)(device,sel_registerName("release"));
-        record(context?"native Metal CoreImage icon context created":"native Metal icon context unavailable");
+        // No Metal device (SM-T970: Preferences is not a PongAdrenoMetal client). The stock helper's
+        // CIContext then takes CoreImage's CPU renderer; do the same instead of returning no image,
+        // which left every scaled Settings icon blank.
+        Method plain=cls?class_getClassMethod(cls,sel_registerName("contextWithOptions:")):NULL;
+        CFStringRef *software=dlsym(RTLD_DEFAULT,"kCIContextUseSoftwareRenderer");
+        if(!context && abi(plain,"@",1,"@") && software && *software) {
+            const void *key[]={*software},*value[]={kCFBooleanTrue};
+            CFDictionaryRef opts=CFDictionaryCreate(NULL,key,value,1,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
+            context=((id(*)(id,SEL,id))objc_msgSend)((id)cls,sel_registerName("contextWithOptions:"),(id)opts);
+            if(context)context=((id(*)(id,SEL))objc_msgSend)(context,sel_registerName("retain"));
+            if(opts)CFRelease(opts);
+        }
+        record(metal?"native Metal CoreImage icon context created":
+            context?"CoreImage CPU icon context created (no Metal device)":"icon context unavailable");
     });
     return context;
 }
