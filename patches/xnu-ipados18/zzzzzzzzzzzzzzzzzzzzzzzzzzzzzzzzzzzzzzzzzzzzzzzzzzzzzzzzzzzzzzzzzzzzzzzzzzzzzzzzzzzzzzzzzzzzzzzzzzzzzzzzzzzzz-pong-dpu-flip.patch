@@ -1,0 +1,778 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index f4b0e76..d2b8657 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2097,6 +2097,15 @@ dispatch_command(const char *cmd)
+ 		send_str(hp_reply[0] ? hp_reply : "buzz: no reply\n");
+ 	} else if (strcmp(cmd, "usbrole") == 0 || strncmp(cmd, "usbrole ", 8) == 0) {
+ 		cmd_handle_usbrole(cmd + 7);
++	} else if (strcmp(cmd, "dpu") == 0) {
++		/* the display controller, read only: clocks, CTL, mixers, pipes, INTF1/2 tear check, frames a second, flipping
++		 * (iokit/Kernel/MiniIOMobileFramebuffer.cpp, z105) */
++		extern int pong_dpu_usb(char *reply, size_t cap);
++		static char dp_reply[3600];
++
++		dp_reply[0] = '\0';
++		(void)pong_dpu_usb(dp_reply, sizeof(dp_reply));
++		send_str(dp_reply[0] ? dp_reply : "dpu: no reply\n");
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 30e7426..2c7ac43 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -294,6 +294,7 @@ public:
+ 	MiniIOSurface * defaultSurface(void);
+ 	IOReturn present(const uint8_t * swap);
+ 	IOReturn show(const uint8_t * swap, MiniIOSurface ** surfaces);
++	int panelBackBuffer(const uint8_t * swap, MiniIOSurface ** surfaces);
+ 	void presenter(void);
+ 	static void presenterMain(void * self, wait_result_t result);
+ 	void reportFrameTimes(void);
+@@ -312,6 +313,584 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * The display controller behind the framebuffer (SM-T970, SM8250): its MDSS at 0xae00000 (Linux:
++ * drivers/gpu/drm/msm/disp/dpu1, whose catalog counts from 0xae01000). The UEFI's DisplayDxe set it
++ * going -- pipes fetching the "Display Reserved" framebuffer at 0x9c000000, through the mixers, DSC and
++ * interface 1 to the command-mode panel S6TUUM3 (2800 x 1752, two halves of 1400), sent a frame on its
++ * TE pulses by INTF1's autorefresh -- and nobody touched it since: every frame was copied by the
++ * processors into that one buffer while the panel read it. Ported from the G986N (y2q, the same SoC):
++ * ref/G986N-iOS/docs/y2q-display.md, work/gap_audit/OPTIMIZE.md section 1.
++ *
++ * - fb_flip=2/3: a frame is drawn into a buffer the panel is not showing and the pipes are pointed at
++ *   it. Their address registers are double buffered: what is written with a flush of their bits in
++ *   their CTL path is taken at the next frame's start, and the bits clear then. Default 0: one
++ *   buffer, as before.
++ * - fb_hwscale=1 (the default; with fb_flip only): a workspace smaller than the panel (fbscale) is
++ *   drawn at its own size, only copied, and enlarged by the VIG pipes' QSEED3 scalers. 0: by the
++ *   processors, as before.
++ * - fb_autorefresh=N: INTF1 sends the panel a frame on every N-th TE pulse (the firmware: 2, 30 a
++ *   second of the panel's 60). Default 0: as the firmware left it.
++ * - USB `dpu` (pong_dpu_usb()): what the controller is doing, read only.
++ *
++ * Nothing here turns a clock or a power switch on: a block without them does not answer a read and
++ * the processor waits for it for ever. Without them the controller is not touched (one buffer).
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++#define PANEL_WIMG_WCOMB        0x6             /* VM_WIMG_WCOMB, as video_console.c maps the boot framebuffer */
++
++static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
++static TUNABLE(uint32_t, gHwScaleArg, "fb_hwscale", 1);
++static TUNABLE(uint32_t, gAutorefresh, "fb_autorefresh", 0);
++
++#define PANEL_FRONT_PHYS        0x9c000000ull   /* the UEFI's framebuffer: "Display Reserved" (gts7xlwifiPkg MemoryMapLib) */
++#define PANEL_RESERVED_END      0x9e400000ull   /* ... 36 MB, kept out of the kernel's memory */
++
++#define GCC_DISP_AHB_CBCR       0x0010b00cull   /* gcc_disp_ahb_clk: the bus clock of the display's clock controller */
++#define DISPCC_BASE             0x0af00000ull
++#define DISPCC_PCLK0_CBCR       0x2004
++#define DISPCC_MDP_CBCR         0x200c
++#define DISPCC_VSYNC_CBCR       0x2024
++#define DISPCC_AHB_CBCR         0x2080          /* the bus clock of the MDSS's registers */
++#define DISPCC_MDSS_GDSCR       0x3000
++#define CBCR_OFF                (1u << 31)
++#define GDSC_POWER_ON           (1u << 31)
++
++#define MDSS_BASE               0x0ae00000ull
++#define MDSS_SIZE               0x00085000ull
++#define MDP_TOP                 0x01000
++#define MDP_VSYNC_SEL           0x414           /* (in MDP top) */
++#define MDSS_CTL(n)             (0x02000 + 0x200 * (n))
++#define CTL_TOP                 0x014
++#define CTL_FLUSH               0x018
++#define CTL_INTF_ACTIVE         0x0f4
++#define CTL_FETCH_PIPE_ACTIVE   0x0fc
++#define MDSS_LM(n)              (0x45000 + 0x1000 * (n))
++#define MDSS_INTF(n)            (0x6b000 + 0x800 * (n))         /* 0: DP, 1: DSI0 (the panel), 2: DSI1, 3: DP */
++#define MDSS_INTF1              MDSS_INTF(1)
++#define INTF_FRAME_COUNT        0x0ac
++#define INTF_LINE_COUNT         0x0b0
++#define INTF_TEAR_AUTOREFRESH   0x2b4           /* bit 31: on; bits 0-15: a frame every so many TE pulses */
++#define AUTOREFRESH_ON          (1u << 31)
++#define SSPP_SRC_SIZE           0x00
++#define SSPP_OUT_SIZE           0x0c
++#define SSPP_OUT_XY             0x10
++#define SSPP_SRC0_ADDR          0x14
++#define SSPP_SRC_YSTRIDE0       0x24
++#define SSPP_SRC_FORMAT         0x30
++
++#define PANEL_PIPES             8
++static const uint32_t kPipeBase[PANEL_PIPES] = { 0x05000, 0x07000, 0x09000, 0x0b000, 0x25000, 0x27000, 0x29000, 0x2b000 };
++static const uint32_t kPipeFlush[PANEL_PIPES] = { 1u << 0, 1u << 1, 1u << 2, 1u << 18, 1u << 11, 1u << 12, 1u << 24, 1u << 25 };
++static const char * const kPipeName[PANEL_PIPES] = { "vig0", "vig1", "vig2", "vig3", "dma0", "dma1", "dma2", "dma3" };
++
++#define PANEL_LATCH_MS          100             /* a flip not taken by then: the panel has stopped, flipping too */
++#define PANEL_BUFFERS           3
++
++static uint8_t *        gMdss;                  /* the controller's registers (dpuMap()) */
++static volatile uint32_t * gGccDispAhb;
++static uint8_t *        gDispcc;
++static uint32_t         gAlive[4];              /* what panelAlive() last read */
++static uint32_t         gPipes;                 /* the pipes that fetch the framebuffer */
++static uint32_t         gPipeFlush;             /* ... their bits in the flush of the CTL path that has them */
++static int              gCtl = -1;
++static uint64_t         gPanelPhys[PANEL_BUFFERS];      /* the buffers: [0] the firmware's, then the others */
++static uint8_t *        gPanelVirt[PANEL_BUFFERS];
++static unsigned         gPanelBuffers;
++static int              gShown;                 /* the buffer the hardware shows (or may: see panelFlip()) */
++static int              gPending = -1;          /* ... the one it has been told to show from the next frame on */
++static int              gNewest;                /* the last one a frame was drawn into */
++static uint64_t         gPendingSince;          /* when the pipes were first told something they have not taken yet */
++static uint32_t         gStatFlips, gStatReplaced;      /* flips told the pipes; of them, put in place of one not taken */
++static uint32_t         gStatPanelFrame;        /* INTF1's frame count at the last report */
++static bool             gHwScale;               /* frames are at the display's size and the pipes scale them to the panel */
++static bool             gScaled;                /* ... and the pipes have been told so */
++static bool             gFlipping;
++
++static inline uint32_t
++mdssRead(uint32_t offset)
++{
++	return *(volatile uint32_t *) (gMdss + offset);
++}
++
++static inline void
++mdssWrite(uint32_t offset, uint32_t value)
++{
++	*(volatile uint32_t *) (gMdss + offset) = value;
++}
++
++/* The clock controller's and the controller's registers mapped, once (some 0.5 MB of the I/O map). */
++static bool
++dpuMap(void)
++{
++	vm_offset_t gcc, dispcc, mdss;
++
++	if (__atomic_load_n(&gMdss, __ATOMIC_ACQUIRE) != NULL) {
++		return true;
++	}
++	/* ponytail: start() and a USB `dpu` racing here would both map; harmless, once, 0.5 MB of the I/O map */
++	gcc = ml_io_map(GCC_DISP_AHB_CBCR & ~(uint64_t) PAGE_MASK, PAGE_SIZE);
++	dispcc = ml_io_map(DISPCC_BASE, 0x4000);
++	mdss = ml_io_map(MDSS_BASE, MDSS_SIZE);
++	if (gcc == 0 || dispcc == 0 || mdss == 0) {
++		return false;
++	}
++	gGccDispAhb = (volatile uint32_t *) (gcc + (GCC_DISP_AHB_CBCR & PAGE_MASK));
++	gDispcc = (uint8_t *) dispcc;
++	__atomic_store_n(&gMdss, (uint8_t *) mdss, __ATOMIC_RELEASE);
++	return true;
++}
++
++/*
++ * Are the controller's registers safe to read? GCC answers always: first the bus clock of the
++ * display's clock controller, then behind it the MDSS power switch, the bus clock of its registers and
++ * its core clock. `now`: gcc disp_ahb, mdss_gdsc, ahb, mdp, vsync, pclk0 (0: not read). Read only.
++ */
++static bool
++dpuPowered(uint32_t now[6])
++{
++	bzero(now, 6 * sizeof(now[0]));
++	now[0] = *gGccDispAhb;
++	if (now[0] & CBCR_OFF) {
++		return false;
++	}
++	now[1] = *(volatile uint32_t *) (gDispcc + DISPCC_MDSS_GDSCR);
++	now[2] = *(volatile uint32_t *) (gDispcc + DISPCC_AHB_CBCR);
++	now[3] = *(volatile uint32_t *) (gDispcc + DISPCC_MDP_CBCR);
++	now[4] = *(volatile uint32_t *) (gDispcc + DISPCC_VSYNC_CBCR);
++	now[5] = *(volatile uint32_t *) (gDispcc + DISPCC_PCLK0_CBCR);
++	return (now[1] & GDSC_POWER_ON) && !(now[2] & CBCR_OFF) && !(now[3] & CBCR_OFF);
++}
++
++/* dpuPowered(), asked before the controller is touched: someone may take them away. A change is said once. */
++static bool
++panelAlive(const char * where)
++{
++	uint32_t now[6];
++	bool on = dpuPowered(now);
++
++	if (memcmp(now, gAlive, sizeof(gAlive)) != 0) {
++		IOLog("MiniIOMobileFramebuffer: dpu: %s: gcc disp_ahb %#x, mdss_gdsc %#x ahb %#x mdp %#x (were %#x %#x %#x %#x)\n", where,
++		    now[0], now[1], now[2], now[3], gAlive[0], gAlive[1], gAlive[2], gAlive[3]);
++		memcpy(gAlive, now, sizeof(gAlive));
++	}
++	return on;
++}
++
++/* Have the pipes taken what they were last told (the flush bits clear)? Then that buffer is the one shown. */
++static void
++panelUpdate(void)
++{
++	if (gPending >= 0 && !(mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush)) {
++		gShown = gPending;
++		gPending = -1;
++	}
++}
++
++/*
++ * The pipes' scalers (QSEED3, version 3.0 on this controller: Linux's dpu_hw_setup_scaler3() with what
++ * _dpu_plane_setup_scaler3() works out for an RGB picture), as the G986N has them. The firmware has
++ * each pipe fetch its part of the framebuffer at the panel's size -- on the y2q two pipes, a half of
++ * the panel each, the second one's output at the panel's middle (the mixers split the source) -- and
++ * nothing is scaled. Scaled, a pipe fetches the columns of the display's picture that its part of
++ * the panel shows and enlarges them, bilinear: the step from one panel pixel to the next is display
++ * over panel, in 21 bits of fraction, and where a part begins between two source columns the scaler
++ * starts with that fraction. The registers are double buffered like the address: taken with the next
++ * flush, the address with them.
++ */
++#define SSPP_SCALER             0xa00
++#define QSEED3_OP_ENABLE        (1u << 0)
++#define QSEED3_OP_Y_RGB_BIL     (3u << 16)      /* DPU_SCALE_BIL */
++#define QSEED3_OP_ALPHA_EN      (1u << 10)
++#define QSEED3_OP_ALPHA_BIL     (1u << 29)      /* DPU_SCALE_ALPHA_BIL */
++#define QSEED3_OP_NOT_DX        (1u << 14)
++#define QSEED3_OP_BLEND         (1u << 31)
++#define QSEED3_PRELOAD_VALUE    (4u | 2u << 8 | 4u << 16 | 2u << 24)    /* DPU_QSEED4_DEFAULT_PRELOAD_H, _V */
++#define PHASE_SHIFT             21
++#define SRC_FORMAT_ALPHA        (1u << 8)       /* SRCC3_EN: the format has alpha */
++
++/* every register of a pipe that scaling changes: the pipe's rectangles, its pixel extension, its scaler */
++static const uint16_t kPipeScaleRegs[] = {
++	0x000, 0x008, 0x00c, 0x010,                                             /* src size, src xy, out size, out xy */
++	0x100, 0x104, 0x108, 0x110, 0x114, 0x118, 0x120, 0x124, 0x128,         /* SW_PIX_EXT C0, C1C2, C3: LR, TB, REQ_PIXELS */
++	SSPP_SCALER + 0x04, SSPP_SCALER + 0x10, SSPP_SCALER + 0x14, SSPP_SCALER + 0x18, SSPP_SCALER + 0x1c, SSPP_SCALER + 0x20,
++	SSPP_SCALER + 0x40, SSPP_SCALER + 0x44, SSPP_SCALER + 0x48,
++	SSPP_SCALER + 0x90, SSPP_SCALER + 0x94, SSPP_SCALER + 0x98, SSPP_SCALER + 0x9c,
++};
++#define PIPE_SCALE_REGS         (sizeof(kPipeScaleRegs) / sizeof(kPipeScaleRegs[0]))
++static uint32_t gPipeFirmware[PANEL_PIPES][PIPE_SCALE_REGS];   /* as the firmware left them */
++static uint32_t gPipeScaledRegs[PANEL_PIPES][PIPE_SCALE_REGS]; /* ... and scaled */
++
++static void
++pipeScaledSet(uint32_t * regs, uint32_t offset, uint32_t value)
++{
++	for (unsigned i = 0; i < PIPE_SCALE_REGS; i++) {
++		if (kPipeScaleRegs[i] == offset) {
++			regs[i] = value;
++		}
++	}
++}
++
++/*
++ * Work out the scaled registers of the pipes, for a picture of `width` x `height` on the panel's
++ * `panelWidth` x `panelHeight`. False: these pipes cannot do it (a DMA pipe has no scaler, or a pipe's
++ * part of the panel is not a whole column of it).
++ */
++static bool
++panelScaled(uint32_t width, uint32_t height, uint32_t panelWidth, uint32_t panelHeight)
++{
++	uint32_t stepX = (uint32_t) (((uint64_t) width << PHASE_SHIFT) / panelWidth);
++	uint32_t stepY = (uint32_t) (((uint64_t) height << PHASE_SHIFT) / panelHeight);
++
++	if (width > panelWidth || height > panelHeight || (gPipes & ~0xfu) != 0) {
++		IOLog("MiniIOMobileFramebuffer: dpu: %ux%u on %ux%u by pipes %#x: not scaled by the pipes\n", width, height, panelWidth,
++		    panelHeight, gPipes);
++		return false;
++	}
++	for (int p = 0; p < PANEL_PIPES; p++) {
++		uint32_t b = kPipeBase[p], * regs = gPipeScaledRegs[p], outX, outW, outH, srcX, srcW, last, init, op;
++		uint64_t first;
++
++		if (!(gPipes & (1u << p))) {
++			continue;
++		}
++		for (unsigned i = 0; i < PIPE_SCALE_REGS; i++) {
++			gPipeFirmware[p][i] = regs[i] = mdssRead(b + kPipeScaleRegs[i]);
++		}
++		outX = mdssRead(b + SSPP_OUT_XY) & 0xffff;
++		outW = mdssRead(b + SSPP_OUT_SIZE) & 0xffff;
++		outH = mdssRead(b + SSPP_OUT_SIZE) >> 16;
++		if ((mdssRead(b + SSPP_OUT_XY) >> 16) != 0 || outH != panelHeight || outW == 0 || outX + outW > panelWidth) {
++			IOLog("MiniIOMobileFramebuffer: dpu: %s shows %ux%u at %#x of the panel: not scaled by the pipes\n", kPipeName[p], outW,
++			    outH, mdssRead(b + SSPP_OUT_XY));
++			return false;
++		}
++		/* the source columns its panel columns fall on: from the one under the first, to the one after the last's */
++		first = (uint64_t) outX * stepX;
++		srcX = (uint32_t) (first >> PHASE_SHIFT);
++		init = (uint32_t) (first & ((1u << PHASE_SHIFT) - 1));
++		last = (uint32_t) (((uint64_t) (outX + outW - 1) * stepX) >> PHASE_SHIFT) + 2;
++		srcW = (last < width ? last : width) - srcX;
++		op = QSEED3_OP_ENABLE | QSEED3_OP_Y_RGB_BIL | QSEED3_OP_NOT_DX | QSEED3_OP_BLEND;
++		if (mdssRead(b + SSPP_SRC_FORMAT) & SRC_FORMAT_ALPHA) {
++			op |= QSEED3_OP_ALPHA_EN | QSEED3_OP_ALPHA_BIL;
++		}
++		pipeScaledSet(regs, SSPP_SRC_SIZE, height << 16 | srcW);
++		pipeScaledSet(regs, 0x008, srcX);
++		for (uint32_t pe = 0x100; pe <= 0x128; pe += 4) {
++			pipeScaledSet(regs, pe, (pe & 0xf) == 8 ? (height << 16 | srcW) : 0);
++		}
++		pipeScaledSet(regs, SSPP_SCALER + 0x04, op);
++		pipeScaledSet(regs, SSPP_SCALER + 0x10, stepX);
++		pipeScaledSet(regs, SSPP_SCALER + 0x14, stepY);
++		pipeScaledSet(regs, SSPP_SCALER + 0x18, stepX);
++		pipeScaledSet(regs, SSPP_SCALER + 0x1c, stepY);
++		pipeScaledSet(regs, SSPP_SCALER + 0x20, QSEED3_PRELOAD_VALUE);
++		pipeScaledSet(regs, SSPP_SCALER + 0x40, height << 16 | srcW);
++		pipeScaledSet(regs, SSPP_SCALER + 0x44, height << 16 | srcW);
++		pipeScaledSet(regs, SSPP_SCALER + 0x48, outH << 16 | outW);
++		pipeScaledSet(regs, SSPP_SCALER + 0x90, init);
++		pipeScaledSet(regs, SSPP_SCALER + 0x94, 0);
++		pipeScaledSet(regs, SSPP_SCALER + 0x98, init);
++		pipeScaledSet(regs, SSPP_SCALER + 0x9c, 0);
++		IOLog("MiniIOMobileFramebuffer: dpu: %s: scaler version %#x (op mode %#x); scaled: columns %u to %u of %u (phase %#x) "
++		    "onto %u at %u, step %#x x %#x\n", kPipeName[p], mdssRead(b + SSPP_SCALER), gPipeFirmware[p][13], srcX, srcX + srcW - 1,
++		    width, init, outW, outX, stepX, stepY);
++	}
++	return true;
++}
++
++/* The pipes told to scale (or to show the panel's size as the firmware had them), from the next flush on. */
++static void
++panelScale(bool scaled)
++{
++	for (int p = 0; p < PANEL_PIPES; p++) {
++		if (gPipes & (1u << p)) {
++			for (unsigned i = 0; i < PIPE_SCALE_REGS; i++) {
++				mdssWrite(kPipeBase[p] + kPipeScaleRegs[i], scaled ? gPipeScaledRegs[p][i] : gPipeFirmware[p][i]);
++			}
++		}
++	}
++	gScaled = scaled;
++}
++
++/*
++ * Point the pipes at buffer `which`: taken by the hardware at the next frame's start. A flip told
++ * before and not taken yet is replaced: its buffer is never shown and is free again -- unless a frame
++ * began while the pipes were being told (INTF1's frame count moved), when it may have been taken just
++ * before; it is then counted as shown, until the pipes are seen to take this one.
++ */
++static void
++panelFlip(unsigned which)
++{
++	uint32_t before, after, waiting;
++
++	__builtin_arm_dsb(0xf);                 /* (the frame's pixels in memory before the hardware is told of them) */
++	before = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
++	waiting = mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush;
++	if (gHwScale != gScaled) {
++		panelScale(gHwScale);           /* (the first frame at the display's size) */
++	}
++	for (int p = 0; p < PANEL_PIPES; p++) {
++		if (gPipes & (1u << p)) {
++			mdssWrite(kPipeBase[p] + SSPP_SRC0_ADDR, (uint32_t) gPanelPhys[which]);
++		}
++	}
++	mdssWrite(MDSS_CTL(gCtl) + CTL_FLUSH, gPipeFlush);
++	after = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
++	gStatFlips++;
++	gStatReplaced += gPending >= 0 && waiting && after == before;
++	if (gPending < 0 || !waiting || after != before) {
++		if (gPending >= 0) {
++			gShown = gPending;
++		}
++		gPendingSince = mach_absolute_time();
++	}
++	gPending = (int) which;
++	gNewest = (int) which;
++}
++
++/* Has the last flip been taken (the buffer shown before it no longer read)? Waits up to `ms`. */
++static bool
++panelLatched(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
++	while (mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush) {
++		if (mach_absolute_time() > deadline) {
++			return false;
++		}
++		IODelay(100);
++	}
++	panelUpdate();
++	return true;
++}
++
++/*
++ * How often the panel is sent a frame: INTF1 does it by itself on every N-th TE pulse (rui's T970
++ * port read 0x80000002 here, 30 a second of the panel's 60 TE, and wrote 0x80000001: BacklightProbe.cpp
++ * t970_dpu_set_refresh()). Only the frame count is changed, and only when asked (fb_autorefresh=N).
++ */
++static void
++panelAutorefresh(void)
++{
++	uint32_t config = mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH);
++
++	if (!(config & AUTOREFRESH_ON) || gAutorefresh == 0 || gAutorefresh > 0xffff || (config & 0xffff) == gAutorefresh) {
++		IOLog("MiniIOMobileFramebuffer: dpu: intf1 autorefresh %#x left as it is (fb_autorefresh=%u)\n", config, gAutorefresh);
++		return;
++	}
++	mdssWrite(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH, AUTOREFRESH_ON | gAutorefresh);
++	IOLog("MiniIOMobileFramebuffer: dpu: intf1 autorefresh %#x now (was %#x)\n", mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH), config);
++}
++
++/*
++ * The panel's controller set up as the boot-args ask: autorefresh, then the pipes that show the
++ * framebuffer, the CTL path that has them, the scalers and the other buffers. Nothing is touched
++ * unless fb_flip or fb_autorefresh is given.
++ */
++static void
++panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWidth, uint32_t displayHeight)
++{
++	uint64_t frontSize = (uint64_t) rowBytes * height, size, next;
++	unsigned want;
++
++	if (gFlip == 0 && gAutorefresh == 0) {
++		return;
++	}
++	if ((uint64_t) vinfo.v_physaddr != PANEL_FRONT_PHYS || PANEL_FRONT_PHYS + frontSize > PANEL_RESERVED_END) {
++		IOLog("MiniIOMobileFramebuffer: dpu: the framebuffer is at %#llx (%llu bytes), not the UEFI's: one buffer\n",
++		    (unsigned long long) vinfo.v_physaddr, frontSize);
++		return;
++	}
++	if (!dpuMap() || !panelAlive("start")) {
++		IOLog("MiniIOMobileFramebuffer: dpu: the display block is without power or clock: not touched, one buffer\n");
++		return;
++	}
++	panelAutorefresh();
++	if (gFlip == 0) {
++		return;
++	}
++	for (int p = 0; p < PANEL_PIPES; p++) {
++		if (mdssRead(kPipeBase[p] + SSPP_SRC0_ADDR) == (uint32_t) PANEL_FRONT_PHYS) {
++			if ((mdssRead(kPipeBase[p] + SSPP_SRC_YSTRIDE0) & 0xffff) != rowBytes) {
++				IOLog("MiniIOMobileFramebuffer: dpu: %s fetches the framebuffer with rows of %u bytes, not %u: one buffer\n",
++				    kPipeName[p], mdssRead(kPipeBase[p] + SSPP_SRC_YSTRIDE0) & 0xffff, rowBytes);
++				gPipes = 0;
++				break;
++			}
++			gPipes |= 1u << p;
++			gPipeFlush |= kPipeFlush[p];
++		}
++	}
++	/* the CTL path whose mixers take those pipes: the first active one (the firmware has one) */
++	for (int n = 0; n < 6 && gCtl < 0; n++) {
++		if (mdssRead(MDSS_CTL(n) + CTL_INTF_ACTIVE) != 0 || mdssRead(MDSS_CTL(n) + CTL_TOP) != 0) {
++			gCtl = n;
++		}
++	}
++	if (gPipes == 0 || gCtl < 0) {
++		IOLog("MiniIOMobileFramebuffer: dpu: no pipe shows the framebuffer as it is (pipes %#x ctl %d): one buffer\n", gPipes, gCtl);
++		return;
++	}
++	gHwScale = gHwScaleArg && (displayWidth != width || displayHeight != height) &&
++	    panelScaled(displayWidth, displayHeight, width, height);
++	/* the other buffers: at the display's size when the pipes scale, where they fit in Display Reserved, else in the kernel's memory */
++	size = (uint64_t) rowBytes * (gHwScale ? displayHeight : height);
++	gPanelPhys[0] = PANEL_FRONT_PHYS;
++	gPanelVirt[0] = (uint8_t *) vinfo.v_baseaddr;
++	gPanelBuffers = 1;
++	next = (PANEL_FRONT_PHYS + frontSize + 0xfffffull) & ~0xfffffull;
++	want = gFlip >= 3 ? 3 : 2;
++	while (gPanelBuffers < want) {
++		uint64_t phys = 0, mapped = (size + PAGE_MASK) & ~(uint64_t) PAGE_MASK;
++		uint8_t * virt = NULL;
++
++		if (next + mapped <= PANEL_RESERVED_END) {
++			/* (megabytes: more than the kernel's I/O map holds, which ml_io_map() takes from) */
++			virt = (uint8_t *) ml_io_map_unmappable((vm_offset_t) next, (vm_size_t) mapped, PANEL_WIMG_WCOMB);
++			phys = next;
++			next += mapped;
++		} else {
++			/* one piece under 4 GB (the pipes' address registers have 32 bits), kept for good */
++			IOBufferMemoryDescriptor * buffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, size, 0x00000000fffff000ull);
++
++			if (buffer != NULL && buffer->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) + size <= 0x100000000ull) {
++				phys = buffer->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++				virt = (uint8_t *) buffer->getBytesNoCopy();
++			} else {
++				OSSafeReleaseNULL(buffer);
++			}
++		}
++		if (virt == NULL) {
++			IOLog("MiniIOMobileFramebuffer: dpu: no memory for buffer %u (%llu bytes)\n", gPanelBuffers, size);
++			break;
++		}
++		gPanelPhys[gPanelBuffers] = phys;
++		gPanelVirt[gPanelBuffers] = virt;
++		gPanelBuffers++;
++	}
++	if (gPanelBuffers < 2) {
++		gHwScale = false;
++		IOLog("MiniIOMobileFramebuffer: dpu: one buffer\n");
++		return;
++	}
++	gShown = gNewest = 0;
++	gPending = -1;
++	gFlipping = true;
++	IOLog("MiniIOMobileFramebuffer: dpu: the framebuffer is fetched by pipes %#x (ctl%d, flush bits %#x); frames are drawn into "
++	    "another buffer and flipped to at a frame's start: %u buffers at %#llx %#llx %#llx, %s\n", gPipes, gCtl, gPipeFlush,
++	    gPanelBuffers, gPanelPhys[0], gPanelPhys[1], gPanelPhys[2], gHwScale ? "scaled by the pipes" : "at the panel's size");
++}
++
++/*
++ * USB `dpu`: what the controller is doing, read only -- its clocks, the CTL paths, the mixers, the
++ * eight pipes (which fetch the framebuffer, with what rows and format), INTF1 and INTF2 with their
++ * tear check (0x280 0x284 0x288 0x28c 0x294 0x298 0x2a0 0x2a4 0x2b0 0x2b4: vsync_sel, en, sync, height,
++ * init, read pointer, start, rd_ptr_irq, write pointer, autorefresh), their frame counts 100 ms apart,
++ * and the flipping's state.
++ */
++static size_t
++dpuReport(char * out, size_t cap)
++{
++	static const uint16_t kTear[] = { 0x280, 0x284, 0x288, 0x28c, 0x294, 0x298, 0x2a0, 0x2a4, 0x2b0, 0x2b4 };
++	uint32_t now[6], frames[2][2];
++	uint64_t times[2], us;
++	size_t at = 0;
++
++#define DPU_SAY(...) do { if (at < cap) { int said = snprintf(out + at, cap - at, __VA_ARGS__); at += said > 0 ? (size_t) said : 0; } } while (0)
++	DPU_SAY("dpu: fb %#llx %ux%u rowbytes %u; fb_flip %u fb_hwscale %u fb_autorefresh %u\n", (unsigned long long) vinfo.v_physaddr,
++	    (unsigned) vinfo.v_width, (unsigned) vinfo.v_height, (unsigned) vinfo.v_rowbytes, gFlip, gHwScaleArg, gAutorefresh);
++	if (!dpuMap()) {
++		DPU_SAY("dpu: not mapped\n");
++		return at;
++	}
++	bool on = dpuPowered(now);
++	DPU_SAY("clk: gcc disp_ahb %x, dispcc mdss_gdsc %x ahb %x mdp %x vsync %x pclk0 %x\n", now[0], now[1], now[2], now[3], now[4],
++	    now[5]);
++	if (!on) {
++		DPU_SAY("dpu: the display block is without power or clock: not read\n");
++		return at;
++	}
++	DPU_SAY("mdss rev %x mdp rev %x vsync_sel %x\n", mdssRead(0), mdssRead(MDP_TOP), mdssRead(MDP_TOP + MDP_VSYNC_SEL));
++	for (int n = 0; n < 6; n++) {
++		uint32_t c = MDSS_CTL(n), top = mdssRead(c + CTL_TOP), intf = mdssRead(c + CTL_INTF_ACTIVE);
++
++		if (n != 0 && top == 0 && intf == 0) {
++			continue;
++		}
++		DPU_SAY("ctl%d layer %x %x %x %x %x %x ext %x %x top %x flush %x intf %x pipes %x\n", n, mdssRead(c), mdssRead(c + 4),
++		    mdssRead(c + 8), mdssRead(c + 0xc), mdssRead(c + 0x10), mdssRead(c + 0x24), mdssRead(c + 0x40), mdssRead(c + 0x44), top,
++		    mdssRead(c + CTL_FLUSH), intf, mdssRead(c + CTL_FETCH_PIPE_ACTIVE));
++	}
++	DPU_SAY("lm op/out:");
++	for (int n = 0; n < 6; n++) {
++		DPU_SAY(" %x/%x", mdssRead(MDSS_LM(n)), mdssRead(MDSS_LM(n) + 4));
++	}
++	DPU_SAY("\n");
++	for (int p = 0; p < PANEL_PIPES; p++) {
++		uint32_t b = kPipeBase[p];
++
++		DPU_SAY("%s src %x xy %x out %x oxy %x addr %x stride %x fmt %x op %x", kPipeName[p], mdssRead(b + SSPP_SRC_SIZE),
++		    mdssRead(b + 0x08), mdssRead(b + SSPP_OUT_SIZE), mdssRead(b + SSPP_OUT_XY), mdssRead(b + SSPP_SRC0_ADDR),
++		    mdssRead(b + SSPP_SRC_YSTRIDE0), mdssRead(b + SSPP_SRC_FORMAT), mdssRead(b + 0x38));
++		if (p < 4) {
++			DPU_SAY(" qseed %x op %x", mdssRead(b + SSPP_SCALER), mdssRead(b + SSPP_SCALER + 4));      /* (the DMA pipes have none) */
++		}
++		DPU_SAY("\n");
++	}
++	for (int i = 1; i <= 2; i++) {
++		uint32_t b = MDSS_INTF(i);
++
++		DPU_SAY("intf%d en %x cfg %x frame %u line %u tear", i, mdssRead(b), mdssRead(b + 4), mdssRead(b + INTF_FRAME_COUNT),
++		    mdssRead(b + INTF_LINE_COUNT));
++		for (unsigned r = 0; r < sizeof(kTear) / sizeof(kTear[0]); r++) {
++			DPU_SAY(" %x", mdssRead(b + kTear[r]));
++		}
++		DPU_SAY("\n");
++	}
++	for (int k = 0; k < 2; k++) {
++		if (k == 1) {
++			IODelay(100 * 1000);
++			if (!dpuPowered(now)) {
++				DPU_SAY("dpu: power or clock gone in 100 ms\n");
++				return at;
++			}
++		}
++		frames[k][0] = mdssRead(MDSS_INTF(1) + INTF_FRAME_COUNT);
++		frames[k][1] = mdssRead(MDSS_INTF(2) + INTF_FRAME_COUNT);
++		times[k] = mach_absolute_time();
++	}
++	us = micros(times[1]) - micros(times[0]);
++	DPU_SAY("frames in %llu us: intf1 +%u (%llu.%llu a second), intf2 +%u (%llu.%llu)\n", us, frames[1][0] - frames[0][0],
++	    us ? (uint64_t) (frames[1][0] - frames[0][0]) * 1000000 / us : 0, us ? (uint64_t) (frames[1][0] - frames[0][0]) * 10000000 / us % 10 : 0,
++	    frames[1][1] - frames[0][1], us ? (uint64_t) (frames[1][1] - frames[0][1]) * 1000000 / us : 0,
++	    us ? (uint64_t) (frames[1][1] - frames[0][1]) * 10000000 / us % 10 : 0);
++	DPU_SAY("flip: %s, %u buffers %llx %llx %llx, pipes %x ctl %d flush bits %x, scaled %d/%d, shown %d pending %d newest %d; "
++	    "%u flips, %u in place of one not taken\n", gFlipping ? "on" : "off", gPanelBuffers, gPanelPhys[0], gPanelPhys[1], gPanelPhys[2],
++	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
++#undef DPU_SAY
++	return at;
++}
++
++extern "C" int pong_dpu_usb(char * reply, size_t cap);
++
++extern "C" int
++pong_dpu_usb(char * reply, size_t cap)
++{
++	if (reply == NULL || cap == 0) {
++		return 0;
++	}
++	reply[0] = '\0';
++	dpuReport(reply, cap);
++	return (int) strlen(reply);
++}
++
+ static bool
+ setNumber(OSDictionary * dict, const char * key, uint64_t value)
+ {
+@@ -388,8 +967,9 @@ IOMobileFramebuffer::failStart(IOService * provider)
+ 		fStartingDisplayNode->release();
+ 		fStartingDisplayNode = NULL;
+ 	}
+-	if (fColumn != NULL) { IODelete(fColumn, uint32_t, fPanelWidth); fColumn = NULL; }
+-	if (fColumnWeight != NULL) { IODelete(fColumnWeight, uint16_t, fPanelWidth); fColumnWeight = NULL; }
++	/* (allocated at the boot framebuffer's width: fPanelWidth may be the display's since, see start()) */
++	if (fColumn != NULL) { IODelete(fColumn, uint32_t, vinfo.v_width); fColumn = NULL; }
++	if (fColumnWeight != NULL) { IODelete(fColumnWeight, uint16_t, vinfo.v_width); fColumnWeight = NULL; }
+ 	if (fHelperLock != NULL) { IOLockFree(fHelperLock); fHelperLock = NULL; }
+ 	if (fSwapLock != NULL) { IOLockFree(fSwapLock); fSwapLock = NULL; }
+ 	if (fLock != NULL) { IOLockFree(fLock); fLock = NULL; }
+@@ -471,6 +1051,15 @@ IOMobileFramebuffer::start(IOService * provider)
+ 			IOLog("MiniIOMobileFramebuffer: invalid fbscale=%u; retain native workspace\n", scale);
+ 		}
+ 	}
++	if (!pong_mmio_quiet) {
++		panelInit(fRowBytes, fPanelWidth, fPanelHeight, fWidth, fHeight);
++	}
++	if (gHwScale) {
++		/* (the pipes scale the frames to the panel: here they are drawn at the display's size, into its top left) */
++		IOLog("MiniIOMobileFramebuffer: the panel's %ux%u is scaled to by its pipes\n", fPanelWidth, fPanelHeight);
++		fPanelWidth = fWidth;
++		fPanelHeight = fHeight;
++	}
+ 	fDiff = gDiff != 0;
+ 	fDiffLeft = fDiffTop = ~0u;
+ 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
+@@ -978,6 +1567,62 @@ IOMobileFramebuffer::presenter(void)
+ 	}
+ }
+ 
++/*
++ * Where a frame is drawn (fb_flip): into a buffer neither on show nor about to be, its number for
++ * panelFlip() once the frame is in it (fBase is pointed at it). A frame whose bottom layer does not
++ * cover the whole display leaves some of that buffer as it was frames ago: the newest one is copied
++ * into it first (slowly: that memory is not cached). -1: one buffer, the one on show.
++ */
++int
++IOMobileFramebuffer::panelBackBuffer(const uint8_t * swap, MiniIOSurface ** surfaces)
++{
++	MiniIOSurface * s = surfaces[0];
++	int32_t src[4], dst[4];
++	uint64_t waited;
++	int back;
++	bool covered;
++
++	if (!gFlipping) {
++		return -1;
++	}
++	if (!panelAlive("a frame")) {
++		/* (the controller is off: nothing is on show, whichever buffer the frame goes to) */
++		fBase = gPanelVirt[gNewest];
++		return -1;
++	}
++	panelUpdate();
++	if (gPending >= 0 && gPanelBuffers == 2) {
++		panelLatched(PANEL_LATCH_MS);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - gPendingSince, &waited);
++	if (gPending >= 0 && waited >= PANEL_LATCH_MS * NSEC_PER_MSEC) {
++		IOLog("MiniIOMobileFramebuffer: dpu: a flip was not taken in %u ms: one buffer from now on\n", PANEL_LATCH_MS);
++		gFlipping = false;
++		fBase = gPanelVirt[gPending];
++		return -1;
++	}
++	for (back = 0; back == gShown || back == gPending; back++) {
++	}
++	fBase = gPanelVirt[back];
++	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
++	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
++	if (swapWord(swap, SWAP_SURFACE(0)) == 0) {
++		covered = (swapWord(swap, SWAP_LAYERS_SET) & 1) && fGraphics;       /* (made black: see show()) */
++	} else {
++		covered = s != NULL && canDrawLinearBGRA(s) &&
++		    (src[2] <= 0 || src[3] <= 0 || (src[0] >= 0 && src[1] >= 0 && (uint64_t) src[0] + (uint32_t) src[2] <= s->info.width &&
++		    (uint64_t) src[1] + (uint32_t) src[3] <= s->info.height)) &&
++		    (dst[2] <= 0 || dst[3] <= 0 || (dst[0] <= 0 && dst[1] <= 0 && (int64_t) dst[0] + dst[2] >= (int64_t) fWidth &&
++		    (int64_t) dst[1] + dst[3] >= (int64_t) fHeight));
++	}
++	if (!covered && back != gNewest) {
++		for (uint32_t y = 0; y < fPanelHeight; y++) {
++			memcpy(fBase + (size_t) y * fRowBytes, gPanelVirt[gNewest] + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
++		}
++	}
++	return back;
++}
++
+ /* A swap's surfaces onto the panel, once the GPU is done with them. */
+ IOReturn
+ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+@@ -1011,7 +1656,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	}
+ 	fStatWaiting += mach_absolute_time() - began;
+ 	began = ready = mach_absolute_time();
+-	if (gOnTheBeat) {
++	if (gOnTheBeat && !gFlipping) {
++		/* (with buffers flipped the pipes take a frame at the panel's own beat: ours is not needed) */
+ 		uint64_t period, aim, next;
+ 
+ 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+@@ -1067,7 +1713,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	int32_t source[4],destination[4];
+ 	memcpy(source,swap+SWAP_SOURCE(0),sizeof(source));
+ 	memcpy(destination,swap+SWAP_DEST(0),sizeof(destination));
+-	if(surfacesReady && base && !swapWord(swap,SWAP_SURFACE(1)) && !swapWord(swap,SWAP_SURFACE(2)) &&
++	/* (not while flipping: the GPU copy writes the firmware's buffer, which may be on show) */
++	if(!gFlipping && surfacesReady && base && !swapWord(swap,SWAP_SURFACE(1)) && !swapWord(swap,SWAP_SURFACE(2)) &&
+ 	    !swapWord(swap,SWAP_SURFACE(3)) && canDrawLinearBGRA(base) &&
+ 	    base->info.width>=fPanelWidth && base->info.height>=fPanelHeight &&
+ 	    !source[0] && !source[1] && !destination[0] && !destination[1] &&
+@@ -1088,6 +1735,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		if(missed++<4)IOLog("PONG GPU ONLY: no completed GPU frame; CPU composition disabled\n");
+ 		IOLockUnlock(fLock);return kIOReturnNotReady;
+ 	}
++	/* (fb_flip: the buffer this frame goes to; display off: nothing is drawn, see below) */
++	int back = (gpuFrame || pong_panel_is_off()) ? -1 : panelBackBuffer(swap, surfaces);
++	bool drew = false;
+ 
+ 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+ 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+@@ -1109,6 +1759,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 					uint32_t *row=(uint32_t *)(fBase + (size_t)y * fRowBytes);
+ 					for (uint32_t x=0;x<fPanelWidth;x++) row[x]=0xff000000u;
+ 				}
++				drew = true;
+ 			}
+ 			continue;
+ 		}
+@@ -1127,9 +1778,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			continue;
+ 		}
+ 		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
+-			if (!gpuFrame && !pong_panel_is_off()) drawLayer(s, src, dst);   /* (display off: nobody sees it) */
++			if (!gpuFrame && !pong_panel_is_off()) {   /* (display off: nobody sees it) */
++				drawLayer(s, src, dst);
++				drew = true;
++			}
+ 		}
+ 	}
++	if (drew && back >= 0) {
++		panelFlip((unsigned) back);     /* (on show from the next frame's start) */
++	}
+ 	drawn = mach_absolute_time();
+ 	fSwapsShown++;
+ 	if (gTouchLat) {
+@@ -1164,6 +1821,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
+ 		    fStatHeld, fStatLost, fStatSwapsLate);
+ 		fStatSwapsLate = 0;
++		if (__atomic_load_n(&gMdss, __ATOMIC_ACQUIRE) != NULL && panelAlive("the report")) {
++			uint32_t panelFrame = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
++
++			IOLog("MiniIOMobileFramebuffer: dpu: %u flips, %u of them in place of one the panel had not taken; the panel was sent "
++			    "%u frames\n", gStatFlips, gStatReplaced, gStatPanelFrame != 0 ? panelFrame - gStatPanelFrame : 0);
++			gStatPanelFrame = panelFrame;
++			gStatFlips = gStatReplaced = 0;
++		}
+ 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
+ 		}
+ 		if (different == 8 && fStatFrames > 8) {
