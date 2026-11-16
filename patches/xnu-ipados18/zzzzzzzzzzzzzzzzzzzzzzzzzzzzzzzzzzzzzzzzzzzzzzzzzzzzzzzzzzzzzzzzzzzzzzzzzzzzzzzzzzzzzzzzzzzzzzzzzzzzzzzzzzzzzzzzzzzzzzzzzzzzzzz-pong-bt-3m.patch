@@ -1,0 +1,258 @@
+diff --git a/bsd/dev/pong_bt.c b/bsd/dev/pong_bt.c
+index c97accf..da48ba5 100644
+--- a/bsd/dev/pong_bt.c
++++ b/bsd/dev/pong_bt.c
+@@ -23,7 +23,8 @@
+  * Third (z101, PLAN.md steps 2 and 4, NOT TRIED ON THE DEVICE):
+  *   `btfw [ibs] [nocts]` on its own thread: steps 1-9, then the btqca QCA6390 start-up at 115200 (version 0xfc00 [19],
+  *   rampatch htbtfw<rom>.tlv and NVM htnv<rom>.bin in 243-byte TLV segments, SoC logging off, HCI_Reset, version),
+- *   then off; `btstat` shows progress and the result line. Files: a `fwput` slot, else
++ *   then off; `btstat` shows progress and the result line. z127: `btfw 3m` and pong_bt bit 1 switch to 3000000 baud
++ *   first (VSC 0xfc48, hci_qca order), NOT TRIED ON THE DEVICE. Files: a `fwput` slot, else
+  *   /private/var/mobile/Library/Pong/bt-<name> (`fsput`). NVM in-band and deep sleep are cleared unless `ibs`.
+  *   Boot argument pong_bt bit 0 (default off): a worker brings the controller up the same way after pong_bt_delay
+  *   seconds and serves it to bluetoothd through UART.SK (bsd/dev/qbt_transport.c, UniXNU/QcaBluetooth effe4ec,
+@@ -228,6 +229,7 @@ void pong_bt_init(void);
+ static vm_offset_t g_bt_gcc23, g_bt_se, g_bt_qup, g_bt_sw;
+ static volatile uint32_t bt_owner;          /* 0 free, 1 a USB command or its `btfw` thread, 2 the UART.SK worker */
+ static bool bt_powered, bt_engine, bt_cts = true;
++static uint32_t bt_baud = BT_SPEED, bt_sample = 16;   /* the line rate now; GENI oversampling (16 from QUP 2.5) */
+ static uint8_t bt_rx[768];                  /* controller bytes not consumed yet */
+ static unsigned bt_rx_n;
+ static struct { uint64_t tx, rx, events, junk, txfail; } bt_count;
+@@ -558,6 +560,25 @@ bt_cmd(uint32_t op, const uint8_t *par, unsigned plen, uint8_t *rsp, unsigned ca
+ 	return ms ? bt_wait(op, rsp, cap, len, ms) : 0;
+ }
+ 
++/* Host side of a baud change: abort the read, new divider for M and S, read again with RFR open. */
++static int
++bt_rate(uint32_t baud)
++{
++	const uint32_t div = (96000000u + baud * bt_sample / 2) / (baud * bt_sample);
++
++	if (div == 0 || div > 4095 || !bt_engine_stop()) {
++		return -1;
++	}
++	bt_wr(g_bt_se, G_M_CLK, div << 4 | 1u);
++	bt_wr(g_bt_se, G_S_CLK, div << 4 | 1u);
++	bt_wr(g_bt_se, G_M_CLEAR, UINT32_MAX);
++	bt_wr(g_bt_se, G_S_CLEAR, UINT32_MAX);
++	bt_wr(g_bt_se, G_S_CMD, 1u << 27 | 1u << 7);
++	bt_wr(g_bt_se, G_MANUAL_RFR, 0);
++	bt_baud = baud;
++	return 0;
++}
++
+ /* ---- bring-up ---- */
+ /* Steps 2..7 of the header. 0 = controller released, read running; 1 = stopped after step upto (powered off again);
+  * < 0 = failed there (powered off again). */
+@@ -691,6 +712,8 @@ bt_up(struct bt_log *l, int upto, int *step)
+ 		bt_wr(g_bt_se, G_M_CLK, div << 4 | 1u);
+ 		bt_wr(g_bt_se, G_S_CLK, div << 4 | 1u);
+ 		bt_wr(g_bt_se, G_CLK_SEL, 0);
++		bt_sample = sample;
++		bt_baud = BT_SPEED;
+ 		bt_say(l, " os=%u div=%u", sample, div);
+ 	}
+ 	if (upto < 7) {
+@@ -815,10 +838,11 @@ bt_file(const char *name, uint8_t **buf, uint32_t *len)
+ }
+ 
+ /* NVM tags (btqca qca_tlv_check_data; tag header: id u16, length u16, 8 reserved bytes): HCI transport (17) byte 0
+- * bit 7 = in-band sleep, byte 1 = UART rate index (0 = 115200; QCA6390 is "WCN3991 and later"); deep sleep (27)
++ * bit 7 = in-band sleep, byte 1 = UART rate index (0 = 115200, 14 = 3000000; QCA6390 is "WCN3991 and later"; the
++ * file's own value is 0x11 = 3200000, so it is always overwritten with the rate in use); deep sleep (27)
+  * byte 0 bit 0. Linux turns both sleeps on; here they follow ibs (default off: nothing here speaks IBS yet). */
+ static int
+-bt_nvm_fix(uint8_t *f, uint32_t n, bool ibs, uint32_t *tags)
++bt_nvm_fix(uint8_t *f, uint32_t n, bool ibs, uint8_t rate, uint32_t *tags)
+ {
+ 	uint32_t off = 0, tl, length;
+ 
+@@ -850,7 +874,7 @@ bt_nvm_fix(uint8_t *f, uint32_t n, bool ibs, uint32_t *tags)
+ 		}
+ 		if (id == 17 && tlen >= 3) {
+ 			t[12] = ibs ? (uint8_t)(t[12] | 0x80) : (uint8_t)(t[12] & 0x7f);
+-			t[13] = 0;
++			t[13] = rate;
+ 			(*tags)++;
+ 		} else if (id == 27 && tlen >= 1) {
+ 			t[12] = ibs ? (uint8_t)(t[12] | 1) : (uint8_t)(t[12] & 0xfe);
+@@ -896,10 +920,12 @@ bt_tlv(struct bt_log *l, const char *tag, const uint8_t *f, uint32_t n, unsigned
+ 
+ /* The btqca QCA6390 start-up once the ROM answers (qca_read_soc_version, qca_uart_setup): version (VSC 0xfc00 [19],
+  * Command Complete [00 19 xx product patch rom soc]), rampatch htbtfw<rom>.tlv, 10 ms, NVM htnv<rom>.bin, SoC logging
+- * off (0xfc17 [14 00]), HCI_Reset, Read_Local_Version. All at 115200: the baud change is a device decision (PLAN.md). */
++ * off (0xfc17 [14 00]), HCI_Reset, Read_Local_Version. At 115200, or with fast first VSC 0xfc48 [0e] and 3000000
++ * (96 MHz / 16 / 2 exactly; 3200000 would be 6 % off), as hci_qca qca_setup does for QCA6390. */
+ static int
+-bt_boot_fw(struct bt_log *l, bool ibs, int *step)
++bt_boot_fw(struct bt_log *l, bool ibs, bool fast, int *step)
+ {
++	static const uint8_t to3m[5] = { 0x01, 0x48, 0xfc, 0x01, 0x0e };   /* QCA_BAUDRATE_3000000 */
+ 	static const uint8_t ver_req = 0x19, log_off[2] = { 0x14, 0x00 };
+ 	uint8_t rsp[32], *f = NULL;
+ 	unsigned len;
+@@ -907,6 +933,20 @@ bt_boot_fw(struct bt_log *l, bool ibs, int *step)
+ 	char name[32];
+ 	int e;
+ 
++	if (fast) {
++		bt_mark(*step = 10);
++		if (bt_tx_raw(to3m, sizeof(to3m))) {
++			bt_say(l, " baud=tx-stuck");
++			return -10;
++		}
++		bt_ms(300);
++		if (bt_rate(3000000u)) {
++			bt_say(l, " baud=host-failed");
++			return -10;
++		}
++		bt_rx_n = 0;
++		bt_say(l, " baud=%u", bt_baud);
++	}
+ 	bt_mark(*step = 11);
+ 	e = bt_cmd(0xfc00, &ver_req, 1, rsp, sizeof(rsp), &len, 1000);
+ 	if (e || len < 15 || rsp[0] || rsp[1] != 0x19) {
+@@ -942,7 +982,7 @@ bt_boot_fw(struct bt_log *l, bool ibs, int *step)
+ 		bt_say(l, " %s=open%d", name, e);
+ 		return -13;
+ 	}
+-	e = bt_nvm_fix(f, n, ibs, &tags);
++	e = bt_nvm_fix(f, n, ibs, fast ? 14 : 0, &tags);
+ 	if (!e) {
+ 		e = bt_tlv(l, "nvm", f, n, 0);
+ 	}
+@@ -963,7 +1003,7 @@ bt_boot_fw(struct bt_log *l, bool ibs, int *step)
+ 
+ /* ---- USB commands ---- */
+ static void
+-bt_args(const char *args, int *upto, bool *ibs)
++bt_args(const char *args, int *upto, bool *ibs, bool *fast)
+ {
+ 	bt_cts = true;
+ 	for (const char *a = args; a && *a; a++) {
+@@ -973,6 +1013,8 @@ bt_args(const char *args, int *upto, bool *ibs)
+ 			bt_cts = false;
+ 		} else if (ibs && strncmp(a, "ibs", 3) == 0 && (a == args || a[-1] == ' ')) {
+ 			*ibs = true;
++		} else if (fast && strncmp(a, "3m", 2) == 0 && (a == args || a[-1] == ' ')) {
++			*fast = true;
+ 		}
+ 	}
+ }
+@@ -992,7 +1034,7 @@ pong_bt_hci_usb(char *reply, size_t reply_cap, const char *args)
+ 		snprintf(reply, reply_cap, "bthci: busy (owner %u; 2 = the UART.SK worker)\n", bt_owner);
+ 		return -1;
+ 	}
+-	bt_args(args, &upto, NULL);
++	bt_args(args, &upto, NULL, NULL);
+ 	bt_say(&l, "bthci:");
+ 	bt_mark(1);
+ 	if (!bt_map()) {
+@@ -1016,7 +1058,7 @@ pong_bt_hci_usb(char *reply, size_t reply_cap, const char *args)
+ 	return rc;
+ }
+ 
+-static bool bt_fw_ibs;
++static bool bt_fw_ibs, bt_fw_fast, bt_sk_fast;
+ 
+ /* `btfw` body on its own thread (the download takes ~20 s at 115200): ROM identify, firmware, patched identify, off. */
+ static void
+@@ -1033,7 +1075,7 @@ bt_fw_thread(void *arg, wait_result_t wr)
+ 		rc = bt_identify(&l, "rom", &step) ? -step : 0;
+ 	}
+ 	if (rc == 0) {
+-		rc = bt_boot_fw(&l, bt_fw_ibs, &step);
++		rc = bt_boot_fw(&l, bt_fw_ibs, bt_fw_fast, &step);
+ 	}
+ 	bt_down();
+ 	if (rc) {
+@@ -1046,7 +1088,7 @@ bt_fw_thread(void *arg, wait_result_t wr)
+ 	bt_give();
+ }
+ 
+-/* `btfw [ibs] [nocts]`: starts the firmware download (needs htbtfw20.tlv and htnv20.bin through fwput or fsput). */
++/* `btfw [ibs] [nocts] [3m]`: starts the firmware download (needs htbtfw20.tlv and htnv20.bin through fwput or fsput). */
+ int
+ pong_bt_fw_usb(char *reply, size_t reply_cap, const char *args)
+ {
+@@ -1059,8 +1101,8 @@ pong_bt_fw_usb(char *reply, size_t reply_cap, const char *args)
+ 		snprintf(reply, reply_cap, "btfw: busy (owner %u; 2 = the UART.SK worker)\n", bt_owner);
+ 		return -1;
+ 	}
+-	bt_fw_ibs = false;
+-	bt_args(args, NULL, &bt_fw_ibs);
++	bt_fw_ibs = bt_fw_fast = false;
++	bt_args(args, NULL, &bt_fw_ibs, &bt_fw_fast);
+ 	bt_last.line[0] = '\0';
+ 	bt_last.state = 1;
+ 	if (kernel_thread_start(bt_fw_thread, NULL, &th) != KERN_SUCCESS) {
+@@ -1070,7 +1112,7 @@ pong_bt_fw_usb(char *reply, size_t reply_cap, const char *args)
+ 		return -1;
+ 	}
+ 	thread_deallocate(th);
+-	snprintf(reply, reply_cap, "btfw: started (ibs %d cts %d); read `btstat`\n", bt_fw_ibs, bt_cts);
++	snprintf(reply, reply_cap, "btfw: started (ibs %d cts %d 3m %d); read `btstat`\n", bt_fw_ibs, bt_cts, bt_fw_fast);
+ 	return 0;
+ }
+ 
+@@ -1102,7 +1144,7 @@ bt_sk_bringup(void)
+ 		rc = bt_identify(&l, "rom", &step) ? -step : 0;
+ 	}
+ 	if (rc == 0) {
+-		rc = bt_boot_fw(&l, false, &step);
++		rc = bt_boot_fw(&l, false, bt_sk_fast, &step);
+ 	}
+ 	if (rc) {
+ 		bt_down();
+@@ -1132,18 +1174,18 @@ bt_serve(void *arg, wait_result_t wr)
+ 		bt_ms(1000);
+ 	}
+ 	rc = bt_sk_bringup();
+-	qbt_transport_power_result(true, rc ? EIO : 0, bt_fwname, BT_SPEED);
++	qbt_transport_power_result(true, rc ? EIO : 0, bt_fwname, bt_baud);
+ 	for (;;) {
+ 		const uint32_t r = __atomic_exchange_n(&bt_req, 0u, __ATOMIC_ACQ_REL);
+ 		bool moved = false;
+ 
+ 		if (r == 1) {
+ 			rc = bt_powered ? 0 : bt_sk_bringup();
+-			qbt_transport_power_result(true, rc ? EIO : 0, bt_fwname, BT_SPEED);
++			qbt_transport_power_result(true, rc ? EIO : 0, bt_fwname, bt_baud);
+ 		} else if (r == 2) {
+ 			bt_down();
+ 			bt_sk_state = 4;
+-			qbt_transport_power_result(false, 0, bt_fwname, BT_SPEED);
++			qbt_transport_power_result(false, 0, bt_fwname, bt_baud);
+ 		}
+ 		if (bt_powered) {
+ 			uint32_t n;
+@@ -1173,8 +1215,8 @@ pong_bt_stat_usb(char *reply, size_t reply_cap)
+ 	if (!reply || reply_cap == 0) {
+ 		return -1;
+ 	}
+-	snprintf(reply, reply_cap, "btstat: owner=%u powered=%d state=%d seg=%u/%u tx=%llu rx=%llu ev=%llu junk=%llu txfail=%llu "
+-	    "sk=%d act=%u/%u/%u/%u fw=%s | %s%s", bt_owner, bt_powered, bt_last.state, bt_seg, bt_segs, bt_count.tx, bt_count.rx,
++	snprintf(reply, reply_cap, "btstat: owner=%u powered=%d baud=%u state=%d seg=%u/%u tx=%llu rx=%llu ev=%llu junk=%llu txfail=%llu "
++	    "sk=%d act=%u/%u/%u/%u fw=%s | %s%s", bt_owner, bt_powered, bt_baud, bt_last.state, bt_seg, bt_segs, bt_count.tx, bt_count.rx,
+ 	    bt_count.events, bt_count.junk, bt_count.txfail, bt_sk_state, qbt_transport_activity[0], qbt_transport_activity[1],
+ 	    qbt_transport_activity[2], qbt_transport_activity[3], bt_fwname, bt_last.line[0] ? bt_last.line : "-",
+ 	    bt_last.line[0] ? "" : "\n");
+@@ -1182,7 +1224,7 @@ pong_bt_stat_usb(char *reply, size_t reply_cap)
+ }
+ 
+ /*
+- * Boot (pong_usb_ctl_init): pong_bt bit 0 starts the UART.SK worker after pong_bt_delay seconds (default 60, after Wi-Fi's
++ * Boot (pong_usb_ctl_init): pong_bt bit 0 starts (bit 1: at 3000000 baud, as `btfw 3m`) the UART.SK worker after pong_bt_delay seconds (default 60, after Wi-Fi's
+  * start; at most 300) and leaves com.apple.bluetoothd out of the launch policy (pong_wifi_tools.c, effective the boot
+  * after). Off by default: without the argument nothing here runs.
+  */
+@@ -1200,6 +1242,7 @@ pong_bt_init(void)
+ 	if (delay > 300) {
+ 		delay = 300;
+ 	}
++	bt_sk_fast = (mode & 2u) != 0;
+ 	if (qbt_transport_init(&ops)) {
+ 		return;
+ 	}
