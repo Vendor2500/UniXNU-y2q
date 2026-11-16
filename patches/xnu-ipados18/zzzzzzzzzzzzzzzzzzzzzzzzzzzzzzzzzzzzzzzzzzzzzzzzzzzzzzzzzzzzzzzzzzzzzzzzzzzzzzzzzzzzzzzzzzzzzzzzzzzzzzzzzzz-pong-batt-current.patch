@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 89c9600..63d5a67 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -88,6 +88,7 @@ extern int pong_wifi_stage4(char *reply, size_t reply_len, int what);
+ extern int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ /* IOPMPowerSource.cpp: battery temperature in tenths of a degree, -32768 until the gauge was read */
+ extern int pong_battery_last_decic;
++extern int pong_battery_last_permille, pong_battery_last_ma;
+ extern uint8_t pong_charger_cnfg[14];      /* CHG_CNFG_00..12 as the battery thread last read them, [13] = valid */
+ /* pong_gpu_probe.c: staged Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+@@ -1495,6 +1496,11 @@ cmd_handle_temp(void)
+ 		    pong_battery_last_decic < 0 ? -pong_battery_last_decic % 10 : pong_battery_last_decic % 10);
+ 		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
+ 	}
++	if (pong_battery_last_ma != -32768) {
++		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " | soc %d.%d%% %dmA", pong_battery_last_permille / 10,
++		    pong_battery_last_permille % 10, pong_battery_last_ma);
++		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++	}
+ 	if (pong_charger_cnfg[13]) {
+ 		/* MAX77705 charger CHG_CNFG_00 (0xb7) .. CHG_CNFG_12 (0xc3), raw: nothing here changes them */
+ 		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " | chg b7");
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index ceb2ac1..2724c8e 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -603,6 +603,8 @@ void pong_battery_publish(IOPMPowerSource *, unsigned int, unsigned int, bool, b
+ extern "C" { extern int pong_battery_last_decic; int pong_battery_last_decic = -32768; }
+ /* state of charge in permille for bsd/dev/pong_boot_write.c (no boot write below 30 %); -1 until the gauge was read */
+ extern "C" { extern int pong_battery_last_permille; int pong_battery_last_permille = -1; }
++/* the gauge's last current in mA (negative = discharging), for USB `temp`: standby drain is read off this */
++extern "C" { extern int pong_battery_last_ma; int pong_battery_last_ma = -32768; }
+ extern "C" { extern uint8_t pong_charger_cnfg[14]; uint8_t pong_charger_cnfg[14]; }   /* USB `temp`; [13] = valid */
+ namespace {
+ constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
+@@ -994,6 +996,7 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 			}
+ 			if (s.tempValid) pong_battery_last_decic = s.decic;
+ 			pong_battery_last_permille = int(s.permille);
++			pong_battery_last_ma = s.currentMa;
+ 			if (s.chargerValid && unsigned((s.details & 0x0f) | (s.intOk & 0x40)) != lastState) {
+ 				lastState = unsigned((s.details & 0x0f) | (s.intOk & 0x40));
+ 				batteryPmsg("PONG_BATT chg dtls=%02x ok=%02x ext=%u chg=%u ma=%d kicks=%u\n", s.details, s.intOk,
