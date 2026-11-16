@@ -1,0 +1,28 @@
+diff --git a/iokit/Kernel/MiniIOSurface.cpp b/iokit/Kernel/MiniIOSurface.cpp
+index 4f5a32e..3f50020 100644
+--- a/iokit/Kernel/MiniIOSurface.cpp
++++ b/iokit/Kernel/MiniIOSurface.cpp
+@@ -1933,6 +1933,23 @@ IOReturn IOSurfaceRootUserClient::gpuHandoff(IOExternalMethodArguments *args)
+     IOLockLock(gSurfaceLock);
+     if(args->scalarInput[1]==0) {
+         if(surface->displayReaders)result=kIOReturnBusy;
++        {   /* z97, SM-T970: boot argument pong_surf_order_ms (0 = off, the default; at most 250) makes a GPU begin wait for
++             * other clients' in-flight GPU jobs on this surface, the implicit order a stock GPU driver gives. Test of the
++             * black WebKit tiles when both WebKit's GPU process and backboardd render with Metal (work/gpu_stage_d). With
++             * it on, a failed job spoils only its own frame (gpuFailed is cleared) instead of the surface for good. */
++            static int orderMs=-1;
++            if(orderMs<0){uint32_t v=0;(void)PE_parse_boot_argn("pong_surf_order_ms",&v,sizeof(v));orderMs=v>250?250:(int)v;}
++            if(!result && orderMs>0) {
++                uint64_t deadline;clock_interval_to_deadline((uint32_t)orderMs,kMillisecondScale,&deadline);
++                for(;;) {
++                    uint32_t mine=0;for(unsigned i=0;i<256;i++)if(fGpuHolds[i].surface==surface){mine=fGpuHolds[i].writers;break;}
++                    if(surface->gpuWriters<=mine || surface->displayReaders)break;
++                    if(IOLockSleepDeadline(gSurfaceLock,surface,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED)break;
++                }
++                if(surface->displayReaders)result=kIOReturnBusy;
++                if(!result)surface->gpuFailed=false;
++            }
++        }
+         if(!result && surface->gpuFailed)result=kIOReturnNotReady;
+         if(!result) {
+             unsigned slot=256,empty=256;
