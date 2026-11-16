@@ -734,4 +734,13 @@ pong_touch_start(void)
     pthread_t thread;
     if (!pthread_create(&thread,NULL,input_thread,NULL)) pthread_detach(thread);
     if (IOHIDEventCreateKeyboardEvent && !pthread_create(&thread,NULL,buttons_thread,NULL)) pthread_detach(thread);
+    pong_sensors_start();   /* sensors_hid.c: light and gravity, only with pong_sensors_hid */
+}
+
+/* make_service() for sensors_hid.c (after pong_touch_start has resolved the event system calls it uses). */
+IOHIDServiceClientRef pong_hid_make_service(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display);
+IOHIDServiceClientRef
+pong_hid_make_service(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display)
+{
+    return make_service(client, product, page, usage, display);
 }

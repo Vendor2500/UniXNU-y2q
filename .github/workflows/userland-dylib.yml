@@ -43,6 +43,14 @@ jobs:
           test -f out/ui/libpong-ui18.dylib
           test -f out/ui/libpong-ui.dylib
 
+      - name: compile the audio plug-in (PongAudio.driver, T970)
+        run: |
+          set -euo pipefail
+          mkdir -p out/audio
+          python3 userland/build-ipados18.py audio --out out/audio --developer "$(xcode-select -p)"
+          test -f out/audio/PongAudio.driver/PongAudio
+          file out/audio/PongAudio.driver/PongAudio
+
       - name: inspect and document dylib
         run: |
           set -euo pipefail
@@ -136,5 +144,6 @@ jobs:
             out/ui/libpong-ui18.dylib
             out/ui/libpong-ui.dylib
             out/ui/libpong-ui18-info.txt
+            out/audio/PongAudio.driver
             out/ui/ui-compile-command.json
           if-no-files-found: error

@@ -1,0 +1,324 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 51bdeb9..e75f9d7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -426,6 +426,7 @@ bsd/dev/pong_adsp.c			standard
+ bsd/dev/pong_bt.c			standard
+ bsd/dev/qbt_transport.c			standard
+ bsd/dev/pong_slpi.c			standard
++bsd/dev/pong_ssc.c			standard
+ bsd/dev/qcom/QcomSmem.c			standard
+ bsd/dev/qcom/QcomSmp2p.c			standard
+ bsd/dev/qcom/QcomGlink.c			standard
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index 601adf4..1664fc6 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -62,7 +62,7 @@ extern uint64_t mach_absolute_time(void);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ 
+ int pong_slpi_usb(char *reply, size_t cap, const char *args);
+-/* The sensor client on top of QRTR (pong_ssc.c, z110): it sends through pong_slpi_send, all on this file's thread. */
++/* The sensor client on top of QRTR (pong_ssc.c, z117): it sends through pong_slpi_send, all on this file's thread. */
+ int pong_slpi_send(const void *packet, size_t length);
+ void pong_ssc_data(const T970QrtrPacket *p);
+ void pong_ssc_server(uint32_t type, uint32_t service, uint32_t node, uint32_t port);
+diff --git a/bsd/dev/pong_ssc.c b/bsd/dev/pong_ssc.c
+new file mode 100644
+index 0000000..06196cb
+--- /dev/null
++++ b/bsd/dev/pong_ssc.c
+@@ -0,0 +1,293 @@
++/*
++ * SM-T970 sensor hub client, stage 3 of auto-brightness / auto-rotation (iOSPort work/sensors_scope/SCOPE.md).
++ * Off by default: boot argument pong_slpi_ssc=1, or USB `slpi ssc`, turns it on; nothing runs before `slpi boot` has
++ * brought the SLPI and its QRTR link up (pong_slpi.c), and everything here runs on that file's polling thread.
++ *
++ * Once the hub announces QMI service 400 (sns_client) it sends one SUID lookup per data type of ssc_types[] (the answers
++ * show what the hub offers), then
++ *   accel          sns_std_sensor_config {sample_rate} (513) at pong_slpi_hz (default 25)
++ *   ambient_light  on-change config (514, empty) or, with pong_slpi_als_hz=N, sns_std_sensor_config at N Hz
++ * and turns sns_std_sensor_event samples into kern.pong_sensors (int32 x 8):
++ *   [0] sequence (+1 per sample)  [1] lux x 100  [2..4] gravity in iPadOS axes, mg  [5] flags (1 lux, 2 gravity)
++ *   [6] accel samples  [7] light samples
++ * which the backboardd bridge (userland/sensors_hid.c) reads. Axes: pong_slpi_axes, three 3-bit fields (X bits 0-2, Y 3-5,
++ * Z 6-8), source axis in the low two bits and bit 2 to negate; 0 = 0x1ac (X=-x, Y=-y, Z=-z of the Android frame), as
++ * rui12366B/UniXNU-gts7xlwifi T970Sensors.cpp. The message flow is that file's onData/onEvent (BSD-2-Clause-Patent),
++ * the codecs are bsd/dev/qcom/T970Ssc.c. Not tested on the device when written (z117).
++ *
++ * Decision points the device answers (SCOPE.md §3): whether SUID events come at all (the precedent saw none), whether the
++ * light sensor is on-change or streaming, which axis frame the hub reports in.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include "qcom/T970Ssc.h"
++
++int pong_slpi_send(const void *packet, size_t length);
++void pong_ssc_data(const T970QrtrPacket *p);
++void pong_ssc_server(uint32_t type, uint32_t service, uint32_t node, uint32_t port);
++void pong_ssc_poll(void);
++void pong_ssc_enable(void);
++size_t pong_ssc_stat(char *out, size_t cap);
++
++#define SSC_PORT_SUID   0x4001u
++#define SSC_PORT_ACCEL  0x4002u
++#define SSC_PORT_ALS    0x4003u
++#define SSC_ON_CHANGE   514u        /* sns_std_sensor.proto SNS_STD_SENSOR_MSGID_SNS_STD_ON_CHANGE_CONFIG */
++#define SSC_PKT         512u        /* pong_slpi.c SL_TXB */
++
++static const char *const ssc_types[] = { "accel", "ambient_light", "gyro", "mag", "proximity", "registry", "device_orient" };
++#define SSC_NTYPES      (sizeof(ssc_types) / sizeof(ssc_types[0]))
++
++static struct {
++	bool init, on, found, have_accel, have_als, cfg_accel, cfg_als;
++	uint32_t node, port, next, hz, als_hz, axes;
++	uint16_t txn;
++	T970Suid accel, als;
++	uint32_t suid_mask;         /* bit i: ssc_types[i] answered with at least one SUID */
++	uint32_t sent, resp, ind, events, errors, other;
++	int32_t last;               /* last response: QMI result << 16 | error, or 0x10000000 | SSC result */
++} ssc;
++
++static int32_t pong_sensors[8];
++SYSCTL_OPAQUE(_kern, OID_AUTO, pong_sensors, CTLFLAG_RD | CTLFLAG_LOCKED, pong_sensors, sizeof(pong_sensors), "I",
++    "SLPI light and gravity (pong_ssc.c)");
++
++void
++pong_ssc_enable(void)
++{
++	ssc.on = true;
++}
++
++static void
++ssc_reset(void)
++{
++	ssc.found = ssc.have_accel = ssc.have_als = ssc.cfg_accel = ssc.cfg_als = false;
++	ssc.next = 0;
++}
++
++void
++pong_ssc_server(uint32_t type, uint32_t service, uint32_t node, uint32_t port)
++{
++	if (service != T970_SNS_SERVICE) {
++		return;
++	}
++	if (type == T970_QRTR_NEW_SERVER && !ssc.found) {
++		ssc_reset();
++		ssc.found = true;
++		ssc.node = node;
++		ssc.port = port;
++	} else if (type == T970_QRTR_DEL_SERVER && ssc.found && node == ssc.node && port == ssc.port) {
++		ssc_reset();
++	}
++}
++
++static bool
++ssc_send(uint32_t port, T970Suid suid, uint32_t msg_id, const uint8_t *payload, size_t length)
++{
++	uint8_t request[256], qmi[300], packet[SSC_PKT];
++	const size_t r = t970_sns_request(request, sizeof(request), suid, msg_id, payload, length);
++	const size_t q = r ? t970_sns_qmi_request(qmi, sizeof(qmi), ssc.txn, request, r) : 0;
++	const size_t n = q ? t970_qrtr_pack(packet, sizeof(packet), T970_QRTR_DATA, T970_QRTR_NODE_APPS, port, ssc.node, ssc.port, 0,
++	    qmi, (uint32_t)q) : 0;
++
++	if (!n || pong_slpi_send(packet, n)) {
++		return false;
++	}
++	ssc.txn++;
++	ssc.sent++;
++	return true;
++}
++
++/* A sensor's stream: 513 at hz, or the on-change config (empty) when hz is 0. */
++static bool
++ssc_config(uint32_t port, T970Suid suid, uint32_t hz)
++{
++	uint8_t payload[16];
++	size_t n = 0;
++
++	if (hz) {
++		n = t970_sns_sensor_config(payload, sizeof(payload), hz);
++		return n && ssc_send(port, suid, T970_SNS_STD_SENSOR_CONFIG, payload, n);
++	}
++	return ssc_send(port, suid, SSC_ON_CHANGE, payload, 0);
++}
++
++void
++pong_ssc_poll(void)
++{
++	if (!ssc.init) {
++		uint32_t v = 0;
++
++		ssc.init = true;
++		ssc.txn = 1;
++		ssc.hz = 25;
++		if (PE_parse_boot_argn("pong_slpi_ssc", &v, sizeof(v)) && v) {
++			ssc.on = true;
++		}
++		(void)PE_parse_boot_argn("pong_slpi_hz", &ssc.hz, sizeof(ssc.hz));
++		(void)PE_parse_boot_argn("pong_slpi_als_hz", &ssc.als_hz, sizeof(ssc.als_hz));
++		(void)PE_parse_boot_argn("pong_slpi_axes", &ssc.axes, sizeof(ssc.axes));
++		if (!ssc.hz || ssc.hz > 400) {
++			ssc.hz = 25;
++		}
++	}
++	if (!ssc.on || !ssc.found) {
++		return;
++	}
++	/* one lookup per data type; the queue takes a few at a time, the rest go on later polls */
++	while (ssc.next < SSC_NTYPES) {
++		const T970Suid lookup = { T970_SUID_SENSOR_LOW, T970_SUID_SENSOR_HIGH };
++		uint8_t payload[64];
++		const size_t n = t970_sns_suid_req(payload, sizeof(payload), ssc_types[ssc.next], 1, 1);
++
++		if (!n || !ssc_send(SSC_PORT_SUID, lookup, T970_SNS_SUID_REQ, payload, n)) {
++			break;
++		}
++		ssc.next++;
++	}
++	if (ssc.have_accel && !ssc.cfg_accel) {
++		ssc.cfg_accel = ssc_config(SSC_PORT_ACCEL, ssc.accel, ssc.hz);
++	}
++	if (ssc.have_als && !ssc.cfg_als) {
++		ssc.cfg_als = ssc_config(SSC_PORT_ALS, ssc.als, ssc.als_hz);
++	}
++}
++
++static void
++ssc_publish(void)
++{
++	__asm__ volatile ("dmb ish" ::: "memory");
++	pong_sensors[0] = pong_sensors[0] + 1;
++}
++
++static void
++ssc_event(void *context, T970Suid suid, uint32_t msg_id, uint64_t timestamp, const uint8_t *payload, size_t length)
++{
++	(void)context;
++	(void)timestamp;
++	ssc.events++;
++	if (msg_id == T970_SNS_SUID_EVENT) {
++		char type[24];
++		T970Suid found[4];
++		const int n = t970_sns_suid_event(payload, length, type, sizeof(type), found, 4);
++
++		for (unsigned i = 0; n > 0 && i < SSC_NTYPES; i++) {
++			if (!strcmp(type, ssc_types[i])) {
++				ssc.suid_mask |= 1u << i;
++			}
++		}
++		if (n > 0 && !strcmp(type, "accel") && !ssc.have_accel) {
++			ssc.accel = found[0];
++			ssc.have_accel = true;
++		} else if (n > 0 && !strcmp(type, "ambient_light") && !ssc.have_als) {
++			ssc.als = found[0];
++			ssc.have_als = true;
++		}
++		return;
++	}
++	if (msg_id == T970_SNS_STD_SENSOR_EVENT) {
++		uint32_t data[4];
++		int32_t status = -1;
++		const int n = t970_sns_sensor_event(payload, length, data, 4, &status);
++
++		if (ssc.have_accel && n >= 3 && suid.low == ssc.accel.low && suid.high == ssc.accel.high) {
++			const uint32_t axes = ssc.axes ? ssc.axes : 0x1acu;
++			int32_t raw[3];
++
++			for (unsigned i = 0; i < 3; i++) {
++				raw[i] = t970_f32_scale(data[i], 1000);                    /* mm/s^2 */
++			}
++			for (unsigned i = 0; i < 3; i++) {
++				const uint32_t f = (axes >> (3 * i)) & 7u;
++				const int32_t v = raw[(f & 3u) < 3u ? (f & 3u) : i];
++
++				pong_sensors[2 + i] = (int32_t)((int64_t)(f & 4u ? -v : v) * 1000 / 9807);   /* mg */
++			}
++			pong_sensors[5] |= 2;
++			pong_sensors[6] = pong_sensors[6] + 1;
++			ssc_publish();
++		} else if (ssc.have_als && n >= 1 && suid.low == ssc.als.low && suid.high == ssc.als.high) {
++			pong_sensors[1] = t970_f32_scale(data[0], 100);                  /* lux x 100 */
++			pong_sensors[5] |= 1;
++			pong_sensors[7] = pong_sensors[7] + 1;
++			ssc_publish();
++		}
++		return;
++	}
++	if (msg_id == T970_SNS_STD_ERROR_EVENT) {
++		ssc.errors++;
++	}
++}
++
++void
++pong_ssc_data(const T970QrtrPacket *p)
++{
++	T970QmiMessage m;
++
++	if (p->confirm_rx) {
++		/* flow control: RESUME_TX from the port the data came to, so the sender may go on */
++		uint8_t body[20] = { 0 }, r[64];
++		const uint32_t words[3] = { T970_QRTR_RESUME_TX, T970_QRTR_NODE_APPS, p->dst_port };
++		size_t n;
++
++		memcpy(body, words, sizeof(words));
++		n = t970_qrtr_pack(r, sizeof(r), T970_QRTR_RESUME_TX, T970_QRTR_NODE_APPS, p->dst_port, p->src_node, p->src_port, 0,
++		    body, sizeof(body));
++		if (n) {
++			(void)pong_slpi_send(r, n);
++		}
++	}
++	if (t970_qmi_parse(p->payload, p->size, &m)) {
++		return;
++	}
++	if (m.type == T970_QMI_RESPONSE && m.msg == T970_SNS_CLIENT_REQ) {
++		uint16_t result = 0, error = 0;
++		uint64_t client = 0;
++		int32_t sns = -1;
++
++		ssc.resp++;
++		if (!t970_sns_qmi_response(&m, &result, &error, &client, &sns)) {
++			ssc.last = result || error ? (int32_t)((uint32_t)result << 16 | error) : (int32_t)(0x10000000u | (uint32_t)(sns & 0xffff));
++		}
++		return;
++	}
++	if (m.type == T970_QMI_INDICATION && (m.msg == T970_SNS_CLIENT_REPORT_IND || m.msg == T970_SNS_CLIENT_JUMBO_REPORT_IND)) {
++		uint64_t client = 0;
++		const uint8_t *event = NULL;
++		uint16_t length = 0;
++
++		ssc.ind++;
++		if (!t970_sns_qmi_report(&m, &client, &event, &length)) {
++			(void)t970_sns_events(event, length, ssc_event, NULL);
++		}
++		return;
++	}
++	ssc.other++;
++}
++
++size_t
++pong_ssc_stat(char *out, size_t cap)
++{
++	int n;
++
++	if (!out || cap < 2) {
++		return 0;
++	}
++	n = snprintf(out, cap, " ssc=%s sns=%s%u:%u sent=%u/%u resp=%u last=%#x ind=%u ev=%u err=%u other=%u suids=%#x"
++	    " stream=%u%u lux100=%d g=%d,%d,%d n=%d/%d",
++	    ssc.on ? "on" : "off", ssc.found ? "" : "none ", ssc.node, ssc.port, ssc.next, (unsigned)SSC_NTYPES, ssc.resp,
++	    (unsigned)ssc.last, ssc.ind, ssc.events, ssc.errors, ssc.other, ssc.suid_mask, ssc.cfg_accel ? 1u : 0u,
++	    ssc.cfg_als ? 1u : 0u, pong_sensors[1], pong_sensors[2], pong_sensors[3], pong_sensors[4], pong_sensors[6],
++	    pong_sensors[7]);
++	if (n < 0) {
++		return 0;
++	}
++	return (size_t)n < cap ? (size_t)n : cap - 1;
++}
++#endif /* PONG */

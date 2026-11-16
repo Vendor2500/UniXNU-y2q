@@ -18,4 +18,5 @@
 #define PONG_BUTTON_VOLUME_DOWN 2
 struct pong_touch {uint64_t time;uint32_t type,finger,x,y;};
 void pong_touch_start(void);
+void pong_sensors_start(void);   /* sensors_hid.c */
 #endif

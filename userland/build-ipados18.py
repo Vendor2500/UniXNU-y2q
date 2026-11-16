@@ -901,6 +901,7 @@ def compile_ui(out, developer):
            str(PROJECT / 'userland/settings_compat18.c'),
            str(PROJECT / 'userland/boot_snapshot18.c'),
            str(PROJECT / 'userland/touch.c'),
+           str(PROJECT / 'userland/sensors_hid.c'),
            str(PROJECT / 'userland/sileo_spawn.c'),
            '-o', str(destination)]
     run(cmd, env=env)
@@ -933,9 +934,11 @@ def compile_audio(out, developer):
     cmd=['xcrun','clang','-target','arm64-apple-ios18.0','-isysroot',str(sdk),
         '-Os','-fblocks','-bundle','-fvisibility=hidden','-Wall','-Wextra','-Werror',
         '-Wl,-no_fixup_chains',
-        '-I'+str(includes.parent),'-I'+str(PROJECT/'drivers/PongPower'),
+        '-I'+str(includes.parent),'-I'+str(PROJECT/'userland'),
         '-framework','CoreFoundation','-framework','IOKit',
-        str(PROJECT/'userland/PongAudioPlugIn.c'),'-o',str(target)]
+        # SM-T970: rui's T970 plug-in on the kernel's T970Audio service (z114), adapted to 22H374; the SM8475 PongAudioPlugIn.c
+        # needs drivers/PongPower's ABI, which this repository does not carry.
+        str(PROJECT/'userland/T970AudioPlugIn.c'),'-o',str(target)]
     run(cmd,env=env)
     factory='341D03C1-9CF6-4163-A3E9-FA3AC191C764'
     put_plist(bundle/'Info.plist',dict(CFBundleDevelopmentRegion='en',CFBundleExecutable='PongAudio',
@@ -944,7 +947,7 @@ def compile_audio(out, developer):
         CFBundleVersion='1',CFBundleSupportedPlatforms=['iPhoneOS'],MinimumOSVersion='18.0',
         CFPlugInFactories={factory:'PongAudio_Create'},
         CFPlugInTypes={'443ABAB8-E7B3-491A-B985-BEB9187030DB':[factory]},
-        AudioServerPlugIn_IOKitUserClients=['PongAudioUserClient']))
+        AudioServerPlugIn_IOKitUserClients=['T970AudioUserClient']))
     run(['codesign','--force','--sign','-','--pagesize','4096',bundle])
     dump(out/'audio-compile-command.json',cmd)
     return bundle
@@ -1119,6 +1122,14 @@ def ui(a):
     dest18 = out / 'libpong-ui18.dylib'
     shutil.copyfile(ui_library, dest18)
     print(dest18)
+
+
+def audio(a):
+    """Compile the audio server plug-in (PongAudio.driver) only, for a build check."""
+    out = a.out.resolve(); out.mkdir(parents=True, exist_ok=True)
+    developer = a.developer or Path(os.environ.get('DEVELOPER_DIR') or
+                                    subprocess.check_output(['xcode-select', '-p'], text=True).strip())
+    print(compile_audio(out, developer))
 
 
 def prepare(a):
@@ -1796,6 +1807,9 @@ def main():
     s.add_argument('--developer', type=Path, required=True)
     s.add_argument('--only-ui', action='store_true', help='compile libpong-ui only')
     s = sub.add_parser('ui', help='compile libpong-ui only')
+    s.add_argument('--out', type=Path, required=True)
+    s.add_argument('--developer', type=Path, default=None, help='Developer directory (defaults to DEVELOPER_DIR or xcode-select -p)')
+    s = sub.add_parser('audio', help='compile the PongAudio.driver audio plug-in only')
     s.add_argument('--out', type=Path, required=True)
     s.add_argument('--developer', type=Path, default=None, help='Developer directory (defaults to DEVELOPER_DIR or xcode-select -p)')
     s = sub.add_parser('refresh_jobs'); s.add_argument('--out', type=Path, required=True)
