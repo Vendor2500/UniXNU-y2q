@@ -1,0 +1,293 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1c5f52e..f6299d5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -408,6 +408,7 @@ bsd/dev/pong_spen.c			standard
+ bsd/dev/pong_usb_ctl.c			standard
+ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
++bsd/dev/pong_haptic.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
+diff --git a/bsd/dev/pong_haptic.c b/bsd/dev/pong_haptic.c
+new file mode 100644
+index 0000000..76dbb3f
+--- /dev/null
++++ b/bsd/dev/pong_haptic.c
+@@ -0,0 +1,256 @@
++/* Pong vibration motor for SM-T970: an ERM coin motor on PM8150L LDO7 ("ldoc7" in the command DB, 2856 mV), on while the
++ * rail is on (stock msm_vibrator COINDC; rui package/T970Haptics.cpp; JeyKul 0031 regulator-haptic). An ERM cannot follow a
++ * waveform: a pulse is the rail on for ms, then off.
++ *
++ * pong_haptic_pulse(ms): 10..1000 ms, queued to one worker thread; EBUSY while a pulse is pending or running. Shared by the
++ * S Pen (side button, pen haptics) and the keyboard cover (trackpad clicks). USB `buzz [ms]` (z103) pulses and reports.
++ * ponytail: its own APPS RSC DRV2 write like pong_wifi_link.c wl_rpmh, without a board-wide RSC lock (touch, goodix, Wi-Fi,
++ * SLPI and ADSP vote on TCS 0/1 too); a busy TCS reads rc 2 and is retried, a shared lock belongs in one place later.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include "qcom/QcomRpmh.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++extern void thread_deallocate(thread_t thread);
++
++#define HP_CMDDB_PHYS   0x80860000UL
++#define HP_CMDDB_SIZE   0x20000u
++#define HP_RSC_PHYS     0x18220000UL            /* APPS RSC DRV2 */
++#define HP_TCS(n, r)    (0xd00u + 0x2a0u * (n) + (r))
++#define HP_IRQ_STATUS   0xd04u
++#define HP_IRQ_CLEAR    0xd08u
++#define AMC_ENABLE      (1u << 16)
++#define AMC_TRIGGER     (1u << 24)
++#define CMD_DONE        (1u << 8 | 1u << 16)
++
++#define HP_MV           2856
++#define HP_MODE_HPM     7
++#define HP_MIN_MS       10
++#define HP_MAX_MS       1000
++
++static LCK_GRP_DECLARE(hp_group, "pong-haptic");
++static LCK_MTX_DECLARE(hp_lock, &hp_group);
++static vm_offset_t hp_rsc;
++static uint32_t hp_rail;                /* ldoc7's RPMh address, 0 = not looked up / missing */
++static uint32_t hp_pending;             /* under hp_lock: next pulse in ms, 0 = none */
++static bool hp_busy;                    /* under hp_lock: a pulse is running */
++static int hp_started;
++/* For USB `buzz`: pulses done, failed, refused, last vote rc, last off rc, last ms, setup state */
++static struct {
++	uint32_t done, failed, refused, ms;
++	int rc, off, setup;
++} hs;
++
++static uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(hp_rsc + off); }
++static void
++wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(hp_rsc + off) = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++hp_sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* One ACTIVE write on DRV2 TCS 0 or 1, waited for: 0 done, 2 no idle TCS, 3 no completion in 50 ms, 5 completed with an error. */
++static int
++hp_rpmh_once(uint32_t address, uint32_t value)
++{
++	uint32_t ctl = 0, status;
++	unsigned t, i;
++
++	for (t = 0; t < 2; t++) {
++		ctl = rd(HP_TCS(t, 0x14));
++		if ((rd(HP_TCS(t, 0x18)) & 1u) && !(ctl & AMC_TRIGGER) && rd(HP_TCS(t, 0x1c)) == 0) {
++			break;
++		}
++	}
++	if (t == 2) {
++		return 2;
++	}
++	ctl &= ~(AMC_ENABLE | AMC_TRIGGER);
++	wr(HP_TCS(t, 0x14), ctl);
++	wr(HP_IRQ_CLEAR, 1u << t);
++	wr(HP_TCS(t, 0x30), 8u | 1u << 8 | 1u << 16);  /* 8-byte write, response wanted */
++	wr(HP_TCS(t, 0x34), address);
++	wr(HP_TCS(t, 0x38), value);
++	wr(HP_TCS(t, 0x10), 1);
++	wr(HP_TCS(t, 0x1c), 1);
++	wr(HP_TCS(t, 0x14), ctl | AMC_ENABLE);
++	wr(HP_TCS(t, 0x14), ctl | AMC_ENABLE | AMC_TRIGGER);
++	for (i = 0; i < 1000; i++) {
++		if ((rd(HP_IRQ_STATUS) & (1u << t)) && (rd(HP_TCS(t, 0x18)) & 1u)) {
++			break;
++		}
++		delay_for_interval(50, NSEC_PER_USEC);
++	}
++	if (i == 1000) {
++		return 3;
++	}
++	status = rd(HP_TCS(t, 0x3c));
++	wr(HP_TCS(t, 0x14), ctl | AMC_ENABLE);
++	wr(HP_TCS(t, 0x14), ctl);
++	wr(HP_TCS(t, 0x1c), 0);
++	wr(HP_IRQ_CLEAR, 1u << t);
++	return (status & CMD_DONE) == CMD_DONE ? 0 : 5;
++}
++
++/* Another driver holding both TCSs (rc 2) is waited out for up to a second. */
++static int
++hp_rpmh(uint32_t word, uint32_t value)
++{
++	int rc = 2;
++
++	for (unsigned i = 0; i < 100 && rc == 2; i++) {
++		rc = hp_rpmh_once(hp_rail + word, value);
++		if (rc == 2) {
++			hp_sleep_ms(10);
++		}
++	}
++	return rc;
++}
++
++/* Map the RSC and find ldoc7 once: 0 ok, 1 map failed, 2 no ldoc7 in the command DB. */
++static int
++hp_setup(void)
++{
++	if (hp_rail) {
++		return 0;
++	}
++	if (!hp_rsc) {
++		hp_rsc = ml_io_map(HP_RSC_PHYS, 0x1000);
++	}
++	uint8_t *db = kalloc_data(HP_CMDDB_SIZE, Z_WAITOK);
++	vm_offset_t va = ml_io_map(HP_CMDDB_PHYS, HP_CMDDB_SIZE);
++	QcomRpmhResource r = { 0 };
++
++	if (db && va) {
++		for (uint32_t i = 0; i < HP_CMDDB_SIZE; i += 4) {
++			uint32_t w = *(volatile uint32_t *)(va + i);
++			memcpy(db + i, &w, 4);
++		}
++		if (qcom_cmd_db_find(db, HP_CMDDB_SIZE, "ldoc7", &r) == QcomRpmhOk) {
++			hp_rail = r.address;
++		}
++	}
++	if (va) {
++		ml_io_unmap(va, HP_CMDDB_SIZE);
++	}
++	if (db) {
++		kfree_data(db, HP_CMDDB_SIZE);
++	}
++	if (!hp_rsc || !va) {
++		return 1;
++	}
++	return hp_rail ? 0 : 2;
++}
++
++static void
++hp_one(uint32_t ms)
++{
++	int rc = hp_rpmh(0, HP_MV);
++
++	if (!rc) {
++		rc = hp_rpmh(8, HP_MODE_HPM);
++	}
++	if (!rc) {
++		rc = hp_rpmh(4, 1);
++	}
++	if (!rc) {
++		hp_sleep_ms(ms);
++	}
++	int off = hp_rpmh(4, 0);        /* always: the motor must not be left running */
++
++	hs.rc = rc;
++	hs.off = off;
++	hs.ms = ms;
++	if (rc || off) {
++		hs.failed++;
++	} else {
++		hs.done++;
++	}
++}
++
++static void
++hp_thread(__unused void *param, __unused wait_result_t wr_res)
++{
++	hs.setup = hp_setup();
++	for (;;) {
++		lck_mtx_lock(&hp_lock);
++		while (!hp_pending) {
++			(void)msleep(&hp_pending, &hp_lock, PZERO, "pong-haptic", NULL);
++		}
++		uint32_t ms = hp_pending;
++		hp_pending = 0;
++		hp_busy = true;
++		lck_mtx_unlock(&hp_lock);
++		if (!hs.setup) {
++			hp_one(ms);
++		} else {
++			hs.failed++;
++		}
++		lck_mtx_lock(&hp_lock);
++		hp_busy = false;
++		lck_mtx_unlock(&hp_lock);
++	}
++}
++
++int
++pong_haptic_pulse(uint32_t ms)
++{
++	if (ms < HP_MIN_MS || ms > HP_MAX_MS) {
++		return EINVAL;
++	}
++	if (!__atomic_exchange_n(&hp_started, 1, __ATOMIC_ACQ_REL)) {
++		thread_t th = THREAD_NULL;
++		if (kernel_thread_start(hp_thread, NULL, &th) != KERN_SUCCESS) {
++			hp_started = 0;
++			return ENOMEM;
++		}
++		thread_deallocate(th);
++	}
++	lck_mtx_lock(&hp_lock);
++	bool busy = hp_busy || hp_pending;
++	if (!busy) {
++		hp_pending = ms;
++		wakeup(&hp_pending);
++	} else {
++		hs.refused++;
++	}
++	lck_mtx_unlock(&hp_lock);
++	return busy ? EBUSY : 0;
++}
++
++/* USB `buzz` (status), `buzz N` (one N ms pulse, then status of the previous ones). */
++int
++pong_haptic_usb(char *reply, size_t cap, const char *args)
++{
++	int queued = -1;
++
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (args && *args) {
++		queued = pong_haptic_pulse((uint32_t)strtoul(args, NULL, 10));
++	}
++	snprintf(reply, cap, "buzz: queued=%d started=%d setup=%d rail=%#x done=%u failed=%u refused=%u last ms=%u rc=%d off=%d\n",
++	    queued, hp_started, hs.setup, hp_rail, hs.done, hs.failed, hs.refused, hs.ms, hs.rc, hs.off);
++	return queued > 0 ? -1 : 0;
++}
++#endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 9064adf..48c2595 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2018,6 +2018,14 @@ dispatch_command(const char *cmd)
+ 		pg_reply[0] = '\0';
+ 		(void)pong_pogo_usb(pg_reply, sizeof(pg_reply), cmd + 4);
+ 		send_str(pg_reply[0] ? pg_reply : "pogo: no reply\n");
++	} else if (strcmp(cmd, "buzz") == 0 || strncmp(cmd, "buzz ", 5) == 0) {
++		/* the vibration motor: `buzz N` pulses it N ms (10..1000), `buzz` reports (bsd/dev/pong_haptic.c, z103) */
++		extern int pong_haptic_usb(char *reply, size_t cap, const char *args);
++		static char hp_reply[200];
++
++		hp_reply[0] = '\0';
++		(void)pong_haptic_usb(hp_reply, sizeof(hp_reply), cmd + 4);
++		send_str(hp_reply[0] ? hp_reply : "buzz: no reply\n");
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
