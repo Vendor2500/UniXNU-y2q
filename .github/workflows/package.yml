@@ -156,6 +156,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          python3 -m pip install --break-system-packages pyhpke || python3 -m pip install pyhpke
           url="$(printf '%s' "${IPSW_URL}" | tr -d '[:space:]')"
           sha="$(printf '%s' "${IPSW_SHA256}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
           if [ -z "$url" ]; then
