@@ -1,0 +1,1063 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e75f9d7..503f599 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -410,6 +410,7 @@ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_haptic.c			standard
+ bsd/dev/pong_usbhost.c			standard
++bsd/dev/pong_usbnet.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 6585d89..4222f46 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -260,6 +260,42 @@ struct pong_ramoops_header {
+ #define OFF_INTR_TRB            0x4000
+ #define OFF_INTR_DATA           0x4100
+ 
++/*
++ * USB network (z124, boot-arg pong_usb_ncm=1; work/usbnet_scope/PLAN.md). The device becomes composite (IAD,
++ * PID 0x316e so Windows binds afresh): the CDC-ACM debug channel unchanged (interfaces 0-1, endpoints 1 and 2)
++ * plus a CDC-NCM function (interfaces 2-3: notifications on EP3 IN, NTB16 bulk on EP4 IN/OUT). The DMA buffer
++ * grows to 64 KiB for one 16 KiB NTB each way. pong_usbnet.c turns NTBs into the en1 interface's frames.
++ */
++#define USB_DMA_NCM_BYTES       0x10000
++#define OFF_NCM_RX_TRB          0x5000
++#define OFF_NCM_TX_TRB          0x5100
++#define OFF_NCM_INT_TRB         0x5200
++#define OFF_NCM_INT_DATA        0x5300
++#define OFF_NCM_RX              0x8000
++#define OFF_NCM_TX              0xC000
++#define NCM_NTB_MAX             0x4000u
++#define EP_NCM_INT              7       /* physical endpoint numbers: (USB number << 1) | IN */
++#define EP_NCM_OUT              8
++#define EP_NCM_IN               9
++
++extern int pong_usbnet_attach(void);
++extern void pong_usbnet_link(int up);
++extern void pong_usbnet_rx(const volatile uint8_t *ntb, unsigned len);
++extern int pong_usbnet_tx_ready(void);
++extern unsigned pong_usbnet_tx(volatile uint8_t *dst, unsigned cap, unsigned packet);
++extern int pong_usbnet_stat(char *out, size_t cap);
++extern const uint8_t pong_usbnet_mac[6];
++
++static uint32_t usb_ncm;                /* pong_usb_ncm bit 0 */
++static unsigned usb_dma_bytes = 32768;
++static unsigned ncm_alt;                /* data interface 3's alternate setting: 1 = NTBs flow */
++static unsigned ncm_in_max = NCM_NTB_MAX;
++static unsigned ncm_notify;             /* 1 = speed change next, 2 = connection next */
++static bool ncm_rx_active, ncm_tx_active, ncm_int_active;
++static unsigned ncm_rsc[10];            /* transfer resource index per endpoint, for End Transfer */
++static unsigned ncm_activity;
++static struct { unsigned rx, tx, rx_err, xfer_fail, ends, alt_sets, reqs, stalls; } ncm_st;
++
+ /* State Variables */
+ static vm_offset_t tlmm_base;
+ static uint32_t cfg_sda, cfg_scl;
+@@ -649,6 +685,197 @@ send_serial_state(void)
+ 	ep_transfer(5, OFF_INTR_TRB, OFF_INTR_DATA, 10, DWC3_TRBCTL_NORMAL);
+ }
+ 
++/* ---- CDC-NCM function (z124) ---- */
++static bool
++ncm_xfer(unsigned ep, unsigned trb_off, unsigned buf_off, unsigned size)
++{
++	bool ok = ep_transfer(ep, trb_off, buf_off, size, DWC3_TRBCTL_NORMAL);
++	if (ok) ncm_rsc[ep] = (core_r(DWC3_DEPCMD(ep)) >> 16) & 0x7fu;
++	else ncm_st.xfer_fail++;
++	return ok;
++}
++
++/* End Transfer (ForceRM) on an endpoint with a TRB still owned by the controller; no completion event asked. */
++static void
++ncm_end(unsigned ep)
++{
++	ep_cmd(ep, 8u | (1u << 11) | (ncm_rsc[ep] << 16), 0, 0, 0);
++	ncm_st.ends++;
++	spin_us(100);
++}
++
++static void
++ncm_arm_rx(void)
++{
++	if (ncm_alt == 1 && !ncm_rx_active) {
++		ncm_rx_active = ncm_xfer(EP_NCM_OUT, OFF_NCM_RX_TRB, OFF_NCM_RX, NCM_NTB_MAX);
++	}
++}
++
++/* Notifications after the data interface goes live: CONNECTION_SPEED_CHANGE, then NETWORK_CONNECTION (connected). */
++static void
++ncm_send_notify(void)
++{
++	uint8_t m[16];
++	unsigned n;
++	uint32_t rate = (ctl_packet_size == 512) ? 480000000u : 12000000u;
++
++	if (ncm_int_active || !ncm_notify || !ctl_configured) return;
++	memset(m, 0, sizeof(m));
++	m[0] = 0xa1;
++	m[4] = 2;                                       /* wIndex: the communication interface */
++	if (ncm_notify == 1) {
++		m[1] = 0x2a;                                /* CONNECTION_SPEED_CHANGE, wLength 8 */
++		m[6] = 8;
++		for (unsigned i = 0; i < 4; i++) m[8 + i] = m[12 + i] = (uint8_t)(rate >> (8 * i));
++		n = 16;
++		ncm_notify = 2;
++	} else {
++		m[1] = 0x00;                                /* NETWORK_CONNECTION, wValue 1 = connected */
++		m[2] = 1;
++		n = 8;
++		ncm_notify = 0;
++	}
++	memcpy((void *)(dma_wcomb + OFF_NCM_INT_DATA), m, n);
++	ncm_int_active = ncm_xfer(EP_NCM_INT, OFF_NCM_INT_TRB, OFF_NCM_INT_DATA, n);
++}
++
++/* Leave alternate setting 1 (host's SET_INTERFACE 0, USB reset, disconnect): transfers ended, link down. */
++static void
++ncm_stop(void)
++{
++	if (!usb_ncm) return;
++	if (ncm_rx_active) ncm_end(EP_NCM_OUT);
++	if (ncm_tx_active) ncm_end(EP_NCM_IN);
++	if (ncm_int_active) ncm_end(EP_NCM_INT);
++	ncm_rx_active = ncm_tx_active = ncm_int_active = false;
++	ncm_notify = 0;
++	if (ncm_alt) {
++		ncm_alt = 0;
++		core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) & ~((1u << EP_NCM_OUT) | (1u << EP_NCM_IN)));
++	}
++	pong_usbnet_link(0);
++}
++
++static void
++ncm_set_alt(unsigned alt)
++{
++	ncm_st.alt_sets++;
++	if (alt == 0) {
++		ncm_stop();
++		return;
++	}
++	if (ncm_alt == 1) return;
++	if (!ep_config(EP_NCM_OUT, 2, ctl_packet_size) || !ep_config(EP_NCM_IN, 2, ctl_packet_size)) {
++		pmsg_log("[PONG_USB] ncm: bulk endpoint config failed\n");
++		return;
++	}
++	core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << EP_NCM_OUT) | (1u << EP_NCM_IN));
++	ncm_alt = 1;
++	ncm_arm_rx();
++	ncm_notify = 1;
++	ncm_send_notify();
++	pong_usbnet_link(1);
++	pmsg_log("[PONG_USB] ncm: data interface on (bulk %u, rx %d)\n", ctl_packet_size, ncm_rx_active);
++}
++
++/* The bulk IN side: the next NTB once the previous one went out. From the thread's loop and after events. */
++static void
++ncm_pump_tx(void)
++{
++	if (ncm_alt != 1 || ncm_tx_active || !pong_usbnet_tx_ready()) return;
++	unsigned n = pong_usbnet_tx((volatile uint8_t *)(dma_wcomb + OFF_NCM_TX), ncm_in_max, ctl_packet_size);
++	if (n) {
++		ncm_tx_active = ncm_xfer(EP_NCM_IN, OFF_NCM_TX_TRB, OFF_NCM_TX, n);
++		ncm_activity++;
++	}
++}
++
++static void
++ncm_ep_event(unsigned ep, unsigned kind, unsigned status)
++{
++	if (kind != DWC3_DEPEVT_XFERCOMPLETE) return;
++	ncm_activity++;
++	if (ep == EP_NCM_INT) {
++		ncm_int_active = false;
++		ncm_send_notify();
++	} else if (ep == EP_NCM_IN) {
++		ncm_tx_active = false;
++		ncm_st.tx++;
++		ncm_pump_tx();
++	} else if (ep == EP_NCM_OUT && ncm_rx_active) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		uint32_t residual = *(volatile uint32_t *)(dma_wcomb + OFF_NCM_RX_TRB + 8) & 0xffffff;
++		ncm_rx_active = false;
++		if (!(status & 1) && residual <= NCM_NTB_MAX) {
++			ncm_st.rx++;
++			pong_usbnet_rx((const volatile uint8_t *)(dma_wcomb + OFF_NCM_RX), NCM_NTB_MAX - residual);
++		} else {
++			ncm_st.rx_err++;
++		}
++		ncm_arm_rx();
++	}
++}
++
++/*
++ * Class requests to the NCM communication interface (2). Returns -1 to stall, 0 for no data stage, 1 with
++ * *resp_len bytes in out for an IN data stage, 2 to take an OUT data stage (at most 64 bytes).
++ */
++static int
++ncm_class_request(uint8_t type, uint8_t req, uint16_t val, uint16_t len, uint8_t *out, unsigned *resp_len)
++{
++	ncm_st.reqs++;
++	if (type & 0x80) {
++		memset(out, 0, 32);
++		switch (req) {
++		case 0x80: {    /* GET_NTB_PARAMETERS: NTB16 only, 16 KiB each way, 4-byte alignment */
++			static const uint8_t p[28] = {
++				28, 0, 1, 0, 0x00, 0x40, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0,
++				0x00, 0x40, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0
++			};
++			memcpy(out, p, sizeof(p));
++			*resp_len = sizeof(p);
++			return 1;
++		}
++		case 0x83:      /* GET_NTB_FORMAT: 16-bit */
++		case 0x89:      /* GET_CRC_MODE: none */
++			*resp_len = 2;
++			return 1;
++		case 0x85:      /* GET_NTB_INPUT_SIZE */
++			out[0] = (uint8_t)ncm_in_max; out[1] = (uint8_t)(ncm_in_max >> 8);
++			out[2] = (uint8_t)(ncm_in_max >> 16); out[3] = (uint8_t)(ncm_in_max >> 24);
++			*resp_len = (len >= 8) ? 8 : 4;
++			return 1;
++		case 0x87:      /* GET_MAX_DATAGRAM_SIZE */
++			out[0] = 0xea; out[1] = 0x05;
++			*resp_len = 2;
++			return 1;
++		default:
++			ncm_st.stalls++;
++			return -1;
++		}
++	}
++	if (req == 0x84 || req == 0x8a) {   /* SET_NTB_FORMAT / SET_CRC_MODE: only 16-bit, no CRC */
++		if (val != 0) { ncm_st.stalls++; return -1; }
++		return 0;
++	}
++	if (!len) return 0;                 /* SET_ETHERNET_PACKET_FILTER (0x43) and the like: accepted */
++	if (len > 64) { ncm_st.stalls++; return -1; }
++	return 2;                           /* SET_NTB_INPUT_SIZE (0x86) is read when the data arrives */
++}
++
++/* Bulk wMaxPacketSize of every bulk endpoint in a configuration descriptor (64 at full speed, 512 at high). */
++static void
++cfg_bulk_packet(uint8_t *cfg, unsigned total, unsigned packet)
++{
++	for (unsigned i = 0; i + 6 < total && cfg[i]; i += cfg[i]) {
++		if (cfg[i + 1] == 5 && (cfg[i + 3] & 3) == 2) {
++			cfg[i + 4] = (uint8_t)packet;
++			cfg[i + 5] = (uint8_t)(packet >> 8);
++		}
++	}
++}
++
+ static void
+ reset_endpoints(void)
+ {
+@@ -693,6 +920,44 @@ static uint8_t cfg_desc[67] = {
+ 	7, 5, 0x01, 2, 64, 0, 0          /* EP1 OUT (Bulk) */
+ };
+ 
++/* pong_usb_ncm=1: the same CDC-ACM function behind an IAD, then CDC-NCM (Windows 11's inbox UsbNcm binds it). */
++static uint8_t cfg_ncm[160] = {
++	9, 2, 160, 0, 4, 1, 0, 0xc0, 50,
++	8, 0x0b, 0, 2, 2, 2, 1, 0,                      /* IAD: interfaces 0-1, CDC-ACM */
++	9, 4, 0, 0, 1, 2, 2, 1, 0,
++	5, 0x24, 0x00, 0x10, 0x01,
++	5, 0x24, 0x01, 0x00, 0x01,
++	4, 0x24, 0x02, 0x02,
++	5, 0x24, 0x06, 0x00, 0x01,
++	7, 5, 0x82, 3, 16, 0, 16,
++	9, 4, 1, 0, 2, 10, 0, 0, 0,
++	7, 5, 0x81, 2, 64, 0, 0,
++	7, 5, 0x01, 2, 64, 0, 0,
++	8, 0x0b, 2, 2, 2, 0x0d, 0, 4,                   /* IAD: interfaces 2-3, CDC-NCM */
++	9, 4, 2, 0, 1, 2, 0x0d, 0, 4,                   /* communication: 1 interrupt endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* Header: CDC 1.10 */
++	5, 0x24, 0x06, 0x02, 0x03,                      /* Union: 2 -> 3 */
++	13, 0x24, 0x0f, 5, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* Ethernet: iMACAddress string 5, 1514-byte segments */
++	6, 0x24, 0x1a, 0x00, 0x01, 0x01,                /* NCM 1.0, SetEthernetPacketFilter */
++	7, 5, 0x83, 3, 16, 0, 9,                        /* EP3 IN interrupt, 16 B */
++	9, 4, 3, 0, 0, 10, 0, 1, 0,                     /* data, alternate 0: no endpoints */
++	9, 4, 3, 1, 2, 10, 0, 1, 0,                     /* data, alternate 1: NTB */
++	7, 5, 0x84, 2, 64, 0, 0,                        /* EP4 IN bulk */
++	7, 5, 0x04, 2, 64, 0, 0                         /* EP4 OUT bulk */
++};
++_Static_assert(sizeof(cfg_ncm) == 160, "cfg_ncm wTotalLength");
++
++/* The device descriptor as sent: with pong_usb_ncm=1 a composite (class EF/02/01) with PID 0x316e. */
++static void
++device_descriptor(uint8_t *out)
++{
++	memcpy(out, dev_desc, sizeof(dev_desc));
++	if (usb_ncm) {
++		out[4] = 0xef; out[5] = 0x02; out[6] = 0x01;
++		out[10] = 0x6e;
++	}
++}
++
+ static unsigned
+ string_descriptor(unsigned index, uint8_t *out)
+ {
+@@ -700,9 +965,21 @@ string_descriptor(unsigned index, uint8_t *out)
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
+ 		return 4;
+ 	}
++	char mac[13];
++	if (index == 5) {   /* iMACAddress: the PC adapter's address, the tablet's en1 address + 1 */
++		static const char hex[] = "0123456789ABCDEF";
++		for (unsigned i = 0; i < 6; i++) {
++			uint8_t b = (uint8_t)(pong_usbnet_mac[i] + (i == 5 ? 1 : 0));
++			mac[2 * i] = hex[b >> 4];
++			mac[2 * i + 1] = hex[b & 15];
++		}
++		mac[12] = 0;
++	}
+ 	const char *str = (index == 1) ? "UniXNU" :
+ 	                  (index == 2) ? "SM-T970 iOS Control Port" :
+-	                  (index == 3) ? "SM8250-GTS7XLWIFI" : "";
++	                  (index == 3) ? "SM8250-GTS7XLWIFI" :
++	                  (index == 4) ? "SM-T970 USB Ethernet" :
++	                  (index == 5) ? mac : "";
+ 	unsigned len = (unsigned)strlen(str);
+ 	if (len > 32) len = 32;
+ 	out[0] = (uint8_t)(2 + 2 * len);
+@@ -1617,6 +1894,30 @@ cmd_handle_usbrole(const char *args)
+ 
+ static void cmd_handle_usbhost(const char *args);   /* z109, below the event loop */
+ 
++/* usbnet (z124): the CDC-NCM function and en1 (work/usbnet_scope/PLAN.md). */
++static void
++cmd_handle_usbnet(void)
++{
++	char reply[640];
++	int n;
++
++	if (!usb_ncm) {
++		send_str("usbnet: off (boot-arg pong_usb_ncm=1 turns it on)\n");
++		return;
++	}
++	n = snprintf(reply, sizeof(reply), "usbnet: alt %u in_max %u notify %u act rx %d tx %d int %d | usb rx %u tx %u "
++	    "rx_err %u xfer_fail %u ends %u alt_sets %u reqs %u stalls %u\n", ncm_alt, ncm_in_max, ncm_notify,
++	    ncm_rx_active, ncm_tx_active, ncm_int_active, ncm_st.rx, ncm_st.tx, ncm_st.rx_err, ncm_st.xfer_fail,
++	    ncm_st.ends, ncm_st.alt_sets, ncm_st.reqs, ncm_st.stalls);
++	if (n > 0 && (size_t)n < sizeof(reply) && core_base) {
++		/* IN endpoint count (GHWPARAMS3) and the TX FIFOs EP3/EP4 IN use (3, 4): a size of 0 would stall them */
++		n += snprintf(reply + n, sizeof(reply) - (size_t)n, "dwc3 hw3 %08x txfifo %08x %08x %08x %08x %08x\n",
++		    core_r(0xC14C), core_r(0xC300), core_r(0xC304), core_r(0xC308), core_r(0xC30C), core_r(0xC310));
++	}
++	if (n > 0 && (size_t)n < sizeof(reply)) pong_usbnet_stat(reply + n, sizeof(reply) - (size_t)n);
++	send_str(reply);
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -2140,6 +2441,8 @@ dispatch_command(const char *cmd)
+ 		hp_reply[0] = '\0';
+ 		(void)pong_haptic_usb(hp_reply, sizeof(hp_reply), cmd + 4);
+ 		send_str(hp_reply[0] ? hp_reply : "buzz: no reply\n");
++	} else if (strcmp(cmd, "usbnet") == 0) {
++		cmd_handle_usbnet();
+ 	} else if (strcmp(cmd, "usbhost") == 0 || strncmp(cmd, "usbhost ", 8) == 0) {
+ 		cmd_handle_usbhost(cmd + 7);
+ 	} else if (strcmp(cmd, "usbrole") == 0 || strncmp(cmd, "usbrole ", 8) == 0) {
+@@ -2451,18 +2754,25 @@ handle_setup(void)
+ 		/* GET_DESCRIPTOR */
+ 		switch (val >> 8) {
+ 		case 1: /* Device */
+-			memcpy(out, dev_desc, sizeof(dev_desc));
++			device_descriptor(out);
+ 			resp_len = sizeof(dev_desc);
+ 			break;
+ 		case 2: /* Configuration */
+-			memcpy(out, cfg_desc, sizeof(cfg_desc));
+-			resp_len = sizeof(cfg_desc);
++			if (usb_ncm) {
++				memcpy(out, cfg_ncm, sizeof(cfg_ncm));
++				resp_len = sizeof(cfg_ncm);
++			} else {
++				memcpy(out, cfg_desc, sizeof(cfg_desc));
++				resp_len = sizeof(cfg_desc);
++			}
+ 			break;
+ 		case 3: /* String */
+ 			resp_len = string_descriptor(val & 0xff, out);
+ 			break;
+ 		case 6: { /* Device Qualifier */
+-			uint8_t q[10] = {10, 6, 0x00, 0x02, dev_desc[4], dev_desc[5], dev_desc[6], 64, 1, 0};
++			uint8_t d[18];
++			device_descriptor(d);
++			uint8_t q[10] = {10, 6, 0x00, 0x02, d[4], d[5], d[6], 64, 1, 0};
+ 			memcpy(out, q, 10);
+ 			resp_len = 10;
+ 			break;
+@@ -2483,14 +2793,17 @@ handle_setup(void)
+ 			return;
+ 		}
+ 		ctl_configured = (val != 0);
++		ncm_stop();
+ 		if (ctl_configured) {
+ 			if (!ep_config(2, 2, ctl_packet_size) ||
+ 			    !ep_config(3, 2, ctl_packet_size) ||
+-			    !ep_config(5, 3, 16)) {
++			    !ep_config(5, 3, 16) ||
++			    (usb_ncm && !ep_config(EP_NCM_INT, 3, 16))) {
+ 				stall_control();
+ 				return;
+ 			}
+-			core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << 2) | (1u << 3) | (1u << 5));
++			core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << 2) | (1u << 3) | (1u << 5) |
++			    (usb_ncm ? (1u << EP_NCM_INT) : 0));
+ 			pmsg_log("[PONG_USB] configured: speed=%s packet=%u\n",
+ 			    (ctl_packet_size == 512) ? "HS" : "FS", ctl_packet_size);
+ 			if (!ctl_rx_active) {
+@@ -2506,7 +2819,7 @@ handle_setup(void)
+ 	} else if (type == 0x02 && req == 1 && !len) {
+ 		/* CLEAR_FEATURE (ENDPOINT_HALT) */
+ 		unsigned ep = ((idx & 15) << 1) | ((idx >> 7) & 1);
+-		if (ep == 2 || ep == 3 || ep == 5) {
++		if (ep == 2 || ep == 3 || ep == 5 || (usb_ncm && ep >= EP_NCM_INT && ep <= EP_NCM_IN)) {
+ 			ep_cmd(ep, DWC3_DEPCMD_CLEARSTALL, 0, 0, 0);
+ 		}
+ 		status_stage(1);
+@@ -2523,6 +2836,21 @@ handle_setup(void)
+ 		/* GET_STATUS (ENDPOINT) */
+ 		out[0] = 0; out[1] = 0;
+ 		resp_len = 2;
++	} else if (usb_ncm && (type & 0x7f) == 0x21 && (idx & 0xff) == 2) {
++		/* CDC-NCM class request to its communication interface */
++		int r = ncm_class_request(type, req, val, len, out, &resp_len);
++		if (r < 0) {
++			stall_control();
++			return;
++		}
++		if (r == 2) {
++			control_data(0, len);
++			return;
++		}
++		if (r == 0) {
++			status_stage(1);
++			return;
++		}
+ 	} else if (type == 0xa1 && req == 0x21 && len == 7) {
+ 		/* CDC: GET_LINE_CODING */
+ 		memcpy(out, ctl_line_coding, 7);
+@@ -2569,12 +2897,19 @@ handle_setup(void)
+ 		status_stage(1);
+ 		return;
+ 	} else if (type == 0x01 && req == 0x0b && !len) {
+-		/* Standard: SET_INTERFACE */
++		/* Standard: SET_INTERFACE (the NCM data interface 3 switches its bulk endpoints on alternate 1) */
++		if (usb_ncm && (idx & 0xff) == 3) {
++			if (val > 1) {
++				stall_control();
++				return;
++			}
++			ncm_set_alt(val);
++		}
+ 		status_stage(1);
+ 		return;
+ 	} else if (type == 0x81 && req == 0x0a && len == 1) {
+ 		/* Standard: GET_INTERFACE */
+-		out[0] = 0;
++		out[0] = (usb_ncm && (idx & 0xff) == 3) ? (uint8_t)ncm_alt : 0;
+ 		resp_len = 1;
+ 	} else {
+ 		if (diag_cdc_other < 5) {
+@@ -2603,6 +2938,10 @@ handle_ep_event(uint32_t event)
+ 		    ++diag_ep0_evt_count, ep, kind, status, ctl_stage);
+ 	}
+ 
++	if (usb_ncm && ep >= EP_NCM_INT && ep <= EP_NCM_IN) {
++		ncm_ep_event(ep, kind, status);
++		return;
++	}
+ 	if (ep >= 2) {
+ 		if (kind == DWC3_DEPEVT_XFERCOMPLETE) {
+ 			if (ep == 3) {
+@@ -2647,7 +2986,13 @@ handle_ep_event(uint32_t event)
+ 		if (ctl_status_dep == 1) {
+ 			/* Control OUT data phase finished */
+ 			__asm__ volatile("dsb sy" ::: "memory");
+-			if (ctl_req_cmd == 0x20) {
++			if (usb_ncm && ctl_req_type == 0x21 && ctl_req_cmd == 0x86) {
++				/* NCM SET_NTB_INPUT_SIZE: the largest NTB the host takes, kept within our 16 KiB buffer */
++				volatile const uint8_t *d = (volatile const uint8_t *)(dma_wcomb + OFF_EP_DATA + 0x100);
++				uint32_t want = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
++				ncm_in_max = (want >= 2048 && want <= NCM_NTB_MAX) ? want : NCM_NTB_MAX;
++				pmsg_log("[PONG_USB] ncm: host NTB input size %u -> %u\n", want, ncm_in_max);
++			} else if (ctl_req_cmd == 0x20) {
+ 				/* SET_LINE_CODING: latch 7-byte line coding */
+ 				memcpy(ctl_line_coding, (const void *)(dma_wcomb + OFF_EP_DATA + 0x100), 7);
+ 				if (diag_cdc_set_line_coding < 5) {
+@@ -2704,6 +3049,7 @@ process_events(void)
+ 			unsigned dev_evt = (event >> 8) & 15;
+ 			switch (dev_evt) {
+ 			case 0: /* Disconnect */
++				ncm_stop();
+ 				ctl_configured = false;
+ 				ctl_dtr = false;
+ 				ctl_rts = false;
+@@ -2718,13 +3064,14 @@ process_events(void)
+ 					diag_dev_evt_count++;
+ 				}
+ 				core_w(DWC3_DCFG, core_r(DWC3_DCFG) & ~(127u << 3));
++				ncm_stop();
+ 				reset_endpoints();
+ 				break;
+ 			case 2: { /* Connection speed done */
+ 				uint32_t spd = DWC3_DSTS_CONNECTSPD(core_r(DWC3_DSTS));
+ 				ctl_packet_size = (spd == 0) ? 512 : 64;
+-				cfg_desc[57] = cfg_desc[64] = (uint8_t)ctl_packet_size;
+-				cfg_desc[58] = cfg_desc[65] = (uint8_t)(ctl_packet_size >> 8);
++				cfg_bulk_packet(cfg_desc, sizeof(cfg_desc), ctl_packet_size);
++				cfg_bulk_packet(cfg_ncm, sizeof(cfg_ncm), ctl_packet_size);
+ 
+ 				/* Restore GCTL (RAMCLKSEL=0 bus clock, PRTCAPDIR=device, DSBLCLKGTNG) */
+ 				uint32_t gctl = core_r(DWC3_GCTL);
+@@ -2844,6 +3191,7 @@ usbhost_run_pending(void)
+ 
+ 	usbhost_pending = 0;
+ 	pmsg_log("[PONG_USB] usbhost session %u s\n", seconds);
++	ncm_stop();
+ 	device_stop();
+ 	(void)pong_usbhost_session(core_base, qscratch_base, seconds, usbhost_flags, usbhost_report, sizeof(usbhost_report));
+ 	core_w(DWC3_GEVNTCOUNT(0), core_r(DWC3_GEVNTCOUNT(0)) & 0xfffcu);   /* ack leftovers; step 14 resets the ring */
+@@ -2897,21 +3245,24 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 		pong_smmu_check_sid0_bypass(smmu_base);
+ 	}
+ 
+-	pmsg_log("[PONG_USB] step 4: allocating DMA contiguous buffer (32 KiB)...\n");
++	PE_parse_boot_argn("pong_usb_ncm", &usb_ncm, sizeof(usb_ncm));
++	usb_ncm &= 1;
++	if (usb_ncm) usb_dma_bytes = USB_DMA_NCM_BYTES;
++	pmsg_log("[PONG_USB] step 4: allocating DMA contiguous buffer (%u KiB, ncm %u)...\n", usb_dma_bytes / 1024, usb_ncm);
+ 	dma_phys = 0;
+-	dma_virt = IOMallocContiguous(USB_DMA_BYTES, 4096, &dma_phys);
++	dma_virt = IOMallocContiguous(usb_dma_bytes, 4096, &dma_phys);
+ 	if (!dma_virt || !dma_phys) {
+ 		pmsg_log("[PONG_USB] fail: IOMallocContiguous 32K\n");
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
+-	dma_wcomb = ml_io_map_wcomb((vm_offset_t)dma_phys, USB_DMA_BYTES);
++	dma_wcomb = ml_io_map_wcomb((vm_offset_t)dma_phys, usb_dma_bytes);
+ 	if (!dma_wcomb) {
+ 		pmsg_log("[PONG_USB] fail: ml_io_map_wcomb DMA\n");
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
+-	memset((void *)dma_wcomb, 0, USB_DMA_BYTES);
++	memset((void *)dma_wcomb, 0, usb_dma_bytes);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	pmsg_log("[PONG_USB] dma: allocated phys=0x%llx\n", (uint64_t)dma_phys);
+ 
+@@ -2958,6 +3309,11 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 	/* Soft reset is SKIPPED to preserve UEFI PHY clocks and state */
+ 	pmsg_log("[PONG_USB] step 11: skipping CSFTRST (preserving UEFI PHY/core state)\n");
+ 
++	if (usb_ncm) {
++		int rc = pong_usbnet_attach();
++		pmsg_log("[PONG_USB] ncm: en1 attach %d (0 = ok); composite device PID 316e\n", rc);
++	}
++
+ 	device_start();
+ 
+ 	pmsg_log("[PONG_USB] step 20: ready: listening on CDC-ACM\n");
+@@ -2969,6 +3325,7 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 			usbhost_run_pending();
+ 		}
+ 		fwput_check_timeout();
++		ncm_pump_tx();
+ 		{
+ 			static char boot_timeout_reply[96];
+ 
+@@ -2979,7 +3336,21 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 		if (ctl_configured && !ctl_rx_active) {
+ 			ctl_rx_active = ep_transfer(2, OFF_RX_TRB, OFF_RX_DATA, ctl_packet_size, DWC3_TRBCTL_NORMAL);
+ 		}
+-		delay_for_interval(2, NSEC_PER_MSEC);
++		{
++			/* NCM traffic: poll every 100 us until 50 ms pass without an NCM event, then back to 2 ms */
++			static unsigned seen, quiet;
++
++			if (ncm_activity != seen) {
++				seen = ncm_activity;
++				quiet = 0;
++			}
++			if (ncm_alt == 1 && quiet < 500) {
++				quiet++;
++				delay_for_interval(100, NSEC_PER_USEC);
++			} else {
++				delay_for_interval(2, NSEC_PER_MSEC);
++			}
++		}
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_usbnet.c b/bsd/dev/pong_usbnet.c
+new file mode 100644
+index 0000000..3111311
+--- /dev/null
++++ b/bsd/dev/pong_usbnet.c
+@@ -0,0 +1,458 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SM-T970 USB network (z124, boot-arg pong_usb_ncm=1; device-untested). iOSPort work/usbnet_scope/PLAN.md.
++ *
++ * The network half of the CDC-NCM function that pong_usb_ctl.c adds next to its CDC-ACM debug channel: the
++ * Ethernet interface en1 the system configures by DHCP (Windows Internet Connection Sharing answers on the PC
++ * side), and the NTB16 framing (USB CDC NCM 1.0 section 3) between that interface and the bulk endpoints.
++ * pong_usb_ctl.c owns the controller: it hands each received NTB to pong_usbnet_rx() and asks
++ * pong_usbnet_tx() for the next NTB to send, both from its thread. The stack's output may run on any thread,
++ * so frames wait in a short queue under a mutex.
++ *
++ * The registry entries configd needs to see an Ethernet interface (IONetworkInterface under a controller) are
++ * made by drivers/T970Wifi/T970WifiNetGlue.cpp, with the classes the Wi-Fi side registers (shared, once).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kern_event.h>
++#include <net/if.h>
++#include <net/if_var.h>
++#include <net/if_media.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/kpi_interface.h>
++#include <net/bpf.h>
++#include <netinet/in.h>
++#include <kern/locks.h>
++
++extern int t970_usbnet_publish(const uint8_t mac[6], unsigned unit);   /* T970WifiNetGlue.cpp */
++
++int pong_usbnet_attach(void);
++void pong_usbnet_link(int up);
++void pong_usbnet_rx(const volatile uint8_t *ntb, unsigned len);
++int pong_usbnet_tx_ready(void);
++unsigned pong_usbnet_tx(volatile uint8_t *dst, unsigned cap, unsigned packet);
++int pong_usbnet_stat(char *out, size_t cap);
++
++#define NTH16_SIG       0x484d434eu     /* "NCMH" */
++#define NDP16_SIG       0x304d434eu     /* "NCM0" (no CRC) */
++#define NTB_MAX         16384u
++#define TXQ_MAX         128u
++#define TX_DGRAMS_MAX   32u
++#define USBNET_UNIT     1u              /* en1: Wi-Fi is en0 */
++
++/* Locally administered: the tablet's en1 and, in the iMACAddress string pong_usb_ctl.c sends, the PC's adapter. */
++const uint8_t pong_usbnet_mac[6] = { 0x02, 0x50, 0x4f, 0x4e, 0x47, 0x01 };
++
++static ifnet_t usbnet_if;
++static int usbnet_attach_rc = 1;        /* 1 = not tried */
++static int usbnet_publish_rc = 1;
++static volatile int usbnet_up;
++static lck_grp_t *usbnet_grp;
++static lck_mtx_t *usbnet_lock;
++static mbuf_t txq_head, txq_tail;
++static unsigned txq_len;
++static uint8_t rx_copy[NTB_MAX] __attribute__((aligned(8)));
++static uint16_t tx_seq;
++static struct {
++	uint32_t rx_ntb, rx_bad, rx_frames, rx_nobuf, rx_refused;
++	uint32_t tx_ntb, tx_frames, tx_drop, tx_long;
++	uint32_t arp_in, arp_out, dhcp_in, dhcp_out;
++	int bad_why;
++} st;
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline void
++put16(uint8_t *p, unsigned v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++}
++
++/* ARP and DHCP counts, both ways: whether the address configuration reaches the PC and back. */
++static void
++note_frame(const uint8_t *e, size_t n, int out)
++{
++	if (n < 14) return;
++	unsigned type = (e[12] << 8) | e[13];
++	if (type == 0x0806) {
++		if (out) st.arp_out++; else st.arp_in++;
++		return;
++	}
++	if (type != 0x0800 || n < 14 + 20 + 8) return;
++	const uint8_t *ip = e + 14;
++	unsigned ihl = (ip[0] & 15) * 4;
++	if (ip[9] != 17 || n < 14 + ihl + 8) return;
++	const uint8_t *udp = ip + ihl;
++	unsigned sp = (udp[0] << 8) | udp[1], dp = (udp[2] << 8) | udp[3];
++	if ((sp == 67 || sp == 68) && (dp == 67 || dp == 68)) {
++		if (out) st.dhcp_out++; else st.dhcp_in++;
++	}
++}
++
++/* One received frame to the stack (the same shape as PongWifiNet.cpp's on_rx: IP header 4-byte aligned, chain-safe). */
++static void
++input_frame(const uint8_t *eth, size_t length)
++{
++	mbuf_t m = NULL;
++	size_t done = 0;
++	int first = 1;
++
++	if (!usbnet_if || length < 14 || length > 1514 + 4) return;
++	note_frame(eth, length, 0);
++	if (mbuf_allocpacket(MBUF_DONTWAIT, length + 2, NULL, &m) || !m) {
++		st.rx_nobuf++;
++		return;
++	}
++	for (mbuf_t n = m; n; n = mbuf_next(n)) {
++		size_t room = mbuf_maxlen(n) - mbuf_leadingspace(n);
++		if (first) {
++			if (room < 2 + 14) break;
++			mbuf_setdata(n, (uint8_t *)mbuf_datastart(n) + mbuf_leadingspace(n) + 2, 0);
++			room -= 2;
++		}
++		size_t take = length - done < room ? length - done : room;
++		memcpy(mbuf_data(n), eth + done, take);
++		mbuf_setlen(n, take);
++		done += take;
++		first = 0;
++	}
++	if (done != length) {
++		st.rx_nobuf++;
++		mbuf_freem(m);
++		return;
++	}
++	mbuf_pkthdr_setlen(m, length);
++	mbuf_pkthdr_setrcvif(m, usbnet_if);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	mbuf_adj(m, 14);
++	struct ifnet_stat_increment_param inc;
++	memset(&inc, 0, sizeof(inc));
++	inc.packets_in = 1;
++	inc.bytes_in = (uint32_t)length;
++	if (ifnet_input(usbnet_if, m, &inc)) st.rx_refused++; else st.rx_frames++;
++}
++
++/* A received NTB16 (pong_usb_ctl.c's DMA buffer, uncached): every datagram of every NDP16 to the stack. */
++void
++pong_usbnet_rx(const volatile uint8_t *ntb, unsigned len)
++{
++	const uint8_t *b = rx_copy;
++	unsigned blen, ndp, guard;
++
++	if (!len) return;
++	if (len > NTB_MAX) len = NTB_MAX;
++	/* uncached reads are slow one by one: 8 bytes at a time (the buffer is page aligned) */
++	for (unsigned i = 0; i < (len + 7) / 8; i++) {
++		((uint64_t *)rx_copy)[i] = ((const volatile uint64_t *)ntb)[i];
++	}
++	st.rx_ntb++;
++	if (len < 12 || le32(b) != NTH16_SIG || le16(b + 4) != 12) { st.rx_bad++; st.bad_why = 1; return; }
++	blen = le16(b + 8);
++	if (blen == 0 || blen > len) { st.rx_bad++; st.bad_why = 2; return; }
++	ndp = le16(b + 10);
++	for (guard = 0; ndp && guard < 8; guard++) {
++		if (ndp < 12 || (ndp & 3) || ndp + 16 > blen || le32(b + ndp) != NDP16_SIG) {
++			st.rx_bad++; st.bad_why = 3; return;
++		}
++		unsigned nlen = le16(b + ndp + 4);
++		if (nlen < 16 || ndp + nlen > blen) { st.rx_bad++; st.bad_why = 4; return; }
++		for (unsigned o = ndp + 8; o + 4 <= ndp + nlen; o += 4) {
++			unsigned di = le16(b + o), dl = le16(b + o + 2);
++			if (!di || !dl) break;
++			if (di + dl > blen) { st.rx_bad++; st.bad_why = 5; break; }
++			input_frame(b + di, dl);
++		}
++		ndp = le16(b + ndp + 6);
++	}
++}
++
++int
++pong_usbnet_tx_ready(void)
++{
++	return txq_len != 0;
++}
++
++/*
++ * The next NTB16 into dst (pong_usb_ctl.c's DMA buffer): as many queued frames as fit in cap, each 4-byte
++ * aligned after the 12-byte header, then one NDP16. 0 when nothing waits. A length that is a multiple of the
++ * bulk packet size gets one pad byte (inside wBlockLength), so no zero-length packet is needed.
++ */
++unsigned
++pong_usbnet_tx(volatile uint8_t *dst, unsigned cap, unsigned packet)
++{
++	mbuf_t list = NULL, tail = NULL;
++	unsigned n = 0, off = 12, len, at[TX_DGRAMS_MAX], ln[TX_DGRAMS_MAX];
++	uint8_t hdr[12], ndp[8 + 4 * (TX_DGRAMS_MAX + 1)];
++
++	if (!usbnet_lock || !txq_len) return 0;
++	if (cap > NTB_MAX) cap = NTB_MAX;
++	lck_mtx_lock(usbnet_lock);
++	while (txq_head && n < TX_DGRAMS_MAX) {
++		len = (unsigned)mbuf_pkthdr_len(txq_head);
++		unsigned start = (off + 3) & ~3u;
++		unsigned end = ((start + len + 3) & ~3u) + 8 + 4 * (n + 2) + 1;
++		if (end > cap) break;
++		mbuf_t m = txq_head;
++		txq_head = mbuf_nextpkt(m);
++		if (!txq_head) txq_tail = NULL;
++		txq_len--;
++		mbuf_setnextpkt(m, NULL);
++		if (tail) mbuf_setnextpkt(tail, m); else list = m;
++		tail = m;
++		at[n] = start; ln[n] = len; n++;
++		off = start + len;
++	}
++	lck_mtx_unlock(usbnet_lock);
++	if (!n) return 0;
++
++	unsigned i = 0;
++	for (mbuf_t m = list, next; m; m = next, i++) {
++		uint8_t frame[64];
++		next = mbuf_nextpkt(m);
++		mbuf_copydata(m, 0, ln[i], (void *)(uintptr_t)(dst + at[i]));
++		mbuf_copydata(m, 0, ln[i] < sizeof(frame) ? ln[i] : sizeof(frame), frame);
++		note_frame(frame, ln[i] < sizeof(frame) ? ln[i] : sizeof(frame), 1);
++		mbuf_freem(m);
++	}
++	unsigned ndp_at = (off + 3) & ~3u, ndp_len = 8 + 4 * (n + 1);
++	unsigned total = ndp_at + ndp_len;
++	if (packet && (total % packet) == 0) total++;
++
++	memset(ndp, 0, sizeof(ndp));
++	ndp[0] = 'N'; ndp[1] = 'C'; ndp[2] = 'M'; ndp[3] = '0';
++	put16(ndp + 4, ndp_len);
++	for (i = 0; i < n; i++) {
++		put16(ndp + 8 + 4 * i, at[i]);
++		put16(ndp + 10 + 4 * i, ln[i]);
++	}
++	hdr[0] = 'N'; hdr[1] = 'C'; hdr[2] = 'M'; hdr[3] = 'H';
++	put16(hdr + 4, 12);
++	put16(hdr + 6, tx_seq++);
++	put16(hdr + 8, total);
++	put16(hdr + 10, ndp_at);
++	for (i = 0; i < 12; i++) dst[i] = hdr[i];
++	for (i = 12; i < at[0]; i++) dst[i] = 0;
++	for (i = off; i < ndp_at; i++) dst[i] = 0;
++	for (i = 0; i < ndp_len; i++) dst[ndp_at + i] = ndp[i];
++	if (total > ndp_at + ndp_len) dst[total - 1] = 0;
++	st.tx_ntb++;
++	st.tx_frames += n;
++	ifnet_stat_increment_out(usbnet_if, n, off, 0);
++	return total;
++}
++
++static errno_t
++usbnet_output(ifnet_t ifp, mbuf_t m)
++{
++	(void)ifp;
++	while (m) {
++		mbuf_t next = mbuf_nextpkt(m);
++		size_t len = mbuf_pkthdr_len(m);
++		mbuf_setnextpkt(m, NULL);
++		if (len < 14 || len > 1514 + 4) {
++			st.tx_long++;
++			mbuf_freem(m);
++		} else {
++			lck_mtx_lock(usbnet_lock);
++			if (!usbnet_up || txq_len >= TXQ_MAX) {
++				lck_mtx_unlock(usbnet_lock);
++				st.tx_drop++;
++				mbuf_freem(m);
++			} else {
++				if (txq_tail) mbuf_setnextpkt(txq_tail, m); else txq_head = m;
++				txq_tail = m;
++				txq_len++;
++				lck_mtx_unlock(usbnet_lock);
++			}
++		}
++		m = next;
++	}
++	return 0;
++}
++
++static errno_t
++usbnet_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	(void)ifp;
++	switch (cmd) {
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq64 *r = (struct ifmediareq64 *)data;
++		int count = r->ifm_count;
++		int medium = IFM_ETHER | IFM_1000_T | IFM_FDX;
++		r->ifm_current = medium;
++		r->ifm_mask = 0;
++		r->ifm_status = IFM_AVALID | (usbnet_up ? IFM_ACTIVE : 0);
++		r->ifm_active = usbnet_up ? medium : IFM_ETHER;
++		r->ifm_count = 1;
++		if (count > 0 && r->ifmu_ulist) return copyout(&medium, r->ifmu_ulist, sizeof(medium));
++		return 0;
++	}
++	case SIOCSIFFLAGS: case SIOCSIFMTU: case SIOCADDMULTI: case SIOCDELMULTI: case SIOCSIFADDR:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++usbnet_event_stub(ifnet_t ifp, const struct kev_msg *ev)
++{
++	(void)ifp; (void)ev;
++}
++
++/* The link event configd's KernelEventMonitor reads (as if_fake.c's interface_link_event). */
++static void
++link_event(uint32_t code)
++{
++	struct {
++		struct kern_event_msg header;
++		struct net_event_data data;
++	} msg;
++
++	memset(&msg, 0, sizeof(msg));
++	msg.header.total_size = (uint32_t)(__builtin_offsetof(struct kern_event_msg, event_data) + sizeof(struct net_event_data));
++	msg.header.vendor_code = KEV_VENDOR_APPLE;
++	msg.header.kev_class = KEV_NETWORK_CLASS;
++	msg.header.kev_subclass = KEV_DL_SUBCLASS;
++	msg.header.event_code = code;
++	struct net_event_data *d = (struct net_event_data *)((uint8_t *)&msg + __builtin_offsetof(struct kern_event_msg, event_data));
++	d->if_family = ifnet_family(usbnet_if);
++	d->if_unit = (uint32_t)ifnet_unit(usbnet_if);
++	strlcpy(d->if_name, ifnet_name(usbnet_if), IFNAMSIZ);
++	ifnet_event(usbnet_if, &msg.header);
++}
++
++/* The host selected (1) or left (0) the NCM data interface's alternate setting 1. From pong_usb_ctl.c's thread. */
++void
++pong_usbnet_link(int up)
++{
++	up = up ? 1 : 0;
++	if (usbnet_up == up) return;
++	usbnet_up = up;
++	if (!up && usbnet_lock) {
++		mbuf_t m;
++		lck_mtx_lock(usbnet_lock);
++		m = txq_head;
++		txq_head = txq_tail = NULL;
++		txq_len = 0;
++		lck_mtx_unlock(usbnet_lock);
++		while (m) {
++			mbuf_t next = mbuf_nextpkt(m);
++			mbuf_setnextpkt(m, NULL);
++			mbuf_freem(m);
++			m = next;
++		}
++	}
++	if (!usbnet_if) return;
++	ifnet_set_flags(usbnet_if, up ? IFF_RUNNING : 0, IFF_RUNNING);
++	link_event(up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
++	printf("Pong USB net: link %s\n", up ? "up" : "down");
++}
++
++/* en1 and its registry entries, once, from pong_usb_ctl.c's thread before the USB device starts. 0 on success. */
++int
++pong_usbnet_attach(void)
++{
++	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++	struct ifnet_init_eparams p;
++	ifnet_t ifp = NULL;
++	errno_t e;
++
++	if (usbnet_attach_rc != 1) return usbnet_attach_rc;
++	usbnet_grp = lck_grp_alloc_init("pong-usbnet", LCK_GRP_ATTR_NULL);
++	usbnet_lock = usbnet_grp ? lck_mtx_alloc_init(usbnet_grp, LCK_ATTR_NULL) : NULL;
++	if (!usbnet_lock) return usbnet_attach_rc = -1;
++
++	memset(&p, 0, sizeof(p));
++	p.ver = IFNET_INIT_CURRENT_VERSION;
++	p.len = sizeof(p);
++	p.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;   /* as PongWifiNet.cpp: no compatibility nexus */
++	p.uniqueid = pong_usbnet_mac;
++	p.uniqueid_len = sizeof(pong_usbnet_mac);
++	p.name = "en";
++	p.unit = USBNET_UNIT;
++	p.family = IFNET_FAMILY_ETHERNET;
++	p.subfamily = IFNET_SUBFAMILY_USB;
++	p.type = IFT_ETHER;
++	p.output = usbnet_output;
++	p.demux = ether_demux;
++	p.add_proto = ether_add_proto;
++	p.del_proto = ether_del_proto;
++	p.check_multi = ether_check_multi;
++	p.framer = ether_frameout;
++	p.ioctl = usbnet_ioctl;
++	p.event = usbnet_event_stub;
++	p.broadcast_addr = bcast;
++	p.broadcast_len = sizeof(bcast);
++	e = ifnet_allocate_extended(&p, &ifp);
++	if (e || !ifp) {
++		printf("Pong USB net: ifnet_allocate_extended %d\n", e);
++		return usbnet_attach_rc = -2;
++	}
++	ifnet_set_mtu(ifp, 1500);
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	ifnet_set_baudrate(ifp, 480000000ULL);
++	ifnet_set_hdrlen(ifp, 14);
++	ifnet_set_addrlen(ifp, 6);
++	e = ifnet_attach(ifp, NULL);
++	if (e) {
++		printf("Pong USB net: ifnet_attach %d\n", e);
++		ifnet_release(ifp);
++		return usbnet_attach_rc = -3;
++	}
++	ifnet_set_lladdr(ifp, pong_usbnet_mac, 6);
++	/* the DHCP client sends and receives through the packet filter while en1 has no address */
++	e = bpf_attach(ifp, DLT_EN10MB, 14, NULL, NULL);
++	if (e) printf("Pong USB net: bpf_attach %d\n", e);
++	usbnet_if = ifp;
++	ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++	usbnet_publish_rc = t970_usbnet_publish(pong_usbnet_mac, USBNET_UNIT);
++	printf("Pong USB net: en%u attached, registry %d\n", USBNET_UNIT, usbnet_publish_rc);
++	return usbnet_attach_rc = 0;
++}
++
++/* `usbnet` (pong_usb_ctl.c): interface, address and counters. */
++int
++pong_usbnet_stat(char *out, size_t cap)
++{
++	char addr[20] = "none";
++	struct ifnet_stats_param s;
++	ifaddr_t *list = NULL;
++
++	memset(&s, 0, sizeof(s));
++	if (usbnet_if) {
++		if (!ifnet_get_address_list_family(usbnet_if, &list, AF_INET) && list) {
++			struct sockaddr_in a;
++			memset(&a, 0, sizeof(a));
++			if (list[0] && !ifaddr_address(list[0], (struct sockaddr *)&a, sizeof(a))) {
++				const uint8_t *q = (const uint8_t *)&a.sin_addr;
++				snprintf(addr, sizeof(addr), "%u.%u.%u.%u", q[0], q[1], q[2], q[3]);
++			}
++			ifnet_free_address_list(list);
++		}
++		ifnet_stat(usbnet_if, &s);
++	}
++	return snprintf(out, cap,
++	    "en%u attach %d registry %d link %d addr %s | rx ntb %u bad %u(why %d) frames %u nobuf %u refused %u | "
++	    "tx ntb %u frames %u drop %u long %u q %u | arp in %u out %u dhcp in %u out %u | stack in %llu out %llu\n",
++	    USBNET_UNIT, usbnet_attach_rc, usbnet_publish_rc, usbnet_up, addr, st.rx_ntb, st.rx_bad, st.bad_why,
++	    st.rx_frames, st.rx_nobuf, st.rx_refused, st.tx_ntb, st.tx_frames, st.tx_drop, st.tx_long, txq_len,
++	    st.arp_in, st.arp_out, st.dhcp_in, st.dhcp_out, (unsigned long long)s.packets_in,
++	    (unsigned long long)s.packets_out);
++}
