@@ -16,6 +16,7 @@
 #include <notify.h>
 #include <signal.h>
 #include <limits.h>
+#include <math.h>
 #include <sys/sysctl.h>
 #include "touch.h"
 #define say(...) fprintf(stderr,__VA_ARGS__)
@@ -57,6 +58,11 @@ static IOHIDEventRef (*IOHIDEventCreateMouseEvent)(CFAllocatorRef allocator, uin
 static IOHIDEventRef (*IOHIDEventCreateScrollEvent)(CFAllocatorRef allocator, uint64_t time,
     double x, double y, double z, uint32_t options);
 static void (*IOHIDEventAppendEvent)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
+/* WebKit PAL IOKitSPIIOS.h order; the two flags are range and invert, touch goes in the options (kIOHIDTransducerTouch) */
+static IOHIDEventRef (*IOHIDEventCreateDigitizerStylusEventWithPolarOrientation)(CFAllocatorRef allocator, uint64_t time,
+    uint32_t index, uint32_t identity, uint32_t event_mask, uint32_t button_mask, double x, double y, double z,
+    double tip_pressure, double barrel_pressure, double twist, double altitude, double azimuth, int range, int invert,
+    uint32_t options);
 static void (*IOHIDEventSetIntegerValue)(IOHIDEventRef event, uint32_t field, CFIndex value);
 
 #define HID_CLIENT_SIMPLE               4       /* a client that only sends */
@@ -83,6 +89,18 @@ static void (*IOHIDEventSetIntegerValue)(IOHIDEventRef event, uint32_t field, CF
 #define FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xb0019
 
 #define MAX_FINGERS     10
+
+/*
+ * The S Pen (PONG_PEN records, bsd/dev/pong_spen.c; nothing arrives unless the kernel has pong_spen bit 2). Not tried on the
+ * device. pong_spen_hid: 1 (default) the stylus rides in the touch screen's own hand events, as WebKit's HIDEventGenerator
+ * sends one; 2 a service of its own, digitizer page usage 0x20 (backboardd's pencil digitizer pair). pong_spen_force: the
+ * tip pressure of a full press (default 500, HIDEventGenerator's stylus scale); it is also the service's
+ * AccurateMaxDigitizerPressureValue, which UIKit divides by to get the force (without it PencilKit draws without pressure).
+ */
+#define PEN_INDEX       20      /* < 31: backboardd drops higher path indexes */
+#define TRANSDUCER_TOUCH 0x20000
+static int pen_hid, pen_force;
+static struct {bool range, tip, side, eraser; double x, y, pressure, altitude, azimuth;} pen;
 
 /*
  * A finger that lands this close to an edge of the screen (a fraction of the width or the height)
@@ -259,6 +277,10 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	if (display) {
 		CFDictionarySetValue(properties, CFSTR("DisplayIntegrated"), kCFBooleanTrue);
 	}
+	if (display && page == HID_PAGE_DIGITIZER && pen_hid) {
+		CFNumberRef force = number(pen_force);
+		if (force) {CFDictionarySetValue(properties, CFSTR("AccurateMaxDigitizerPressureValue"), force);CFRelease(force);}
+	}
 	made->trackpad = page == HID_PAGE_GENERIC_DESKTOP && usage == HID_USAGE_MOUSE;
 	if (made->trackpad && (pogo_mt & 1)) {
 		CFDictionarySetValue(properties, CFSTR("ActuationSupported"), kCFBooleanTrue);
@@ -289,6 +311,62 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	return service;
 }
 
+static void
+append_pen(IOHIDEventRef parent, uint64_t time, uint32_t change)
+{
+	IOHIDEventRef stylus = IOHIDEventCreateDigitizerStylusEventWithPolarOrientation(NULL, time, PEN_INDEX, PEN_INDEX, change,
+	    pen.side ? 2 : 0, pen.x, pen.y, 0, pen.tip ? pen.pressure : 0, 0, 0, pen.altitude, pen.azimuth, pen.range, pen.eraser,
+	    pen.tip ? TRANSDUCER_TOUCH : 0);
+	if (!stylus) return;
+	IOHIDEventSetIntegerValue(stylus, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
+	IOHIDEventAppendEvent(parent, stylus, 0);
+	CFRelease(stylus);
+}
+
+/* A PONG_PEN record: x, y 0..65535; finger = pressure 0..4095 | (tilt x + 64) << 12 | (tilt y + 64) << 19 | flags << 26
+ * (1 in range, 2 tip, 4 side button, 8 eraser), tilt in degrees. */
+static void
+send_pen(IOHIDServiceClientRef service, const struct pong_touch *t)
+{
+	unsigned flags = t->finger >> 26;
+	bool range = flags & 1, tip = flags & 2, any = tip;
+	uint32_t change = (range != pen.range ? DIGITIZER_RANGE : 0) | (tip != pen.tip ? DIGITIZER_TOUCH : 0);
+
+	if (!range && !pen.range) return;
+	if (range) {     /* leaving range keeps the last position */
+		double a = tan(((int)((t->finger >> 12) & 0x7f) - 64) * M_PI / 180), b = tan(((int)((t->finger >> 19) & 0x7f) - 64) * M_PI / 180);
+		pen.x = t->x / 65535.0;
+		pen.y = t->y / 65535.0;
+		pen.pressure = (t->finger & 0xfff) * pen_force / 4095.0;
+		/* IOHID's angles (HIDEventGenerator): altitude = away from upright (UIKit's complement), azimuth = a turn minus UIKit's */
+		pen.altitude = atan(sqrt(a * a + b * b));
+		pen.azimuth = a != 0 || b != 0 ? fmod(2 * M_PI - atan2(b, a), 2 * M_PI) : 0;
+		change |= DIGITIZER_POSITION;
+	}
+	pen.range = range;
+	pen.tip = tip;
+	pen.side = flags & 4;
+	pen.eraser = flags & 8;
+	for (unsigned i = 0; pen_hid == 1 && i < MAX_FINGERS; i++) any |= fingers[i].touching;
+	IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, pen.x,
+	    pen.y, 0, 0, 0, 0, any || range, any, 0);
+	if (!hand) return;
+	IOHIDEventSetIntegerValue(hand, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
+	IOHIDEventSetIntegerValue(hand, FIELD_IS_BUILT_IN, 1);
+	for (unsigned i = 0; pen_hid == 1 && i < MAX_FINGERS; i++) {
+		if (!fingers[i].touching) continue;
+		IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(NULL, t->time, i + 1, i + 2, 0, fingers[i].x, fingers[i].y, 0,
+		    1.0, 0, true, true, 0);
+		if (!finger) continue;
+		IOHIDEventSetIntegerValue(finger, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
+		IOHIDEventAppendEvent(hand, finger, 0);
+		CFRelease(finger);
+	}
+	append_pen(hand, t->time, change);
+	IOHIDVirtualServiceClientDispatchEvent(service, hand);
+	CFRelease(hand);
+}
+
 /* One frame of the touch screen: the hand, and under it every finger that is down or has just lifted. */
 static void
 send_touch(IOHIDServiceClientRef screen, const struct pong_touch *t)
@@ -313,7 +391,7 @@ send_touch(IOHIDServiceClientRef screen, const struct pong_touch *t)
 	}
 
 	hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, fingers[f].x,
-	    fingers[f].y, 0, 0, 0, 0, any, any, 0);
+	    fingers[f].y, 0, 0, 0, 0, any || pen.range, any || pen.tip, 0);
     if (!hand) return;
 	IOHIDEventSetIntegerValue(hand, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
 	IOHIDEventSetIntegerValue(hand, FIELD_IS_BUILT_IN, 1);
@@ -329,6 +407,7 @@ send_touch(IOHIDServiceClientRef screen, const struct pong_touch *t)
 		IOHIDEventAppendEvent(hand, finger, 0);
 		CFRelease(finger);
 	}
+	if (pen.range && pen_hid == 1) append_pen(hand, t->time, 0);
     if (!IOHIDVirtualServiceClientDispatchEvent(screen,hand)) {
         static unsigned failures;
         if (failures++<3) fprintf(stderr,"Pong touch HID: event dispatch refused\n");
@@ -382,6 +461,12 @@ static void init_tp_rot(void)
         tp_scroll_div = boot_number(bootargs, "pong_pogo_scroll=", 8);
         if (tp_scroll_div < 1) tp_scroll_div = 1;
         pogo_mt = boot_number(bootargs, "pong_pogo_mt=", 0);
+        if ((boot_number(bootargs, "pong_spen=", 0) & 2) && IOHIDEventCreateDigitizerStylusEventWithPolarOrientation) {
+            pen_hid = boot_number(bootargs, "pong_spen_hid=", 1);
+            pen_force = boot_number(bootargs, "pong_spen_force=", 500);
+            if (pen_force < 1) pen_force = 500;
+            say("Pong touch HID: S Pen hid=%d force=%d\n", pen_hid, pen_force);
+        }
         if (tp_rot || pogo_mt) say("Pong touch HID: pogo rot=%d scroll=%d mt=%d\n", tp_rot, tp_scroll_div, pogo_mt);
     }
 }
@@ -413,13 +498,20 @@ input_thread(void *unused)
     if (!screen) {say("Pong touch HID: server did not open digitizer; SKIP\n");close(device);return NULL;}
     if (IOHIDEventCreateKeyboardEvent)
         wake_control=make_service(client,"Pong touch wake control",HID_PAGE_CONSUMER,HID_USAGE_CONSUMER_CONTROL,false);
+    IOHIDServiceClientRef pen_service=pen_hid==2?make_service(client,"Pong S Pen",HID_PAGE_DIGITIZER,0x20,true):NULL;
+    if (pen_hid==2 && !pen_service) pen_hid=0;
     say("Pong touch HID: display-integrated digitizer opened\n");
     if (wake_control) say("Pong touch HID: tap-to-wake consumer opened\n");
     struct pong_touch sample;unsigned count=0,waking=0;ssize_t length;
     while ((length=read(device,&sample,sizeof(sample)))>0 || (length<0 && errno==EINTR)) {
         if (length<0) continue;
         if (length!=(ssize_t)sizeof(sample)) continue;
-        if (sample.type<PONG_TOUCH_DOWN || sample.type>PONG_POINTER_SCROLL) continue;
+        if (sample.type<PONG_TOUCH_DOWN || sample.type>PONG_PEN) continue;
+        if (sample.type == PONG_PEN) {
+            unsigned mode=(unsigned)__atomic_load_n(&touch_mode,__ATOMIC_RELAXED)&0xff;
+            if (pen_hid && mode!=TOUCH_MODE_OFF && mode!=TOUCH_MODE_WAKE) send_pen(pen_hid==2?pen_service:screen,&sample);
+            continue;
+        }
 
         if (sample.type == PONG_CONN_CHANGE) {
             if (sample.x) {
@@ -535,6 +627,7 @@ input_thread(void *unused)
         pogo_trackpad = NULL;
     }
     if (wake_control) {IOHIDVirtualServiceClientRemove(wake_control);CFRelease(wake_control);}
+    if (pen_service) {IOHIDVirtualServiceClientRemove(pen_service);CFRelease(pen_service);}
     close(device);IOHIDVirtualServiceClientRemove(screen);CFRelease(screen);CFRelease(client);
     return NULL;
 }
@@ -633,6 +726,8 @@ pong_touch_start(void)
     IOHIDEventCreateScrollEvent=(__typeof__(IOHIDEventCreateScrollEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateScrollEvent");
     IOHIDUserDeviceCreate=(__typeof__(IOHIDUserDeviceCreate))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceCreate");
     IOHIDUserDeviceHandleReportWithTimeStamp=(__typeof__(IOHIDUserDeviceHandleReportWithTimeStamp))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceHandleReportWithTimeStamp");
+    IOHIDEventCreateDigitizerStylusEventWithPolarOrientation=(__typeof__(IOHIDEventCreateDigitizerStylusEventWithPolarOrientation))
+        dlsym(RTLD_DEFAULT,"IOHIDEventCreateDigitizerStylusEventWithPolarOrientation");
     RESOLVE(IOHIDEventAppendEvent);
     RESOLVE(IOHIDEventSetIntegerValue);
 #undef RESOLVE

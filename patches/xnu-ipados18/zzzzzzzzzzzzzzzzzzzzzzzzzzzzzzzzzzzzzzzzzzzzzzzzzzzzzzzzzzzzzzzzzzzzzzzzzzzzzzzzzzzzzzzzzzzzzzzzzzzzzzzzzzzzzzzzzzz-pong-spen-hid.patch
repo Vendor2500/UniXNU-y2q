@@ -1,0 +1,212 @@
+diff --git a/bsd/dev/pong_input.c b/bsd/dev/pong_input.c
+index 9d23de0..c9050e3 100644
+--- a/bsd/dev/pong_input.c
++++ b/bsd/dev/pong_input.c
+@@ -29,7 +29,7 @@ static int input_major=-1;
+ void
+ pong_touch_post(uint32_t type,uint32_t finger,uint32_t x,uint32_t y)
+ {
+-    if (type<PONG_TOUCH_DOWN || type>PONG_POINTER_SCROLL) return;
++    if (type<PONG_TOUCH_DOWN || type>PONG_PEN) return;
+     if (type==PONG_BUTTON_DOWN || type==PONG_BUTTON_UP) {
+         if (finger>=3u) return;
+     } else if (type<=PONG_TOUCH_UP) {
+diff --git a/bsd/dev/pong_spen.c b/bsd/dev/pong_spen.c
+index a6d92e8..a74d41c 100644
+--- a/bsd/dev/pong_spen.c
++++ b/bsd/dev/pong_spen.c
+@@ -1,6 +1,6 @@
+ /*
+  * SM-T970 S Pen digitizer, stage 1 (iOSPort work/spen_scope/PLAN.md): read the Wacom W9021 ("wacom,w90xx") and show it over USB.
+- * Nothing reaches the HID system yet; nothing runs unless `spen on` is sent.
++ * Nothing runs unless `spen on` is sent or the boot argument pong_spen is set.
+  *
+  *   spen        state, query result (firmware, ranges), counters, last coordinate packet decoded
+  *   spen on     once per boot: map the pins, FWE low, 3.3 V on (GPIO 93), query, survey exit (0x2d) + start (0x31), then a
+@@ -15,6 +15,15 @@
+  * button, bit4 tip; x = b1:b2, y = b3:b4, pressure = (b5 & 15):b6, height b7, tilt x/y = s8 b8/b9.
+  * Port of rui12366B/UniXNU-gts7xlwifi 88b34f9 package/T970Pen.cpp stages 1-2 (BSD-2-Clause-Patent); the same protocol is in
+  * JeyKul/gts7xl-mainline linux-patches/0009 (samsung-w90xx.c). Not tested on the device when written.
++ *
++ * Stage 2 (z115, not tested on the device), boot arguments, all off by default:
++ *   pong_spen=<bits>      1 start at boot (after pong_spen_delay s, default 25), 2 post every coordinate packet to /dev/pong-touch
++ *                         as type PONG_PEN (userland/touch.c turns it into an iPadOS stylus), 4 side-button press pulses the
++ *                         vibration motor (pong_haptic_pulse, z103) for pong_spen_buzz ms (default 20)
++ *   pong_spen_xform=<b>   1 swap raw axes, 2 mirror x, 4 mirror y (default 0: raw x along the long side, as the precedent found)
++ *   pong_spen_maxx/maxy   calibration: the raw value that maps to the far edge (default: the controller's query answer)
++ * PONG_PEN record: x, y 0..65535 (after the transform), finger = pressure 0..4095 | (tilt x + 64) << 12 | (tilt y + 64) << 19 |
++ * flags << 26 (1 in range, 2 tip, 4 side button, 8 eraser); tilt in the digitizer's degrees, transformed like the axes.
+  */
+ 
+ #include <pexpert/arm64/board_config.h>
+@@ -26,6 +35,8 @@
+ #include <libkern/OSAtomic.h>
+ #include <mach/mach_types.h>
+ #include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <sys/pong_input.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
+@@ -33,6 +44,8 @@ extern void thread_deallocate(thread_t thread);
+ extern uint64_t mach_absolute_time(void);
+ 
+ int pong_spen_usb(char *reply, size_t cap, const char *args);
++void pong_spen_init(void);
++extern int pong_haptic_pulse(uint32_t ms);
+ 
+ #define SP_NORTH        0x0f900000UL
+ #define SP_SOUTH        0x0f500000UL
+@@ -73,6 +86,8 @@ static uint8_t sp_raw[4][SP_COORD_LEN];
+ static unsigned sp_raw_n;
+ static char sp_query_hex[2 * 15 + 1];
+ static bool sp_prox, sp_tip, sp_side_down;
++static unsigned sp_bits, sp_xform, sp_buzz_ms = 20, sp_delay_s = 25, sp_cal_x, sp_cal_y, sp_posted, sp_buzzes;
++static int sp_buzz_rc;
+ 
+ static volatile uint32_t *
+ sp_reg(unsigned pin, unsigned off)
+@@ -317,6 +332,37 @@ sp_garage(void)
+ 	sp_hall_v = h;
+ }
+ 
++/* A coordinate packet as one PONG_PEN record (pong_spen bit 2). */
++static void
++sp_post(const uint8_t *d, bool ready)
++{
++	if (!(sp_bits & 2)) {
++		return;
++	}
++	unsigned mx = sp_cal_x ? sp_cal_x : sp_max_x, my = sp_cal_y ? sp_cal_y : sp_max_y;
++	unsigned rx = ((unsigned)d[1] << 8) | d[2], ry = ((unsigned)d[3] << 8) | d[4], p = ((unsigned)(d[5] & 15) << 8) | d[6];
++	int tx = (int8_t)d[8], ty = (int8_t)d[9];
++	if (sp_xform & 1) {
++		unsigned t = rx; rx = ry; ry = t;
++		t = mx; mx = my; my = t;
++		int u = tx; tx = ty; ty = u;
++	}
++	if (rx > mx) rx = mx;
++	if (ry > my) ry = my;
++	unsigned x = mx ? (unsigned)((uint64_t)rx * 65535 / mx) : 0, y = my ? (unsigned)((uint64_t)ry * 65535 / my) : 0;
++	if (sp_xform & 2) { x = 65535 - x; tx = -tx; }
++	if (sp_xform & 4) { y = 65535 - y; ty = -ty; }
++	if (tx < -63) tx = -63;
++	if (tx > 63) tx = 63;
++	if (ty < -63) ty = -63;
++	if (ty > 63) ty = 63;
++	if (sp_max_p && sp_max_p != 4095) p = (unsigned)((uint64_t)(p > sp_max_p ? sp_max_p : p) * 4095 / sp_max_p);
++	unsigned flags = ready ? (1u | ((d[0] & 0x10) ? 2u : 0) | ((d[0] & 0x20) ? 4u : 0) | ((d[0] & 0x40) ? 8u : 0)) : 0;
++	if (!(flags & 2)) p = 0;
++	pong_touch_post(PONG_PEN, (p & 0xfff) | ((unsigned)(tx + 64) & 0x7f) << 12 | ((unsigned)(ty + 64) & 0x7f) << 19 | flags << 26, x, y);
++	sp_posted++;
++}
++
+ static void
+ sp_packet(void)
+ {
+@@ -341,12 +387,22 @@ sp_packet(void)
+ 	memcpy(sp_last, d, sizeof(d));
+ 	bool ready = d[0] & 0x80, tip = d[0] & 0x10, side = d[0] & 0x20;
+ 	if (!ready) {
++		if (sp_prox) {
++			sp_post(d, false);      /* one record when the pen leaves */
++		}
+ 		sp_prox = sp_tip = sp_side_down = false;
+ 		return;
+ 	}
+ 	if (!sp_prox) sp_hover++;
+ 	if (tip && !sp_tip) sp_tips++;
+-	if (side && !sp_side_down) sp_side++;
++	if (side && !sp_side_down) {
++		sp_side++;
++		if (sp_bits & 4) {
++			sp_buzz_rc = pong_haptic_pulse(sp_buzz_ms);
++			sp_buzzes++;
++		}
++	}
++	sp_post(d, true);
+ 	sp_prox = true;
+ 	sp_tip = tip;
+ 	sp_side_down = side;
+@@ -410,8 +466,16 @@ sp_bring_up(void)
+ }
+ 
+ static void
+-sp_thread(__unused void *arg, __unused wait_result_t wr)
++sp_thread(void *arg, __unused wait_result_t wr)
+ {
++	if (arg) {      /* started at boot: let the touch screen and the rest of the system come up first */
++		for (unsigned s = 0; s < sp_delay_s; s++) {
++			sp_sleep_ms(1000);
++		}
++	}
++	if ((sp_bits & 2) && !pong_touch_device_ready()) {
++		sp_bits &= ~2u;
++	}
+ 	if (!sp_bring_up()) {
+ 		return;
+ 	}
+@@ -492,13 +556,36 @@ pong_spen_usb(char *reply, size_t cap, const char *args)
+ 	    "spen st %d err 0x%x pins %02x>%02x i2c %u nack %u busy %u stretch %u boot %u\n"
+ 	    "query %s fw %04x mpu %02x max %ux%u p %u tilt %u/%u h %u\n"
+ 	    "pk %u co %u oth %u types 0x%x stuck %u rate %u best %u hover %u tips %u side %u pdct %u/%u hall %u/%u\n"
+-	    "last flags %02x %s%s%s%s x %u y %u p %u h %u tilt %d,%d\n",
++	    "last flags %02x %s%s%s%s x %u y %u p %u h %u tilt %d,%d\n"
++	    "bits %u xform %u cal %ux%u posted %u buzz %u ms %u rc %d\n",
+ 	    sp_stage, sp_err, sp_pins_before, sp_pins_after, sp_i2c_err, sp_nacks, sp_busy, sp_stretch, sp_boot_ack,
+ 	    sp_query_hex[0] ? sp_query_hex : "-", sp_fw, sp_mpu, sp_max_x, sp_max_y, sp_max_p, sp_tilt_x, sp_tilt_y, sp_height,
+ 	    sp_packets, sp_coords, sp_other, sp_types, sp_irq_stuck, sp_rate, sp_rate_best, sp_hover, sp_tips, sp_side,
+ 	    sp_pdct, sp_pdct_edges, sp_hall_v, sp_hall_edges,
+ 	    d[0], (d[0] & 0x80) ? "range" : "out", (d[0] & 0x10) ? " tip" : "", (d[0] & 0x20) ? " side" : "",
+-	    (d[0] & 0x40) ? " eraser" : "", x, y, p, d[7], (int)(int8_t)d[8], (int)(int8_t)d[9]);
++	    (d[0] & 0x40) ? " eraser" : "", x, y, p, d[7], (int)(int8_t)d[8], (int)(int8_t)d[9],
++	    sp_bits, sp_xform, sp_cal_x, sp_cal_y, sp_posted, sp_buzzes, sp_buzz_ms, sp_buzz_rc);
+ 	return 0;
+ }
++
++void
++pong_spen_init(void)
++{
++	thread_t th;
++	unsigned v;
++
++	if (PE_parse_boot_argn("pong_spen_xform", &v, sizeof(v))) sp_xform = v;
++	if (PE_parse_boot_argn("pong_spen_maxx", &v, sizeof(v))) sp_cal_x = v;
++	if (PE_parse_boot_argn("pong_spen_maxy", &v, sizeof(v))) sp_cal_y = v;
++	if (PE_parse_boot_argn("pong_spen_buzz", &v, sizeof(v)) && v >= 10 && v <= 1000) sp_buzz_ms = v;
++	if (PE_parse_boot_argn("pong_spen_delay", &v, sizeof(v)) && v <= 600) sp_delay_s = v;
++	if (!PE_parse_boot_argn("pong_spen", &v, sizeof(v)) || !v) {
++		return;
++	}
++	sp_bits = v;
++	if ((v & 1) && OSCompareAndSwap(0, 1, &sp_started) &&
++	    kernel_thread_start((thread_continue_t)sp_thread, (void *)1, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
+ #endif /* PONG */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 490c851..20a4b55 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1175,6 +1175,8 @@ bsd_init(void)
+ 		pong_buttons_init();
+ 	extern void pong_fts_init(void);
+ 	pong_fts_init();
++	extern void pong_spen_init(void);
++	pong_spen_init();
+ 	extern void pong_usb_ctl_init(void);
+ 	pong_usb_ctl_init();
+ 	extern void pong_cpu_perf_init(void);
+diff --git a/bsd/sys/pong_input.h b/bsd/sys/pong_input.h
+index 8921192..a24f179 100644
+--- a/bsd/sys/pong_input.h
++++ b/bsd/sys/pong_input.h
+@@ -13,6 +13,7 @@
+ #define PONG_POINTER_BUTTON 9
+ #define PONG_CONN_CHANGE 10
+ #define PONG_POINTER_SCROLL 11 /* pogo trackpad two-finger scroll: x, y = signed deltas (z112) */
++#define PONG_PEN 12 /* S Pen packet: x, y 0..65535, finger = pressure | tilt | flags (bsd/dev/pong_spen.c) */
+ #define PONG_BUTTON_POWER 0
+ #define PONG_BUTTON_VOLUME_UP 1
+ #define PONG_BUTTON_VOLUME_DOWN 2
