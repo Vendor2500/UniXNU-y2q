@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index 1664fc6..ea4965f 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -245,13 +245,13 @@ sl_crash(void)
+ 
+ /* ---- secure monitor: PIL service, resumed on INTERRUPTED, retried on busy (T970Sensors.cpp scm; interrupts stay on) ---- */
+ static int64_t
+-sl_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++sl_scm_svc(uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
+ {
+ 	int64_t out = -1000;
+ 
+ 	*r1 = 0;
+ 	for (unsigned busy = 0; busy < 20; busy++) {
+-		uint64_t first = qcom_scm_fn(QCOM_SCM_SVC_PIL, cmd), session = 0;
++		uint64_t first = qcom_scm_fn(svc, cmd), session = 0;
+ 		unsigned resumes = 0;
+ 
+ 		for (;;) {
+@@ -276,6 +276,21 @@ sl_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint6
+ 	}
+ 	return out;
+ }
++static int64_t
++sl_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	return sl_scm_svc(QCOM_SCM_SVC_PIL, cmd, arginfo, a, b, c, r1);
++}
++/* qcom_scm's __qcom_scm_is_call_available: the INFO service (6) asked about a SiP call (svc, cmd); 1 = implemented, 0 = not,
++ * negative = the INFO call itself failed (z121: tells "PAS_IS_SUPPORTED says no" from "that query is not served here"). */
++static int64_t
++sl_scm_avail(uint32_t svc, uint32_t cmd)
++{
++	uint64_t r1 = 0;
++	const int64_t r = sl_scm_svc(0x06u, 0x01u, qcom_scm_args(1, 0, 0, 0), 0x02000000u | (svc & 0xffu) << 8 | (cmd & 0xffu), 0, 0, &r1);
++
++	return r ? (r < 0 ? r : -r) : (int64_t)r1;
++}
+ /* Interrupts stay on, as sl_scm (the GPU's gz_scm masks them; a large image's auth takes long). */
+ int64_t
+ pong_q6_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
+@@ -1049,6 +1064,18 @@ pong_slpi_usb(char *reply, size_t cap, const char *args)
+ 		if (fe != -1) {
+ 			sl_close(&f);
+ 		}
++		/* z121: pas12 read 0/0 on the device (11-16). Controls: PAS 13 (the GPU zap, authenticated on this tablet 11-15) and
++		 * PAS 1 (the ADSP) through the same query, and whether TrustZone serves the query and the boot calls at all. */
++		{
++			uint64_t s1 = 0, s13 = 0;
++			const int64_t p1 = sl_scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), 1, 0, 0, &s1);
++			const int64_t p13 = sl_scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), 13, 0, 0, &s13);
++
++			SL_ADD(" pas1=%lld/%llu pas13=%lld/%llu avail=sup:%lld init:%lld auth:%lld", (long long)p1, (unsigned long long)s1,
++			    (long long)p13, (unsigned long long)s13, (long long)sl_scm_avail(QCOM_SCM_SVC_PIL, QCOM_SCM_PAS_IS_SUPPORTED),
++			    (long long)sl_scm_avail(QCOM_SCM_SVC_PIL, QCOM_SCM_PAS_INIT_IMAGE),
++			    (long long)sl_scm_avail(QCOM_SCM_SVC_PIL, QCOM_SCM_PAS_AUTH_AND_RESET));
++		}
+ 		SL_ADD(" stage=%d next=%s\n", sl.stage, sl_started ? "slpi stat" : "slpi boot");
+ 	}
+ 	return 0;
