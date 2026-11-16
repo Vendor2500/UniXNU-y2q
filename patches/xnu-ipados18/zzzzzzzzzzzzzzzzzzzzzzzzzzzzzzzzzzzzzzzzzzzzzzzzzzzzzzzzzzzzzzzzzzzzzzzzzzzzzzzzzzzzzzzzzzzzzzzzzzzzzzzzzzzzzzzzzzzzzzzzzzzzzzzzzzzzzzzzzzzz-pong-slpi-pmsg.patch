@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index bfbbded..f445695 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -781,6 +781,12 @@ sl_router_rx(void *c, QcomGlinkChannel *ch, const uint8_t *data, uint32_t length
+ 		return;
+ 	}
+ 	pong_ssc_server(p.type, k.a, k.c, k.d);
++	if (p.type == T970_QRTR_BYE || p.type == T970_QRTR_DEL_SERVER) {
++		char line[64];      /* z140: the remote leaving (a PD restart or a crash) goes to pmsg */
++
++		snprintf(line, sizeof(line), "qrtr %s node %u svc %u", p.type == T970_QRTR_BYE ? "bye" : "del", p.src_node, k.a);
++		sl_log(line);
++	}
+ 	if (p.type == T970_QRTR_HELLO) {
+ 		sl.node = p.src_node;
+ 		if (!sl_hello_answered) {
+@@ -819,6 +825,16 @@ sl_service(void)
+ 				sl_ring(SL_CLIENT, QCOM_IPCC_SIGNAL_SMP2P);
+ 			}
+ 			sl.slave = value;
++			if (changed) {
++				/* z140: every change of the SLPI's state bits goes to pmsg with the uptime, so a tablet that drops off USB
++				 * after `slpi boot` (11-16, half83n, 2-3 min later) leaves in pstore whether the SLPI died first */
++				char line[64];
++				uint64_t ns = 0;
++
++				absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++				snprintf(line, sizeof(line), "slave %x -> %x at %llu s", value ^ changed, value, (unsigned long long)(ns / 1000000000u));
++				sl_log(line);
++			}
+ 			if (changed & value & SL_FATAL) {
+ 				sl_crash();
+ 			}
