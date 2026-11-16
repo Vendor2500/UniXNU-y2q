@@ -1,0 +1,129 @@
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+index 170bff3..dc40ae4 100644
+--- a/bsd/dev/pong_backlight_t970.c
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -48,6 +48,7 @@ extern uint64_t mach_absolute_time(void);
+ int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level);
+ int pong_backlight_set_dbv(uint32_t dbv);
+ void pong_backlight_svc_state(uint32_t state, uint32_t ms);
++void pong_panel_power_request(uint64_t state);
+ 
+ /* ---- addresses ---------------------------------------------------------------------------- */
+ /* One 0x4000 window at ae94000 (one ml_io_map call). Every register this file touches is inside the
+@@ -95,6 +96,10 @@ static int g_bl_quiet;  /* set while the iOS service sends: no per-write pmsg ma
+  * class, 2 the class never appeared, 3 class found, 4 the service failed to start, 5 registered; ms: the wait.
+  * sets/fail/last: requests that reached pong_backlight_set_dbv, how many did not go out, the last value. */
+ static uint32_t g_bl_svc_state, g_bl_svc_ms, g_bl_svc_sets, g_bl_svc_fail, g_bl_svc_last;
++/* The window server's display power requests (framebuffer selector 12), for the USB `bl` reply: how many, the last
++ * value, and -- only with boot-arg pong_fb_power=1 -- DCS display-off/on packets sent and failed, panel now off. */
++static uint32_t g_pw_reqs, g_pw_last = ~0u, g_pw_sent, g_pw_fail;
++static int g_pw_off;
+ 
+ /* ---- small helpers ------------------------------------------------------------------------ */
+ /* Strict 32-bit volatile helpers with barriers; no memcpy/memmove on Device memory. */
+@@ -316,8 +321,10 @@ pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t level)
+ 		const uint32_t tpg = bl_rd32(BL_REG_TPG_CTRL);
+ 
+ 		snprintf(reply, reply_cap,
+-		    "[PONG_BL] rd hw=%08x ctrl=%08x status=%08x dma=%08x int=%08x tpg=%08x svc=%u/%ums sets=%u fail=%u last=%u\n",
+-		    hw, ctrl, status, dma, intr, tpg, g_bl_svc_state, g_bl_svc_ms, g_bl_svc_sets, g_bl_svc_fail, g_bl_svc_last);
++		    "[PONG_BL] rd hw=%08x ctrl=%08x status=%08x dma=%08x int=%08x tpg=%08x svc=%u/%ums sets=%u fail=%u last=%u "
++		    "pwr=%u/%d sent=%u fail=%u off=%d\n",
++		    hw, ctrl, status, dma, intr, tpg, g_bl_svc_state, g_bl_svc_ms, g_bl_svc_sets, g_bl_svc_fail, g_bl_svc_last,
++		    g_pw_reqs, (int)g_pw_last, g_pw_sent, g_pw_fail, g_pw_off);
+ 		bl_pmsg(reply);
+ 		return 0;
+ 	}
+@@ -493,4 +500,63 @@ pong_backlight_set_dbv(uint32_t dbv)
+ 	__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
+ 	return rc;
+ }
++
++/*
++ * The window server asked for the display to be powered off or on (IOMobileFramebuffer selector 12, its first
++ * scalar). Always counted and remembered for the USB `bl` reply, so a locked/unlocked device shows what value
++ * backboardd really sends. Only with boot-arg pong_fb_power=1 is the panel told: MIPI DCS 0x28 (display off) for 0,
++ * 0x29 (display on) for anything else, on a change only, through the same FIFO transport and in-flight guard as the
++ * brightness writes. Display off keeps the panel initialised (no sleep-in, no reset), so 0x29 alone brings it back.
++ * ponytail: value semantics (0 = off) assumed until the counters confirm it on the device; default off for that.
++ */
++void
++pong_panel_power_request(uint64_t state)
++{
++	static int enabled = -1;
++	const int off = state == 0;
++
++	g_pw_reqs++;
++	g_pw_last = (uint32_t)state;
++	if (enabled < 0) {
++		int v = 0;
++
++		enabled = PE_parse_boot_argn("pong_fb_power", &v, sizeof(v)) && v;
++	}
++	if (!enabled || off == g_pw_off) {
++		return;
++	}
++	for (int tries = 0; __atomic_exchange_n(&g_bl_busy, 1, __ATOMIC_ACQUIRE); tries++) {
++		if (tries == 50) {
++			g_pw_fail++;            /* a brightness write held the FIFO for 50 ms: the next request retries */
++			return;
++		}
++		bl_spin_us(1000);
++	}
++	g_bl_quiet = 1;
++	if (!g_bl_dsi) {
++		g_bl_dsi = ml_io_map(BL_DSI0_PHYS, BL_DSI0_WINDOW);
++	}
++	int rc = -1;
++	if (g_bl_dsi) {
++		const uint32_t hw = bl_rd32(BL_REG_HW_VERSION);
++		const uint32_t ctrl = bl_rd32(BL_REG_CTRL);
++		const uint32_t tpg = bl_rd32(BL_REG_TPG_CTRL);
++
++		if (hw && hw != ~0u && (ctrl & 1u) && !(tpg & 1u)) {
++			const uint8_t dcs = off ? 0x28 : 0x29;
++			uint32_t words[2];
++			unsigned int step = 1;
++
++			rc = bl_send(words, bl_pack(&dcs, 1u, words, 2), &step);
++		}
++	}
++	if (rc) {
++		g_pw_fail++;
++	} else {
++		g_pw_sent++;
++		g_pw_off = off;
++	}
++	g_bl_quiet = 0;
++	__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
++}
+ #endif /* PONG */
+\ No newline at end of file
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 33169cd..49a987a 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -58,6 +58,7 @@ extern "C" void pong_scanout_idle(void);
+ extern "C" void pong_backlight_start(IOService *display);
+ #endif
+ extern "C" void pong_backlight_t970_start(IOService *display);
++extern "C" void pong_panel_power_request(uint64_t state);       /* bsd/dev/pong_backlight_t970.c */
+ extern "C" int pong_mmio_quiet;
+ 
+ 
+@@ -1496,10 +1497,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kFBMethodSwapWait:
+         if(args->scalarInputCount!=3 || args->scalarInput[0]>UINT32_MAX)return kIOReturnBadArgument;
+         return fOwner->waitSwap((uint32_t)in[0],(uint32_t)in[1],in[2]);
++	case kFBMethodRequestPowerChange:
++		if (args->scalarInputCount >= 1) {
++			pong_panel_power_request(in[0]);
++		}
++		return kIOReturnSuccess;
+ 	case kFBMethodSwapSignal:
+ 	case kFBMethodSwapCancel:
+ 	case kFBMethodSwapCancelAll:
+-	case kFBMethodRequestPowerChange:
+ 	case kFBMethodChangeFrameInfo:
+ 		return kIOReturnSuccess;
+ 
