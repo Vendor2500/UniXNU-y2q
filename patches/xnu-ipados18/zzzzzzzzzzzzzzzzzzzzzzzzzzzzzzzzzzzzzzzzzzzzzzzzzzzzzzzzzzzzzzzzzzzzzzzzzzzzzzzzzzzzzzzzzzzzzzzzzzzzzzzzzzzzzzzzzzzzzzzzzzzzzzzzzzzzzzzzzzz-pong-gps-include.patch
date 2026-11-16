@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/pong_gps.c b/bsd/dev/pong_gps.c
+index 9dba5a8..ff9ed4c 100644
+--- a/bsd/dev/pong_gps.c
++++ b/bsd/dev/pong_gps.c
+@@ -32,6 +32,7 @@
+ #include <sys/errno.h>
+ #include <sys/fcntl.h>
+ #include <sys/uio.h>
++#include <sys/vnode.h>                           /* IO_NDELAY */
+ #include <sys/conf.h>
+ #include <sys/proc.h>
+ #include <miscfs/devfs/devfs.h>
