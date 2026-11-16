@@ -1,0 +1,82 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 73d7d9a..813b3af 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7889,6 +7889,40 @@ pong_var_seed_apply(proc_t p, user_addr_t scratch)
+ 		pong_ramoops_diagnostic_write(pmsg_line, plen < (int)sizeof(pmsg_line) ? plen : (int)sizeof(pmsg_line) - 1);
+ 	}
+ 	printf("Pong var seed: completed ok=%d fail=%d last_err=%d\n", ok_count, fail_count, last_err);
++
++	/*
++	 * boot-arg pong_tz=Area/City (absent = untouched): the time zone as tzd keeps it, the link
++	 * /var/db/timezone/localtime -> /var/db/timezone/zoneinfo/Area/City; zoneinfo itself is linked to /usr/share/zoneinfo
++	 * only when tzd has not made it. Rewritten every boot while the argument is there. Device-untested; whether timed or
++	 * tzd later puts their own zone back is the decision point (then: Settings > General > Date & Time by hand).
++	 */
++	char tz[64] = { 0 };
++	if (PE_parse_boot_arg_str("pong_tz", tz, sizeof(tz)) && tz[0] && tz[0] != '/' && !strnstr(tz, "..", sizeof(tz))) {
++		char target[128];
++		int32_t rv = 0;
++		static const char zoneinfo[] = "/private/var/db/timezone/zoneinfo", system_zones[] = "/usr/share/zoneinfo",
++		    localtime[] = "/private/var/db/timezone/localtime";
++		struct symlink_args sa = { .path = scratch + 0x600, .link = scratch + 0x800 };
++		struct unlink_args ua = { .path = scratch + 0x800 };
++		int zerr = -1, lerr = -1;
++
++		if (copyout(system_zones, scratch + 0x600, sizeof(system_zones)) == 0 &&
++		    copyout(zoneinfo, scratch + 0x800, sizeof(zoneinfo)) == 0) {
++			zerr = symlink(p, &sa, &rv);                    /* EEXIST when tzd made it: left alone */
++		}
++		snprintf(target, sizeof(target), "/var/db/timezone/zoneinfo/%s", tz);
++		if (copyout(target, scratch + 0x600, strlen(target) + 1) == 0 &&
++		    copyout(localtime, scratch + 0x800, sizeof(localtime)) == 0) {
++			(void)unlink(p, &ua, &rv);
++			lerr = symlink(p, &sa, &rv);
++		}
++		printf("Pong var seed: tz %s zoneinfo=%d localtime=%d\n", tz, zerr, lerr);
++		char line[96];
++		int n = snprintf(line, sizeof(line), "[PONG_TZ] %s zoneinfo=%d localtime=%d\n", tz, zerr, lerr);
++		if (n > 0) {
++			pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		}
++	}
+ }
+ #endif
+ 
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index 7474bd0..32d1541 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -803,6 +803,11 @@ static int autoIbusOff(void) {
+ 	}
+ 	return -2;
+ }
++/* pong_charge_stop=N (50..99, default 0 = off): at N % the charge current drops to 50 mA -- the cable still powers the
++ * tablet, the battery is held near N -- and goes back to the cable's limit below N - 5 %. Like a stock iPad's "Limit to
++ * 80%". Device-untested. */
++static unsigned gChargeStop;
++static bool gChargeHeld;
+ static int applyChargeLimits(int decic, uint8_t *cc0Out, uint8_t *bcOut) {
+ 	uint8_t cc0 = 0, bc = 0, c06 = 0, c09 = 0, c02 = 0, c12 = 0;
+ 	int in = 500, chg = 500, rpIn = 0, rpChg = 0, bcIn = 0, bcChg = 0;
+@@ -826,6 +831,11 @@ static int applyChargeLimits(int decic, uint8_t *cc0Out, uint8_t *bcOut) {
+ 		in = rpIn > bcIn ? rpIn : bcIn;
+ 		chg = rpChg > bcChg ? rpChg : bcChg;
+ 	}
++	if (gChargeStop && pong_battery_last_permille >= 0) {
++		if (pong_battery_last_permille >= int(gChargeStop * 10)) gChargeHeld = true;
++		else if (pong_battery_last_permille < int((gChargeStop - 5) * 10)) gChargeHeld = false;
++		if (gChargeHeld) chg = 50;
++	}
+ 	if (decic >= 500 || decic < 0) chg = 100;
+ 	else if (decic >= 450 && chg > 1000) chg = 1000;
+ 	if (in > 3200) in = 3200;
+@@ -959,6 +969,8 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 	int ibus = 0;
+ 	uint8_t lastCc0 = 0xff, lastBc = 0xff;
+ 	PE_parse_boot_argn("pong_charger_limits", &limits, sizeof(limits));
++	PE_parse_boot_argn("pong_charge_stop", &gChargeStop, sizeof(gChargeStop));
++	if (gChargeStop < 50 || gChargeStop > 99) gChargeStop = 0;
+ 	batteryPmsg("PONG_BATT cfg kick=%u sample_ticks=%u spin=%u\n", kick, sampleTicks, gT970Spin);
+ 	for (;;) {
+ 		if (kick == 1) {
