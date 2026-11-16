@@ -1,0 +1,134 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 7308b20..019f182 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2285,6 +2285,41 @@ struct execsw {
+  *	<ex_imgact>:???			[anything an imgact can return]
+  *	EDEADLK				Process is being terminated
+  */
++#if defined(ARM64_BOARD_CONFIG_PONG) && (DEVELOPMENT || DEBUG)
++/* Boot argument pong_exec_var=1: exec /private/var/pong/exec<path> instead of <path> while that file exists, so a program
++ * (a replacement /usr/sbin/BlueTool, ...) is swapped over USB `fsput` without touching the system volume; deleting the file
++ * or dropping the argument brings the original back (z132). Returns a MAXPATHLEN kalloc_data buffer or NULL. */
++#define PONG_EXEC_VAR "/private/var/pong/exec"
++static char *
++exec_overlay_path(const char *path)
++{
++	static int enabled = -1;
++	vnode_t vp = NULLVP;
++	char *alt;
++
++	if (enabled < 0) {
++		int value = 0;
++		enabled = PE_parse_boot_argn("pong_exec_var", &value, sizeof(value)) && value == 1;
++	}
++	if (!enabled || path[0] != '/' || strncmp(path, "/private/var/", 13) == 0 || strncmp(path, "/var/", 5) == 0 ||
++	    sizeof(PONG_EXEC_VAR) + strlen(path) > MAXPATHLEN) {
++		return NULL;
++	}
++	alt = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (alt == NULL) {
++		return NULL;
++	}
++	strlcpy(alt, PONG_EXEC_VAR, MAXPATHLEN);
++	strlcat(alt, path, MAXPATHLEN);
++	if (vnode_lookup(alt, 0, &vp, vfs_context_kernel()) != 0) {
++		kfree_data(alt, MAXPATHLEN);
++		return NULL;
++	}
++	vnode_put(vp);
++	return alt;
++}
++#endif
++
+ static int
+ exec_activate_image(struct image_params *imgp)
+ {
+@@ -2295,6 +2330,7 @@ exec_activate_image(struct image_params *imgp)
+ 	int once = 1;   /* save SGUID-ness for interpreted files */
+ 	int i;
+ 	int itercount = 0;
++	char *overlay = NULL;   /* pong_exec_var: the Data volume copy looked up instead of excpath */
+ 	proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+ 
+ 	/*
+@@ -2320,8 +2356,11 @@ exec_activate_image(struct image_params *imgp)
+ 
+ 	ndp = kalloc_type(struct nameidata, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+ 
++#if defined(ARM64_BOARD_CONFIG_PONG) && (DEVELOPMENT || DEBUG)
++	overlay = exec_overlay_path(excpath);
++#endif
+ 	NDINIT(ndp, LOOKUP, OP_LOOKUP, FOLLOW | LOCKLEAF | AUDITVNPATH1,
+-	    UIO_SYSSPACE, CAST_USER_ADDR_T(excpath), imgp->ip_vfs_context);
++	    UIO_SYSSPACE, CAST_USER_ADDR_T(overlay ? overlay : excpath), imgp->ip_vfs_context);
+ 
+ again:
+ 	error = namei(ndp);
+@@ -2468,6 +2507,9 @@ bad_notrans:
+ 		nameidone(imgp->ip_ndp);
+ 	}
+ 	kfree_type(struct nameidata, ndp);
++	if (overlay) {
++		kfree_data(overlay, MAXPATHLEN);
++	}
+ 
+ 	return error;
+ }
+@@ -5995,12 +6037,13 @@ sysctl_exec_inject(__unused struct sysctl_oid *oidp, __unused void *arg1,
+ SYSCTL_PROC(_kern, OID_AUTO, exec_inject, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_exec_inject, "A", "LIBRARY NAME... [; LIBRARY NAME...]");
+ 
+-/* Boot argument pong_ui18_var=1: insert the UI library from the Data volume (put there over USB `fsput`) instead of the
+- * read-only system copy, but only while that file exists, so a missing file leaves the old library in place (z125). */
+-#define PONG_UI18_SYS "/pong/libpong-ui18.dylib"
+-#define PONG_UI18_VAR "/private/var/pong/libpong-ui18.dylib"
++/* Boot argument pong_ui18_var=1: insert every /pong/<name> library (libpong-ui18, libpong-usb18, the audio codecs) from
++ * /private/var/pong/<name> on the Data volume (put there over USB `fsput`) instead of the read-only system copy, but only
++ * while that file exists, so a missing file leaves the old library in place (z125, all of /pong/ since z132). */
++#define PONG_LIB_SYS "/pong/"
++#define PONG_LIB_VAR "/private/var/pong/"
+ static bool
+-exec_inject_ui18_var(void)
++exec_inject_lib_var(const char *library, size_t liblen, char *alt, size_t altsize)
+ {
+ 	static int enabled = -1;
+ 	vnode_t vp = NULLVP;
+@@ -6009,7 +6052,14 @@ exec_inject_ui18_var(void)
+ 		int value = 0;
+ 		enabled = PE_parse_boot_argn("pong_ui18_var", &value, sizeof(value)) && value == 1;
+ 	}
+-	if (!enabled || vnode_lookup(PONG_UI18_VAR, 0, &vp, vfs_context_kernel()) != 0) {
++	if (!enabled || liblen <= sizeof(PONG_LIB_SYS) - 1 || strncmp(library, PONG_LIB_SYS, sizeof(PONG_LIB_SYS) - 1) != 0 ||
++	    sizeof(PONG_LIB_VAR) + liblen - (sizeof(PONG_LIB_SYS) - 1) > altsize) {
++		return false;
++	}
++	strlcpy(alt, PONG_LIB_VAR, altsize);
++	memcpy(alt + sizeof(PONG_LIB_VAR) - 1, library + sizeof(PONG_LIB_SYS) - 1, liblen - (sizeof(PONG_LIB_SYS) - 1));
++	alt[sizeof(PONG_LIB_VAR) - 1 + liblen - (sizeof(PONG_LIB_SYS) - 1)] = 0;
++	if (vnode_lookup(alt, 0, &vp, vfs_context_kernel()) != 0) {
+ 		return false;
+ 	}
+ 	vnode_put(vp);
+@@ -6020,6 +6070,7 @@ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+ 	char conf[sizeof(exec_inject_conf)];
++	char alt[160];
+ 	const char *name, *p;
+ 	size_t used;
+ 	bool any = false;
+@@ -6042,10 +6093,9 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 			if ((size_t)(p - word) == imgp->ip_ndp->ni_cnd.cn_namelen &&
+ 			    p != word && strncmp(word, name, p - word) == 0) matched = true;
+ 		}
+-		if (matched && liblen == sizeof(PONG_UI18_SYS) - 1 && strncmp(library, PONG_UI18_SYS, liblen) == 0 &&
+-		    exec_inject_ui18_var()) {
+-			library = PONG_UI18_VAR;
+-			liblen = sizeof(PONG_UI18_VAR) - 1;
++		if (matched && exec_inject_lib_var(library, liblen, alt, sizeof(alt))) {
++			library = alt;
++			liblen = strlen(alt);
+ 		}
+ 		if (matched && liblen && *library == '/') {
+ 			if (used + (any ? 1 : 0) + liblen >= size) return false;
