@@ -1,0 +1,53 @@
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -266,6 +266,9 @@
+  *                           throttles the restarts, and a message to com.apple.fairplayd.versioned then waits: all five Settings
+  *                           freezes on 11-14 were a thread blocked there holding an unfair lock the main thread needed.
+  *   com.apple.bluetoothd    exits every 10 s (no Bluetooth transport yet); Settings > Bluetooth froze the same way.
++ * Optional, off by default, not yet tried on the device: boot argument pong_lp_extra bit 0 also disables
++ *   com.apple.spaceattributiond  restarted every 10 s on 11-14; StorageUI (Settings > General > iPad Storage) links its
++ *                                framework, so that screen is the likeliest to freeze the same way.
+  * launchd reads the file when it starts, so this takes effect from the next boot. Boot argument pong_launch_policy=0 writes an
+  * empty policy instead (everything enabled again on the boot after). ref/rui-gts7xlwifi package/BootWatchdogPolicy.c does the same.
+  */
+@@ -274,8 +277,18 @@
+     "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+     "<plist version=\"1.0\"><dict>";
+ static const char lp_jobs[] = "<key>com.apple.fairplayd.A2</key><true/><key>com.apple.bluetoothd</key><true/>";
++static const char lp_storage[] = "<key>com.apple.spaceattributiond</key><true/>";   /* pong_lp_extra bit 0 */
+ static const char lp_tail[] = "</dict></plist>\n";
+ 
++static uint32_t
++lp_extra(void)
++{
++	uint32_t v = 0;
++
++	(void)PE_parse_boot_argn("pong_lp_extra", &v, sizeof(v));
++	return v;
++}
++
+ static int
+ lp_put(const char *path, const char *data, size_t len, int trunc)
+ {
+@@ -306,7 +319,8 @@
+ lp_write(int disable)
+ {
+ 	char body[512];
+-	int n = snprintf(body, sizeof(body), "%s%s%s", lp_head, disable ? lp_jobs : "", lp_tail);
++	int n = snprintf(body, sizeof(body), "%s%s%s%s", lp_head, disable ? lp_jobs : "",
++	    disable && (lp_extra() & 1) ? lp_storage : "", lp_tail);
+ 	int e;
+ 
+ 	if (n <= 0 || n >= (int)sizeof(body)) {
+@@ -333,8 +347,9 @@
+ 	} else if (args && strncmp(args, "clear", 5) == 0) {
+ 		(void)lp_write(0);
+ 	}
+-	(void)snprintf(reply, cap, "launchpolicy: %s (rc %d); disables com.apple.fairplayd.A2, com.apple.bluetoothd from the next boot\n",
+-	    wt.lp_rc < 0 ? "not written this boot" : wt.lp_rc == 0 ? "written" : "write failed", wt.lp_rc);
++	(void)snprintf(reply, cap, "launchpolicy: %s (rc %d); disables com.apple.fairplayd.A2, com.apple.bluetoothd%s from the next boot\n",
++	    wt.lp_rc < 0 ? "not written this boot" : wt.lp_rc == 0 ? "written" : "write failed", wt.lp_rc,
++	    (lp_extra() & 1) ? ", com.apple.spaceattributiond" : "");
+ 	return wt.lp_rc > 0 ? -1 : 0;
+ }
+ 
