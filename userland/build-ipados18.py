@@ -51,7 +51,8 @@ LITE_EXCLUDED_JOBS = {
     'com.apple.cryptexd',
     'com.apple.routined',
     'com.apple.watchdogd',
-    'com.apple.locationd',
+    # com.apple.locationd is back (GPS / location, iOSPort work/gps_camera_scope/DESIGN.md); the kernel's launch policy
+    # keeps it disabled unless boot argument pong_loc bit 0 (bsd/dev/pong_wifi_tools.c lp_loc).
     'com.apple.identityservicesd',
     'com.apple.passd',
     'com.apple.thermalmonitord',
@@ -559,6 +560,13 @@ def jobs(root, cryptex, overlay, out, app_cryptex=None):
             # All selected definitions use this real canonical directory,
             # including launch angels. No /pong symlink changes cache keys.
             cached_jobs['/System/Library/LaunchDaemons/' + f.name] = job
+    # The location provider (userland/pong-locd.m): feeds locationd through CLSimulationManager. Runs only while its binary
+    # is on the Data volume (fsput /private/var/pong/pong-locd) and idles unless boot argument pong_loc bit 0.
+    locd = dict(Label='dev.unixnu.pong.locd', ProgramArguments=['/private/var/pong/pong-locd'], UserName='root',
+                KeepAlive={'PathState': {'/private/var/pong/pong-locd': True}}, ThrottleInterval=30,
+                StandardOutPath='/dev/console', StandardErrorPath='/dev/console')
+    put_plist(dest / 'dev.unixnu.pong.locd.plist', locd)
+    cached_jobs['/System/Library/LaunchDaemons/dev.unixnu.pong.locd.plist'] = locd
     cache['LaunchDaemons'] = cached_jobs
     # Retain the matching 18.x extension/bundle/tree schema and feature gates.
     # The restore policy reads this local cache directly; no stale stock
@@ -972,6 +980,18 @@ def compile_sleep(out, developer):
     return destination
 
 
+def compile_locd(out, developer):
+    """The location provider for locationd (CLSimulationManager); job dev.unixnu.pong.locd in jobs()."""
+    env = dict(os.environ, DEVELOPER_DIR=str(developer))
+    target = out / 'pong-locd'
+    run(['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64-apple-ios18.0', '-Os', '-fobjc-arc',
+         '-Wall', '-Wextra', '-Werror', '-Wl,-no_fixup_chains', '-framework', 'Foundation', '-framework', 'CoreLocation',
+         PROJECT / 'userland/pong-locd.m', '-o', target], env=env)
+    run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'dev.unixnu.pong.locd',
+         '--entitlements', PROJECT / 'userland/pong-locd.entitlements.plist', target])
+    return target
+
+
 def compile_sileo_registration(out, developer):
     env = dict(os.environ, DEVELOPER_DIR=str(developer))
     target = out / 'sileo-register'
@@ -1089,6 +1109,7 @@ def helper(a):
     signature = compile_init(out, a.developer, out / 'init')
     ui_library = compile_ui(out, a.developer)
     sleep_service = compile_sleep(out, a.developer)
+    compile_locd(out, a.developer)
     audio_plugin = compile_audio(out, a.developer)
     compile_sileo_registration(out, a.developer)
     compile_audio_route(out, a.developer)

@@ -65,6 +65,20 @@ jobs:
           codesign --verify --strict out/bt/BlueTool
           file out/bt/BlueTool
 
+      - name: compile the location provider (pong-locd, GPS / location, not tried on the device)
+        run: |
+          set -euo pipefail
+          # CLSimulationManager feeder for locationd: NMEA from /dev/pong_gps or a fixed place in location.txt;
+          # idles unless boot argument pong_loc bit 0. Deploy: fsput /private/var/pong/pong-locd (job dev.unixnu.pong.locd).
+          mkdir -p out/loc
+          xcrun --sdk iphoneos clang -target arm64-apple-ios18.0 -Os -fobjc-arc -Wall -Wextra -Werror \
+            -Wl,-no_fixup_chains -framework Foundation -framework CoreLocation userland/pong-locd.m -o out/loc/pong-locd
+          codesign --force --sign - --pagesize 4096 --identifier dev.unixnu.pong.locd \
+            --entitlements userland/pong-locd.entitlements.plist out/loc/pong-locd
+          codesign --verify --strict out/loc/pong-locd
+          codesign -d --entitlements - out/loc/pong-locd
+          file out/loc/pong-locd
+
       - name: inspect and document dylib
         run: |
           set -euo pipefail
@@ -161,4 +175,5 @@ jobs:
             out/audio/PongAudio.driver
             out/ui/ui-compile-command.json
             out/bt/BlueTool
+            out/loc/pong-locd
           if-no-files-found: error
