@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/pong_ssc.c b/bsd/dev/pong_ssc.c
+index 06196cb..bfd79f0 100644
+--- a/bsd/dev/pong_ssc.c
++++ b/bsd/dev/pong_ssc.c
+@@ -54,6 +54,23 @@ static struct {
+ 	int32_t last;               /* last response: QMI result << 16 | error, or 0x10000000 | SSC result */
+ } ssc;
+ 
++/* z122 diagnosis (11-16 on the device: 7 lookups answered, 7 events, no SUID): each event as msgid[/type:count], in order */
++static char ssc_seen[160];
++
++static void
++ssc_note(uint32_t msg_id, const char *type, int n)
++{
++	const size_t at = strnlen(ssc_seen, sizeof(ssc_seen));
++
++	if (at < sizeof(ssc_seen) - 1) {
++		if (type) {
++			snprintf(ssc_seen + at, sizeof(ssc_seen) - at, "%s%u/%s:%d", at ? " " : "", msg_id, type, n);
++		} else {
++			snprintf(ssc_seen + at, sizeof(ssc_seen) - at, "%s%u", at ? " " : "", msg_id);
++		}
++	}
++}
++
+ static int32_t pong_sensors[8];
+ SYSCTL_OPAQUE(_kern, OID_AUTO, pong_sensors, CTLFLAG_RD | CTLFLAG_LOCKED, pong_sensors, sizeof(pong_sensors), "I",
+     "SLPI light and gravity (pong_ssc.c)");
+@@ -61,6 +78,10 @@ SYSCTL_OPAQUE(_kern, OID_AUTO, pong_sensors, CTLFLAG_RD | CTLFLAG_LOCKED, pong_s
+ void
+ pong_ssc_enable(void)
+ {
++	/* z122: every `slpi ssc` asks again (a user PD that comes up late would answer the second time).
++	 * ponytail: written from the USB thread while the polling thread reads it; a race costs one duplicate lookup. */
++	ssc_seen[0] = '\0';
++	ssc.next = 0;
+ 	ssc.on = true;
+ }
+ 
+@@ -177,6 +198,7 @@ ssc_event(void *context, T970Suid suid, uint32_t msg_id, uint64_t timestamp, con
+ 		T970Suid found[4];
+ 		const int n = t970_sns_suid_event(payload, length, type, sizeof(type), found, 4);
+ 
++		ssc_note(msg_id, type[0] ? type : "?", n);
+ 		for (unsigned i = 0; n > 0 && i < SSC_NTYPES; i++) {
+ 			if (!strcmp(type, ssc_types[i])) {
+ 				ssc.suid_mask |= 1u << i;
+@@ -223,6 +245,7 @@ ssc_event(void *context, T970Suid suid, uint32_t msg_id, uint64_t timestamp, con
+ 	if (msg_id == T970_SNS_STD_ERROR_EVENT) {
+ 		ssc.errors++;
+ 	}
++	ssc_note(msg_id, NULL, 0);
+ }
+ 
+ void
+@@ -288,6 +311,11 @@ pong_ssc_stat(char *out, size_t cap)
+ 	if (n < 0) {
+ 		return 0;
+ 	}
++	if ((size_t)n < cap - 1) {
++		const int m = snprintf(out + n, cap - (size_t)n, " seen=[%s]", ssc_seen);
++
++		n += m > 0 ? m : 0;
++	}
+ 	return (size_t)n < cap ? (size_t)n : cap - 1;
+ }
+ #endif /* PONG */
