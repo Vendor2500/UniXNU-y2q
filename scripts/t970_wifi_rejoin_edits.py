@@ -32,6 +32,14 @@ REJOIN_EDITS = (
      '          log(6, "wifi-net: left, state %u", cur.state);\n'
      '        } }\n'
      '      gKeyed = hasKey; int r = nw_wifi_connect('),
+    # z96: the 22H374 daemon's state notices and switches, named from the shared cache's Apple80211 request table
+    # (work/dsc_ioc_names.py): 382 ABORT_SCAN (sent right before every ASSOCIATE), 383 SET_PROPERTY, 422 6G_MODE,
+    # 470 DHCP_RENEWAL_DATA, 471 MOVING_NETWORK, 473 MIMO_CONFIG, 481 HEARTBEAT (every 30 s), 483 EXTERNAL_POWER_STATE.
+    # All were answered "not supported" (102). The interface keeps none of that state; they are accepted, as the same
+    # tablet's UniXNU-gts7xlwifi T970WifiNet.cpp does for 383/470/471/473.
+    ('    case kScanCacheClear: case kLocale: case kCountryCode: case kPowerSave: case kAuthType: case kCipherKey: return 0;\n',
+     '    case kScanCacheClear: case kLocale: case kCountryCode: case kPowerSave: case kAuthType: case kCipherKey: return 0;\n'
+     '    case 382: case 383: case 422: case 470: case 471: case 473: case 481: case 483: return 0;   // 22H374 notices (z96)\n'),
 )
 
 REJOIN_TAIL = r'''
