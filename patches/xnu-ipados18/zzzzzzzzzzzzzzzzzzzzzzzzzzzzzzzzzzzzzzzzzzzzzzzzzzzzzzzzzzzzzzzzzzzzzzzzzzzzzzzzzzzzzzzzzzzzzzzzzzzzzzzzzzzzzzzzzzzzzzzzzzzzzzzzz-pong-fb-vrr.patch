@@ -1,0 +1,160 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 02dbf72..8abad3f 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -356,7 +356,8 @@ static TUNABLE(uint32_t, gAutorefresh, "fb_autorefresh", 0);
+  * DSC 2 x 1400 x 12), so only the panel's frequency register changes: DCS 0x60 0x20 (0x00: 60 Hz; stock on-command,
+  * JeyKul's s6tuum3 patch 0020), sent over the running link (pong_panel_dcs(), bsd/dev/pong_backlight_t970.c). Then
+  * INTF1's tear check counts lines at the 120 Hz mode's rate (Linux: vsync clock / (vtotal 1912 x 120)) and sends a
+- * frame on every TE pulse. fb_120hz=2: the DCS only, the tear check left as the UEFI set it.
++ * frame on every TE pulse. fb_120hz=2: the DCS only, the tear check left as the UEFI set it. fb_120hz=3: 60 or 120
++ * as the frames come (panelRateFrame()).
+  */
+ static TUNABLE(uint32_t, g120Hz, "fb_120hz", 0);
+ #define INTF_TEAR_SYNC_CONFIG_VSYNC 0x288       /* bits 0-18: vsync clocks a line; 19: count; 20: restart at the TE pin */
+@@ -368,6 +369,7 @@ static uint32_t         g120Sync[2];            /* INTF1's SYNC_CONFIG_VSYNC bef
+ 
+ #define PANEL_FRONT_PHYS        0x9c000000ull   /* the UEFI's framebuffer: "Display Reserved" (gts7xlwifiPkg MemoryMapLib) */
+ #define PANEL_RESERVED_END      0x9e400000ull   /* ... 36 MB, kept out of the kernel's memory */
++#define PANEL_DFPS_DATA         0x9e300000ull   /* ... whose last MB is the boot loader's dfps_data_region (live dts): no buffer there */
+ 
+ #define GCC_DISP_AHB_CBCR       0x0010b00cull   /* gcc_disp_ahb_clk: the bus clock of the display's clock controller */
+ #define DISPCC_BASE             0x0af00000ull
+@@ -819,6 +821,95 @@ panel120Hz(void)
+ 	    g120Sent == 0 ? "sent" : "NOT SENT", g120Sent, g120Sync[0], g120Sync[1]);
+ }
+ 
++/*
++ * fb_120hz=3: the refresh rate follows the frames, as ProMotion does it. A command-mode panel keeps
++ * showing what it was last sent, so the rate is the panel's own: 60 Hz while nothing moves, 120 as
++ * soon as frames come faster than 60 a second can show (their interval, averaged over the last few,
++ * under RATE_FAST_US), back to 60 when they slow down (over RATE_SLOW_US: video, a blinking cursor)
++ * or stop (RATE_IDLE_MS without one). The switch is the stock runtime command (samsung,vrr_tx_cmds:
++ * 60 20, no wait; 60 00 back) and INTF1's line counter for that mode; the DSI link stays as it is
++ * (the same rate for both modes). What iOS itself could say (selector 87, AnnounceNextSwapTimestamp;
++ * displayMaxRefreshInterval) is not used yet: work/gap_audit/DPU_TEST.md.
++ */
++#define RATE_FAST_US            12500           /* (80 a second) */
++#define RATE_SLOW_US            15000
++#define RATE_IDLE_MS            500             /* ponytail: fixed; a boot-arg when a device test says otherwise */
++static IOLock *         gRateLock;
++static thread_call_t    gRateIdle;
++static bool             gRateFast;              /* the panel at 120 now */
++static uint64_t         gRateLast, gRateAvgUs;  /* the last frame's time, the average interval */
++static uint32_t         gRateUp, gRateDown, gRateFailed;
++
++/* The panel to 120 (`fast`) or 60, with the line counter for it. With gRateLock held. */
++static void
++panelRateSet(bool fast)
++{
++	uint8_t freq[2] = { 0x60, (uint8_t) (fast ? 0x20 : 0x00) };
++	uint32_t sync;
++
++	if (fast == gRateFast) {
++		return;
++	}
++	if (pong_panel_dcs(freq, sizeof(freq)) != 0) {
++		gRateFailed++;
++		return;
++	}
++	if ((g120Sync[0] & (1u << 19)) && panelAlive("the refresh rate")) {
++		sync = fast ? (g120Sync[0] & ~0x7ffffu) | (VSYNC_CLOCK_HZ / (PANEL_120_VTOTAL * 120)) : g120Sync[0];
++		mdssWrite(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC, sync);
++	}
++	gRateFast = fast;
++	if (fast) {
++		gRateUp++;
++	} else {
++		gRateDown++;
++	}
++}
++
++static void
++panelRateIdle(thread_call_param_t, thread_call_param_t)
++{
++	IOLockLock(gRateLock);
++	panelRateSet(false);
++	gRateAvgUs = 0;
++	IOLockUnlock(gRateLock);
++}
++
++static void
++panelRateInit(void)
++{
++	g120Sync[0] = g120Sync[1] = mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC);
++	gRateLock = IOLockAlloc();
++	gRateIdle = thread_call_allocate(panelRateIdle, NULL);
++	IOLog("MiniIOMobileFramebuffer: dpu: fb_120hz=3: 60 Hz, 120 while frames come faster than every %u us (intf1 sync %#x)\n",
++	    RATE_FAST_US, g120Sync[0]);
++}
++
++/* A frame was put on the panel at `now` (fb_120hz=3). */
++static void
++panelRateFrame(uint64_t now)
++{
++	uint64_t us, deadline;
++
++	if (gRateLock == NULL || gRateIdle == NULL) {
++		return;
++	}
++	IOLockLock(gRateLock);
++	us = gRateLast != 0 ? micros(now) - micros(gRateLast) : 0;
++	gRateLast = now;
++	if (us != 0 && us < 200000) {
++		gRateAvgUs = gRateAvgUs == 0 ? us : (gRateAvgUs * 3 + us) / 4;
++		if (gRateAvgUs < RATE_FAST_US) {
++			panelRateSet(true);
++		} else if (gRateAvgUs > RATE_SLOW_US) {
++			panelRateSet(false);
++		}
++	}
++	IOLockUnlock(gRateLock);
++	clock_interval_to_deadline(RATE_IDLE_MS, kMillisecondScale, &deadline);
++	thread_call_enter_delayed(gRateIdle, deadline);
++}
++
+ /*
+  * The panel's controller set up as the boot-args ask: 120 Hz, autorefresh, then the pipes that show the
+  * framebuffer, the CTL path that has them, the scalers and the other buffers. Nothing is touched
+@@ -842,8 +933,10 @@ panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWi
+ 		IOLog("MiniIOMobileFramebuffer: dpu: the display block is without power or clock: not touched, one buffer\n");
+ 		return;
+ 	}
+-	if (g120Hz != 0) {
++	if (g120Hz == 1 || g120Hz == 2) {
+ 		panel120Hz();
++	} else if (g120Hz == 3) {
++		panelRateInit();                /* (60 Hz until frames come faster: panelRateFrame()) */
+ 	}
+ 	panelAutorefresh();
+ 	if (gFlip == 0) {
+@@ -884,7 +977,7 @@ panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWi
+ 		uint64_t phys = 0, mapped = (size + PAGE_MASK) & ~(uint64_t) PAGE_MASK;
+ 		uint8_t * virt = NULL;
+ 
+-		if (next + mapped <= PANEL_RESERVED_END) {
++		if (next + mapped <= PANEL_DFPS_DATA) {
+ 			/* (megabytes: more than the kernel's I/O map holds, which ml_io_map() takes from) */
+ 			virt = (uint8_t *) ml_io_map_unmappable((vm_offset_t) next, (vm_size_t) mapped, PANEL_WIMG_WCOMB);
+ 			phys = next;
+@@ -1010,7 +1103,9 @@ dpuReport(char * out, size_t cap)
+ 	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
+ 	DPU_SAY("last 5 s report: %u frames in %u ms, %u us each in the driver; %u flips, %u replaced; the panel was sent %u frames\n",
+ 	    gLastReport[0], gLastReport[1], gLastReport[2], gLastReport[3], gLastReport[4], gLastReport[5]);
+-	DPU_SAY("120hz: fb_120hz %u, DCS 60 20 answer %d, intf1 sync_config_vsync %x -> %x\n", g120Hz, g120Sent, g120Sync[0], g120Sync[1]);
++	DPU_SAY("120hz: fb_120hz %u, DCS 60 20 answer %d, intf1 sync_config_vsync %x -> %x now %x; adaptive: at %s, %u up %u down %u failed, "
++	    "frames every %llu us\n", g120Hz, g120Sent, g120Sync[0], g120Sync[1], mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC),
++	    gRateFast ? "120" : "60", gRateUp, gRateDown, gRateFailed, gRateAvgUs);
+ 	DPU_SAY("color: fb_color %u, scopes %x, inverted %d, remap %llu, %s; 8.8 matrix %d %d %d / %d %d %d / %d %d %d, offsets %d %d %d; %u SetMatrix calls\n",
+ 	    gColor, gColorScopes, gColorInvert, gColorRemap, gColorActive ? "applied" : "identity", gColorQ[0], gColorQ[1], gColorQ[2],
+ 	    gColorQ[3], gColorQ[4], gColorQ[5], gColorQ[6], gColorQ[7], gColorQ[8], gColorQ[9], gColorQ[10], gColorQ[11], gColorCalls);
+@@ -1946,6 +2041,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	if (drew && back >= 0) {
+ 		panelFlip((unsigned) back);     /* (on show from the next frame's start) */
+ 	}
++	if (drew && g120Hz == 3) {
++		panelRateFrame(began);          /* (fb_120hz=3: 120 while frames come fast) */
++	}
+ 	drawn = mach_absolute_time();
+ 	fSwapsShown++;
+ 	if (gTouchLat) {
