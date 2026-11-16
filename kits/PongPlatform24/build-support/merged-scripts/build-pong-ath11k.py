@@ -276,8 +276,7 @@ def t970_edits(gen, mhi, shared, out):
         ('\tif (drop) {\n\t\tdev_kfree_skb_any(msdu);\n\t\treturn;\n\t}\n\n\tath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);\n',
          '\tif (drop) {\n'
          '\t\tnw_wifi_t970_rxp[13]++;\n'
-         '\t\tif (!FIELD_GET(RX_ATTENTION_INFO1_MCAST_BCAST,\n'
-         '\t\t\t       __le32_to_cpu(ath11k_dp_rx_get_attention(ar->ab, rxcb->rx_desc)->info1)))\n'
+         '\t\tif (!ath11k_dp_rx_h_attn_is_mcbc(ar->ab, rxcb->rx_desc))\n'   # get_attention returns void * in 7.0
          '\t\t\tnw_wifi_t970_rxp[14]++;\n'
          '\t\tdev_kfree_skb_any(msdu);\n\t\treturn;\n\t}\n'
          '\tnw_wifi_t970_rxp[15]++;\n\n\tath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);\n'),
@@ -545,6 +544,9 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
         return obj.name if r.returncode else None
     with ThreadPoolExecutor(a.jobs) as pool: failed = [r for r in pool.map(compile, jobs) if r]
     (out / 'compile-commands.json').write_text(json.dumps(commands, indent=2) + '\n')
+    for name in failed:   # the logs stay on the runner; print their errors so CI shows them
+        log_text = (out / (Path(name).stem + '.log')).read_text()
+        print('== ' + name + '\n' + '\n'.join(l for l in log_text.splitlines() if 'error' in l)[:6000], flush=True)
     if failed: raise SystemExit('ath11k compile failures (retained .log): ' + ', '.join(failed))
     archive = out / 'libPongAth11k.a'
     linked = out / 'ath11k-combined.o'
