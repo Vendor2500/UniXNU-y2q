@@ -1,0 +1,1553 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 4222f46..9b82bbc 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -56,6 +56,7 @@ extern void pong_dump_task_threads_pmsg(task_t task, const char *comm, int pid,
+ extern void pong_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+ extern uint64_t pong_cpu_idle_mach(unsigned int cpu);
+ extern int pong_cpu_perf_status(char *out, size_t cap);
++extern int pong_cpu_perf_set(const char *what, int value);   /* `cpuperf limit C`, `cpuperf park 0|1` (z132) */
+ extern int pong_prefer_cluster;
+ extern kern_return_t pong_task_prefer_cluster(task_t task, uint32_t cluster_id);
+ extern task_t kernel_task;
+@@ -89,6 +90,10 @@ extern int pong_backlight_usb(char *reply, size_t reply_cap, int mode, uint32_t
+ /* IOPMPowerSource.cpp: battery temperature in tenths of a degree, -32768 until the gauge was read */
+ extern int pong_battery_last_decic;
+ extern int pong_battery_last_permille, pong_battery_last_ma;
++/* z132: coulomb counter (mAh) and its sample time, `chgoff` request and state (IOPMPowerSource.cpp) */
++extern int pong_battery_last_qh, pong_chg_hold_state;
++extern uint64_t pong_battery_last_at;
++extern volatile int pong_chg_hold_min;
+ extern uint8_t pong_charger_cnfg[14];      /* CHG_CNFG_00..12 as the battery thread last read them, [13] = valid */
+ /* pong_gpu_probe.c: staged Adreno 650 power/clock/SMMU/RBBM probe; one result line */
+ extern int pong_gpu_probe_usb(char *reply, size_t reply_cap, int mode);
+@@ -109,6 +114,7 @@ extern int pong_metal_diag_usb(char *out, size_t cap);   /* `metaldiag` (NativeA
+ extern int pong_gpu_diag_usb(char *reply, size_t cap);   /* `gpudiag` (bsd/kern/kern_exit.c, z93) */
+ extern int pong_wifi_join_usb(char *reply, size_t cap, const char *cmd);   /* `wifijoin` (pong_wifi_tools.c, z92) */
+ extern int pong_iobusy_usb(char *reply, size_t cap);   /* `iobusy` (IOService.cpp, z119) */
++extern int pong_keybag_usb(char *reply, size_t cap, const char *cmd);   /* `keybag [reset [erase]]` (MiniAppleKeyStore.cpp, z133) */
+ extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+@@ -296,6 +302,37 @@ static unsigned ncm_rsc[10];            /* transfer resource index per endpoint,
+ static unsigned ncm_activity;
+ static struct { unsigned rx, tx, rx_err, xfer_fail, ends, alt_sets, reqs, stalls; } ncm_st;
+ 
++/*
++ * USB mux (pclink, boot-arg pong_usb_mux; work/pclink_scope/PLAN.md). Bit 0 adds a vendor interface FF/FE/02 with one
++ * bulk pair (EP5 OUT/IN) after the CDC function(s): the usbmux interface a PC's usbmuxd claims. pong_usbmux.c speaks
++ * the protocol and connects each stream to 127.0.0.1:<port> (lockdownd 62078). The device is composite (IAD), PID
++ * 0x316f (0x3170 with NCM), and answers Microsoft OS 1.0 descriptors so Windows binds WinUSB to the mux interface by
++ * itself. Bit 1 sends VID 05AC PID 12AB instead, the id libimobiledevice's usbmuxd and macOS look for.
++ * The DMA buffer grows to 128 KiB; the mux uses only 0x5400-0x55ff and 0x10000-0x17fff.
++ */
++#define USB_DMA_MUX_BYTES       0x20000
++#define OFF_MUX_RX_TRB          0x5400
++#define OFF_MUX_TX_TRB          0x5500
++#define OFF_MUX_RX              0x10000
++#define OFF_MUX_TX              0x14000
++#define MUX_XFER_MAX            0x4000u
++#define EP_MUX_OUT              10
++#define EP_MUX_IN               11
++#define MS_VENDOR_CODE          0x20
++
++extern int pong_usbmux_init(void);
++extern void pong_usbmux_link(int up);
++extern void pong_usbmux_rx(const volatile uint8_t *p, unsigned len);
++extern unsigned pong_usbmux_tx(volatile uint8_t *dst, unsigned cap);
++extern int pong_usbmux_poll(void);
++extern int pong_usbmux_stat(char *out, size_t cap);
++
++static uint32_t usb_mux;                /* pong_usb_mux: bit 0 on, bit 1 Apple VID/PID */
++static int mux_init_rc = 1;
++static bool mux_on, mux_rx_active, mux_tx_active, mux_zlp;
++static unsigned mux_rsc[2];
++static struct { unsigned rx, tx, rx_err, xfer_fail, ends, ms_reqs; } mux_st;
++
+ /* State Variables */
+ static vm_offset_t tlmm_base;
+ static uint32_t cfg_sda, cfg_scl;
+@@ -817,6 +854,153 @@ ncm_ep_event(unsigned ep, unsigned kind, unsigned status)
+ 	}
+ }
+ 
++/* ---- USB mux function (pclink) ---- */
++static bool
++mux_xfer(unsigned ep, unsigned trb_off, unsigned buf_off, unsigned size)
++{
++	bool ok = ep_transfer(ep, trb_off, buf_off, size, DWC3_TRBCTL_NORMAL);
++	if (ok) mux_rsc[ep & 1] = (core_r(DWC3_DEPCMD(ep)) >> 16) & 0x7fu;
++	else mux_st.xfer_fail++;
++	return ok;
++}
++
++static void
++mux_arm_rx(void)
++{
++	if (mux_on && !mux_rx_active) {
++		mux_rx_active = mux_xfer(EP_MUX_OUT, OFF_MUX_RX_TRB, OFF_MUX_RX, MUX_XFER_MAX);
++	}
++}
++
++/* Unconfigured, reset or unplugged: transfers ended (ForceRM), endpoints off, every stream closed. */
++static void
++mux_stop(void)
++{
++	if (mux_init_rc != 0) return;
++	if (mux_rx_active) { ep_cmd(EP_MUX_OUT, 8u | (1u << 11) | (mux_rsc[0] << 16), 0, 0, 0); mux_st.ends++; }
++	if (mux_tx_active) { ep_cmd(EP_MUX_IN, 8u | (1u << 11) | (mux_rsc[1] << 16), 0, 0, 0); mux_st.ends++; }
++	if (mux_rx_active || mux_tx_active) spin_us(100);
++	mux_rx_active = mux_tx_active = mux_zlp = false;
++	if (mux_on) {
++		mux_on = false;
++		core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) & ~((1u << EP_MUX_OUT) | (1u << EP_MUX_IN)));
++	}
++	pong_usbmux_link(0);
++}
++
++/* SET_CONFIGURATION 1: the bulk pair is live from here (the interface has no alternate setting). */
++static bool
++mux_start(void)
++{
++	if (mux_init_rc != 0) return true;
++	if (!ep_config(EP_MUX_OUT, 2, ctl_packet_size) || !ep_config(EP_MUX_IN, 2, ctl_packet_size)) {
++		pmsg_log("[PONG_USB] mux: bulk endpoint config failed\n");
++		return false;
++	}
++	core_w(DWC3_DALEPENA, core_r(DWC3_DALEPENA) | (1u << EP_MUX_OUT) | (1u << EP_MUX_IN));
++	mux_on = true;
++	pong_usbmux_link(1);
++	mux_arm_rx();
++	pmsg_log("[PONG_USB] mux: interface on (bulk %u, rx %d)\n", ctl_packet_size, mux_rx_active);
++	return true;
++}
++
++/* Next frame to the host; a frame filling its last packet is followed by a zero-length packet (usbmuxd reads 16 KiB). */
++static void
++mux_pump_tx(void)
++{
++	if (!mux_on || mux_tx_active) return;
++	if (mux_zlp) {
++		mux_zlp = false;
++		mux_tx_active = mux_xfer(EP_MUX_IN, OFF_MUX_TX_TRB, OFF_MUX_TX, 0);
++		return;
++	}
++	unsigned n = pong_usbmux_tx((volatile uint8_t *)(dma_wcomb + OFF_MUX_TX), MUX_XFER_MAX);
++	if (n) {
++		mux_zlp = (n % ctl_packet_size) == 0;
++		mux_tx_active = mux_xfer(EP_MUX_IN, OFF_MUX_TX_TRB, OFF_MUX_TX, n);
++		ncm_activity++;
++	}
++}
++
++static void
++mux_ep_event(unsigned ep, unsigned kind, unsigned status)
++{
++	if (kind != DWC3_DEPEVT_XFERCOMPLETE) return;
++	ncm_activity++;
++	if (ep == EP_MUX_IN) {
++		mux_tx_active = false;
++		mux_st.tx++;
++		mux_pump_tx();
++	} else if (ep == EP_MUX_OUT && mux_rx_active) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		uint32_t residual = *(volatile uint32_t *)(dma_wcomb + OFF_MUX_RX_TRB + 8) & 0xffffff;
++		mux_rx_active = false;
++		if (!(status & 1) && residual <= MUX_XFER_MAX) {
++			mux_st.rx++;
++			pong_usbmux_rx((const volatile uint8_t *)(dma_wcomb + OFF_MUX_RX), MUX_XFER_MAX - residual);
++		} else {
++			mux_st.rx_err++;
++		}
++		mux_arm_rx();
++		mux_pump_tx();
++	}
++}
++
++/* The mux interface's number: after ACM (0-1) and, with NCM, after it (2-3). */
++static unsigned
++mux_interface(void)
++{
++	return usb_ncm ? 4 : 2;
++}
++
++/*
++ * Microsoft OS 1.0 descriptors (vendor request MS_VENDOR_CODE): wIndex 4 = extended compat ID (the mux function is
++ * WINUSB), wIndex 5 = extended properties (its DeviceInterfaceGUIDs, the GUID work/pclink_scope/usbmuxd_win.py opens).
++ * Returns the length written to out, 0 to stall.
++ */
++static unsigned
++mux_ms_descriptor(uint16_t idx, uint8_t *out)
++{
++	static const char name[] = "DeviceInterfaceGUIDs";
++	static const char guid[] = "{6F8A2C41-5B0E-4D37-9C21-7E5F3A0B9D54}";
++	unsigned n;
++
++	mux_st.ms_reqs++;
++	if (idx == 4) {
++		memset(out, 0, 40);
++		out[0] = 40;                    /* dwLength */
++		out[5] = 1;                     /* bcdVersion 1.00 */
++		out[6] = 4;                     /* wIndex */
++		out[8] = 1;                     /* bCount */
++		out[16] = (uint8_t)mux_interface();
++		out[17] = 1;
++		memcpy(out + 18, "WINUSB", 6);
++		return 40;
++	}
++	if (idx != 5) return 0;
++	const unsigned name_len = 2 * sizeof(name);           /* UTF-16 with its NUL */
++	const unsigned data_len = 2 * (sizeof(guid) + 1);     /* REG_MULTI_SZ: the string, NUL, final NUL */
++	const unsigned prop = 4 + 4 + 2 + name_len + 4 + data_len;
++	n = 10 + prop;
++	memset(out, 0, n);
++	out[0] = (uint8_t)n; out[1] = (uint8_t)(n >> 8);
++	out[5] = 1;                         /* bcdVersion 1.00 */
++	out[6] = 5;                         /* wIndex */
++	out[8] = 1;                         /* wCount */
++	uint8_t *p = out + 10;
++	p[0] = (uint8_t)prop;
++	p[4] = 7;                           /* REG_MULTI_SZ */
++	p[8] = (uint8_t)name_len;
++	p += 10;
++	for (unsigned i = 0; i < sizeof(name); i++) p[2 * i] = (uint8_t)name[i];
++	p += name_len;
++	p[0] = (uint8_t)data_len;
++	p += 4;
++	for (unsigned i = 0; i < sizeof(guid); i++) p[2 * i] = (uint8_t)guid[i];
++	return n;
++}
++
+ /*
+  * Class requests to the NCM communication interface (2). Returns -1 to stall, 0 for no data stage, 1 with
+  * *resp_len bytes in out for an IN data stage, 2 to take an OUT data stage (at most 64 bytes).
+@@ -952,12 +1136,46 @@ static void
+ device_descriptor(uint8_t *out)
+ {
+ 	memcpy(out, dev_desc, sizeof(dev_desc));
+-	if (usb_ncm) {
++	if (usb_ncm || usb_mux) {
+ 		out[4] = 0xef; out[5] = 0x02; out[6] = 0x01;
+-		out[10] = 0x6e;
++		out[10] = usb_mux ? (usb_ncm ? 0x70 : 0x6f) : 0x6e;
++	}
++	if (usb_mux & 2) {
++		out[8] = 0xac; out[9] = 0x05;   /* the VID/PID usbmuxd and macOS look for */
++		out[10] = 0xab; out[11] = 0x12;
+ 	}
+ }
+ 
++/*
++ * The configuration as sent. Without the mux it is cfg_desc or cfg_ncm unchanged; with it, the ACM function behind its
++ * IAD (cfg_ncm's first 75 bytes) or all of cfg_ncm, then the mux interface (FF/FE/02, OUT then IN, as usbmuxd expects).
++ */
++static unsigned
++config_descriptor(uint8_t *out)
++{
++	if (!usb_mux) {
++		if (usb_ncm) {
++			memcpy(out, cfg_ncm, sizeof(cfg_ncm));
++			return sizeof(cfg_ncm);
++		}
++		memcpy(out, cfg_desc, sizeof(cfg_desc));
++		return sizeof(cfg_desc);
++	}
++	unsigned n = usb_ncm ? sizeof(cfg_ncm) : 75;
++	uint8_t lo = (uint8_t)ctl_packet_size, hi = (uint8_t)(ctl_packet_size >> 8);
++	const uint8_t mux[23] = {
++		9, 4, (uint8_t)mux_interface(), 0, 2, 0xff, 0xfe, 0x02, 6,
++		7, 5, 0x05, 2, lo, hi, 0,
++		7, 5, 0x85, 2, lo, hi, 0
++	};
++	memcpy(out, cfg_ncm, n);
++	memcpy(out + n, mux, sizeof(mux));
++	n += sizeof(mux);
++	out[2] = (uint8_t)n; out[3] = (uint8_t)(n >> 8);
++	out[4] = (uint8_t)(mux_interface() + 1);
++	return n;
++}
++
+ static unsigned
+ string_descriptor(unsigned index, uint8_t *out)
+ {
+@@ -965,6 +1183,13 @@ string_descriptor(unsigned index, uint8_t *out)
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
+ 		return 4;
+ 	}
++	if (index == 0xee && usb_mux) {     /* Microsoft OS string: "MSFT100", vendor code */
++		static const char sig[] = "MSFT100";
++		out[0] = 18; out[1] = 3;
++		for (unsigned i = 0; i < 7; i++) { out[2 + 2 * i] = (uint8_t)sig[i]; out[3 + 2 * i] = 0; }
++		out[16] = MS_VENDOR_CODE; out[17] = 0;
++		return 18;
++	}
+ 	char mac[13];
+ 	if (index == 5) {   /* iMACAddress: the PC adapter's address, the tablet's en1 address + 1 */
+ 		static const char hex[] = "0123456789ABCDEF";
+@@ -979,7 +1204,8 @@ string_descriptor(unsigned index, uint8_t *out)
+ 	                  (index == 2) ? "SM-T970 iOS Control Port" :
+ 	                  (index == 3) ? "SM8250-GTS7XLWIFI" :
+ 	                  (index == 4) ? "SM-T970 USB Ethernet" :
+-	                  (index == 5) ? mac : "";
++	                  (index == 5) ? mac :
++	                  (index == 6) ? "SM-T970 USB Mux" : "";
+ 	unsigned len = (unsigned)strlen(str);
+ 	if (len > 32) len = 32;
+ 	out[0] = (uint8_t)(2 + 2 * len);
+@@ -1821,6 +2047,14 @@ cmd_handle_temp(void)
+ 		    pong_battery_last_permille % 10, pong_battery_last_ma);
+ 		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
+ 	}
++	if (pong_battery_last_qh != -32768) {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(pong_battery_last_at, &ns);
++		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " qh %d @%llus hold %d", pong_battery_last_qh,
++		    ns / NSEC_PER_SEC, pong_chg_hold_state);
++		n += k > 0 && k < (int)sizeof(reply) - n ? k : 0;
++	}
+ 	if (pong_charger_cnfg[13]) {
+ 		/* MAX77705 charger CHG_CNFG_00 (0xb7) .. CHG_CNFG_12 (0xc3), raw: nothing here changes them */
+ 		k = snprintf(reply + n, sizeof(reply) - (size_t)n, " | chg b7");
+@@ -2337,9 +2571,24 @@ dispatch_command(const char *cmd)
+ 	} else if (strcmp(cmd, "cpus") == 0) {
+ 		cmd_handle_cpus();
+ 	} else if (strcmp(cmd, "cpuperf") == 0) {
+-		char reply[256];
++		char reply[320];
+ 
+ 		send_str(pong_cpu_perf_status(reply, sizeof(reply)) > 0 ? reply : "cpuperf: no reply\n");
++	} else if (strncmp(cmd, "cpuperf limit ", 14) == 0 || strncmp(cmd, "cpuperf park ", 13) == 0) {
++		const bool limit = cmd[8] == 'l';
++		const char *p = cmd + (limit ? 14 : 13);
++
++		send_str(pong_cpu_perf_set(limit ? "limit" : "park", (int)parse_uint(&p)) == 0 ? "cpuperf: set\n" :
++		    "cpuperf: refused (needs pong_cpu_perf=3 or 4; limit 30..110)\n");
++	} else if (strncmp(cmd, "chgoff ", 7) == 0) {
++		/* z132: battery only for N minutes (0 ends it) with the cable in; the battery thread applies it within 10 s */
++		const char *p = cmd + 7;
++		char reply[96];
++
++		pong_chg_hold_min = (int)parse_uint(&p);
++		snprintf(reply, sizeof(reply), "chgoff: %d min requested, state now %d (see `temp` hold)\n", pong_chg_hold_min,
++		    pong_chg_hold_state);
++		send_str(reply);
+ 	} else if (strncmp(cmd, "prefer ", 7) == 0) {
+ 		cmd_handle_prefer(cmd + 7);
+ 	} else if (strcmp(cmd, "top") == 0) {
+@@ -2443,6 +2692,21 @@ dispatch_command(const char *cmd)
+ 		send_str(hp_reply[0] ? hp_reply : "buzz: no reply\n");
+ 	} else if (strcmp(cmd, "usbnet") == 0) {
+ 		cmd_handle_usbnet();
++	} else if (strcmp(cmd, "usbmux") == 0) {
++		/* pclink: the USB mux function and its streams (work/pclink_scope/PLAN.md) */
++		char reply[640];
++		int n;
++
++		if (mux_init_rc != 0) {
++			send_str("usbmux: off (boot-arg pong_usb_mux=1, or 3 for VID 05AC PID 12AB)\n");
++		} else {
++			n = snprintf(reply, sizeof(reply), "usbmux: mode %u on %d act rx %d tx %d zlp %d | usb rx %u tx %u rx_err %u "
++			    "xfer_fail %u ends %u ms_reqs %u | txfifo5 %08x\n", usb_mux, mux_on, mux_rx_active, mux_tx_active,
++			    mux_zlp, mux_st.rx, mux_st.tx, mux_st.rx_err, mux_st.xfer_fail, mux_st.ends, mux_st.ms_reqs,
++			    core_base ? core_r(0xC314) : 0);
++			if (n > 0 && (size_t)n < sizeof(reply)) pong_usbmux_stat(reply + n, sizeof(reply) - (size_t)n);
++			send_str(reply);
++		}
+ 	} else if (strcmp(cmd, "usbhost") == 0 || strncmp(cmd, "usbhost ", 8) == 0) {
+ 		cmd_handle_usbhost(cmd + 7);
+ 	} else if (strcmp(cmd, "usbrole") == 0 || strncmp(cmd, "usbrole ", 8) == 0) {
+@@ -2512,6 +2776,12 @@ dispatch_command(const char *cmd)
+ 
+ 		(void)pong_wifi_join_usb(wj_reply, sizeof(wj_reply), cmd);
+ 		send_str(wj_reply);
++	} else if (strncmp(cmd, "keybag", 6) == 0) {
++		static char kb_reply[640];
++
++		kb_reply[0] = '\0';
++		(void)pong_keybag_usb(kb_reply, sizeof(kb_reply), cmd);
++		send_str(kb_reply[0] ? kb_reply : "keybag: no reply\n");
+ 	} else if (strcmp(cmd, "iobusy") == 0) {
+ 		static char ib_reply[1500];
+ 
+@@ -2758,13 +3028,7 @@ handle_setup(void)
+ 			resp_len = sizeof(dev_desc);
+ 			break;
+ 		case 2: /* Configuration */
+-			if (usb_ncm) {
+-				memcpy(out, cfg_ncm, sizeof(cfg_ncm));
+-				resp_len = sizeof(cfg_ncm);
+-			} else {
+-				memcpy(out, cfg_desc, sizeof(cfg_desc));
+-				resp_len = sizeof(cfg_desc);
+-			}
++			resp_len = config_descriptor(out);
+ 			break;
+ 		case 3: /* String */
+ 			resp_len = string_descriptor(val & 0xff, out);
+@@ -2794,11 +3058,13 @@ handle_setup(void)
+ 		}
+ 		ctl_configured = (val != 0);
+ 		ncm_stop();
++		mux_stop();
+ 		if (ctl_configured) {
+ 			if (!ep_config(2, 2, ctl_packet_size) ||
+ 			    !ep_config(3, 2, ctl_packet_size) ||
+ 			    !ep_config(5, 3, 16) ||
+-			    (usb_ncm && !ep_config(EP_NCM_INT, 3, 16))) {
++			    (usb_ncm && !ep_config(EP_NCM_INT, 3, 16)) ||
++			    !mux_start()) {
+ 				stall_control();
+ 				return;
+ 			}
+@@ -2819,7 +3085,8 @@ handle_setup(void)
+ 	} else if (type == 0x02 && req == 1 && !len) {
+ 		/* CLEAR_FEATURE (ENDPOINT_HALT) */
+ 		unsigned ep = ((idx & 15) << 1) | ((idx >> 7) & 1);
+-		if (ep == 2 || ep == 3 || ep == 5 || (usb_ncm && ep >= EP_NCM_INT && ep <= EP_NCM_IN)) {
++		if (ep == 2 || ep == 3 || ep == 5 || (usb_ncm && ep >= EP_NCM_INT && ep <= EP_NCM_IN) ||
++		    (mux_init_rc == 0 && (ep == EP_MUX_OUT || ep == EP_MUX_IN))) {
+ 			ep_cmd(ep, DWC3_DEPCMD_CLEARSTALL, 0, 0, 0);
+ 		}
+ 		status_stage(1);
+@@ -2836,6 +3103,17 @@ handle_setup(void)
+ 		/* GET_STATUS (ENDPOINT) */
+ 		out[0] = 0; out[1] = 0;
+ 		resp_len = 2;
++	} else if (usb_mux && (type == 0xc0 || type == 0xc1) && req == MS_VENDOR_CODE) {
++		/* Microsoft OS 1.0: Windows binds WinUSB to the mux interface */
++		resp_len = mux_ms_descriptor(idx, out);
++		if (!resp_len) {
++			stall_control();
++			return;
++		}
++	} else if ((usb_mux & 2) && type == 0xc0 && req == 0x45 && len) {
++		/* macOS's Apple-device configuration query (Pong services139): one configuration, which is current */
++		out[0] = 1; out[1] = 1; out[2] = 1; out[3] = 0;
++		resp_len = 4;
+ 	} else if (usb_ncm && (type & 0x7f) == 0x21 && (idx & 0xff) == 2) {
+ 		/* CDC-NCM class request to its communication interface */
+ 		int r = ncm_class_request(type, req, val, len, out, &resp_len);
+@@ -2942,6 +3220,10 @@ handle_ep_event(uint32_t event)
+ 		ncm_ep_event(ep, kind, status);
+ 		return;
+ 	}
++	if (mux_init_rc == 0 && (ep == EP_MUX_OUT || ep == EP_MUX_IN)) {
++		mux_ep_event(ep, kind, status);
++		return;
++	}
+ 	if (ep >= 2) {
+ 		if (kind == DWC3_DEPEVT_XFERCOMPLETE) {
+ 			if (ep == 3) {
+@@ -3050,6 +3332,7 @@ process_events(void)
+ 			switch (dev_evt) {
+ 			case 0: /* Disconnect */
+ 				ncm_stop();
++				mux_stop();
+ 				ctl_configured = false;
+ 				ctl_dtr = false;
+ 				ctl_rts = false;
+@@ -3065,6 +3348,7 @@ process_events(void)
+ 				}
+ 				core_w(DWC3_DCFG, core_r(DWC3_DCFG) & ~(127u << 3));
+ 				ncm_stop();
++				mux_stop();
+ 				reset_endpoints();
+ 				break;
+ 			case 2: { /* Connection speed done */
+@@ -3248,6 +3532,9 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 	PE_parse_boot_argn("pong_usb_ncm", &usb_ncm, sizeof(usb_ncm));
+ 	usb_ncm &= 1;
+ 	if (usb_ncm) usb_dma_bytes = USB_DMA_NCM_BYTES;
++	PE_parse_boot_argn("pong_usb_mux", &usb_mux, sizeof(usb_mux));
++	usb_mux = (usb_mux & 1) ? (usb_mux & 3) : 0;
++	if (usb_mux) usb_dma_bytes = USB_DMA_MUX_BYTES;
+ 	pmsg_log("[PONG_USB] step 4: allocating DMA contiguous buffer (%u KiB, ncm %u)...\n", usb_dma_bytes / 1024, usb_ncm);
+ 	dma_phys = 0;
+ 	dma_virt = IOMallocContiguous(usb_dma_bytes, 4096, &dma_phys);
+@@ -3313,6 +3600,11 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 		int rc = pong_usbnet_attach();
+ 		pmsg_log("[PONG_USB] ncm: en1 attach %d (0 = ok); composite device PID 316e\n", rc);
+ 	}
++	if (usb_mux) {
++		mux_init_rc = pong_usbmux_init();
++		if (mux_init_rc != 0) usb_mux = 0;     /* no buffers: the device stays as without the argument */
++		pmsg_log("[PONG_USB] mux: init %d, mode %u\n", mux_init_rc, usb_mux);
++	}
+ 
+ 	device_start();
+ 
+@@ -3326,6 +3618,10 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 		}
+ 		fwput_check_timeout();
+ 		ncm_pump_tx();
++		if (mux_init_rc == 0) {
++			if (pong_usbmux_poll()) ncm_activity++;
++			mux_pump_tx();
++		}
+ 		{
+ 			static char boot_timeout_reply[96];
+ 
+@@ -3344,7 +3640,7 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 				seen = ncm_activity;
+ 				quiet = 0;
+ 			}
+-			if (ncm_alt == 1 && quiet < 500) {
++			if ((ncm_alt == 1 || mux_on) && quiet < 500) {
+ 				quiet++;
+ 				delay_for_interval(100, NSEC_PER_USEC);
+ 			} else {
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 0068605..1a3003a 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -1508,6 +1508,46 @@ wj_file(struct wj_record *r, int write)
+ 	return e;
+ }
+ 
++/*
++ * Passcode keybag (z133, iokit/Kernel/MiniAppleKeyStore.cpp): read or write len bytes at off of a file with the kernel's
++ * credentials (the caller may be SpringBoard), created root 0600, synced after a write. buf NULL: does path exist.
++ */
++int pong_kfile_rw(const char *path, void *buf, int len, long long off, int write);
++int
++pong_kfile_rw(const char *path, void *buf, int len, long long off, int write)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int e;
++
++	if (buf == NULL) {
++		e = vnode_lookup(path, 0, &vp, ctx);
++		if (e == 0) {
++			vnode_put(vp);
++		}
++		return e;
++	}
++	e = vnode_open(path, write ? (O_CREAT | FWRITE | O_NOFOLLOW) : (FREAD | O_NOFOLLOW), S_IRUSR | S_IWUSR,
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (e == 0) {
++		int resid = 0, e2;
++
++		e = vn_rdwr(write ? UIO_WRITE : UIO_READ, vp, (caddr_t)buf, len, (off_t)off, UIO_SYSSPACE,
++		    IO_NODELOCKED | (write ? IO_UNIT | IO_SYNC : 0), vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (e == 0 && resid != 0) {
++			e = EIO;
++		}
++		if (e == 0 && write) {
++			e = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		}
++		e2 = vnode_close(vp, write ? FWRITE : FREAD, ctx);
++		if (e == 0) {
++			e = e2;
++		}
++	}
++	return e;
++}
++
+ static void
+ wifi_join_loop(void)
+ {
+diff --git a/iokit/Kernel/MiniAppleKeyStore.cpp b/iokit/Kernel/MiniAppleKeyStore.cpp
+index f5bf967..93c2305 100644
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -2,10 +2,33 @@
+  * Pong development AppleKeyStore compatibility service, adapted from the
+  * supplied MiniAppleKeyStore from the earlier port.
+  *
+- * This is explicitly a volatile software keybag with no passcode and no
+- * hardware-backed secrets. It implements the earlier port's complete development
+- * keybag protocol, including reversible software wrapping, so MobileKeyBag
+- * and keychain clients can run without a SEP. Wrapping is not encryption.
++ * Default (boot argument pong_keybag_passcode absent or 0): a volatile software
++ * keybag with no passcode and no hardware-backed secrets, exactly as before. It
++ * implements the earlier port's development keybag protocol, including
++ * reversible software wrapping ("HKwr"), so MobileKeyBag and keychain clients
++ * run without a SEP. That wrapping is not encryption.
++ *
++ * Passcode keybag (z133, pong_keybag_passcode=1 with pong_software_keybag=1;
++ * design work/passcode_scope/PLAN.md):
++ *  - /private/var/pong/keybag (Data volume, root 0600) holds three random class
++ *    keys: A (classes 1 2 7 10 13, usable while unlocked), C (3 8 11, after the
++ *    first unlock since boot) and D (everything else, always). The file has two
++ *    checksummed slots written alternately, so a torn write keeps the previous one.
++ *  - With a passcode, keys A and C are stored XORed with HMAC(KEK, ...) where
++ *    KEK = PBKDF2-HMAC-SHA256(passcode, salt, 100000), plus a KEK verifier. On lock
++ *    key A is wiped from memory; after a reboot A and C stay absent until the first
++ *    unlock. There is no hardware key: whoever copies the file can try passcodes
++ *    offline at the KDF's cost, so short passcodes give little offline protection.
++ *  - New wraps are "P" blobs, same size as before (8 + key): 'P', class, 6-byte
++ *    HMAC tag over the key (synthetic IV), key XOR an HMAC-SHA256 key stream.
++ *    Old "HKwr" blobs still unwrap (migration), gated by the same lock rules.
++ *  - Wrong passcodes count; from the 6th the next try waits 60 s, then 300, 900,
++ *    3600 (no wipe, no permanent block). The count and wait survive reboots.
++ *  - Rollback: remove the boot argument. Locks, passcode checks and new "P" wraps
++ *    stop; "P" blobs of class D, and of every class if the passcode was removed
++ *    first, still unwrap from the file. USB `keybag reset` removes the passcode
++ *    while unlocked; `keybag reset erase` also replaces keys that are not in memory.
++ *  - USB `keybag` shows the state and the last calls (selector, process, result).
+  */
+ #include <pexpert/arm64/board_config.h>
+ #if defined(PONG) && (DEVELOPMENT || DEBUG) && !SECURE_KERNEL
+@@ -14,87 +37,661 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/crypto/sha2.h>
++#include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ 
+ #include "MiniDrivers.h"
+ 
+-enum {
+-	kAKSOpenCheck           = 0x00,
+-	kAKSGetLockState        = 0x07,
+-	kAKSLockDevice          = 0x08,
+-	kAKSUnlockDevice        = 0x09,
+-	kAKSWrapKey             = 0x0a,
+-	kAKSUnwrapKey           = 0x0b,
+-	kAKSUnlockBag           = 0x0c,
+-	kAKSGetSystem           = 0x0e,
+-	kAKSGetDeviceState      = 0x11,
+-	kAKSGetBagUUID          = 0x17,
+-	kAKSAssertHold          = 0x1a,
+-	kAKSAssertDrop          = 0x1b,
+-	kAKSGetConfiguration    = 0x1f,
+-	kAKSLockDeviceNow       = 0x20,
+-	kAKSGetExtendedState    = 0x23,
+-	kAKSGeneration          = 0x28,
+-	kAKSAssertPromote       = 0x64,
+-	kAKSAssertConsume       = 0x65,
+-	kAKSNotifyStateSet      = 0x66,
+-	kAKSNotifyStateIsSet    = 0x67,
+-	kAKSPrewarm             = 0x73,
++extern "C" void read_random(void *buffer, unsigned int bytes);
++extern "C" int pong_kfile_rw(const char *path, void *buf, int len, long long off, int write);   /* bsd/dev/pong_wifi_tools.c */
++extern "C" int pong_kernel_mkdir(const char *path, int mode);                                   /* bsd/vfs/vfs_syscalls.c */
++
++static uint64_t
++kbMicros(void)
++{
++	uint64_t abs, ns;
++	clock_get_uptime(&abs);
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++static uint64_t
++kbNow(void)
++{
++	clock_sec_t s;
++	clock_usec_t u;
++	clock_get_calendar_microtime(&s, &u);
++	return (uint64_t)s;
++}
++
++/* ==== keybag core begin (work/passcode_scope/kb_selftest.sh also builds this part in user space) ==== */
++#define KB_PATH   "/private/var/pong/keybag"
++#define KB_DIR    "/private/var/pong"
++#define KB_DATA   "/private/var/mobile"   /* exists once the Data volume is mounted */
++#define KB_MAGIC  0x31424b50u             /* "PKB1" */
++#define KB_ITERS  100000u
++#define KB_PC_MAX 128
++#define KB_PASS   ((IOReturn)1)           /* not handled here: the volatile keybag answers */
++
++enum { KB_A, KB_C, KB_D, KB_TIERS };
++enum { KB_UNKNOWN, KB_LOADED, KB_BROKEN };
++
++struct kb_rec {
++	uint32_t magic, version;
++	uint64_t gen;
++	uint32_t has, iters, failed, pad;
++	uint64_t backoff_until, changed_at;
++	uint8_t salt[16], verifier[32], keys[KB_TIERS][32], sum[32];
+ };
+ 
+-#define kAKSStateFlags        0x6 /* no passcode, unlocked since boot */
+-#define kAKSLockStateDisabled 3
++static struct {
++	int on, state, slot, locked, once, lastErr;
++	uint32_t kdfMs;
++	uint64_t lastTry;
++	struct kb_rec rec;
++	uint8_t key[KB_TIERS][32];
++	bool have[KB_TIERS];
++} kb;
+ 
+-static uint64_t gAKSLogged[4];
+-static bool gAKSNotifyState;
++/* Match the upstream development format; the fixed pattern is not a secret. */
++static const uint8_t kWrapMark[4] = { 'H', 'K', 'w', 'r' };
++
++static void
++wrapMix(uint8_t *bytes, size_t length)
++{
++	for (size_t i = 0; i < length; i++) {
++		bytes[i] ^= (uint8_t)(0x5a + 37 * i);
++	}
++}
++
++static int
++kbTier(uint32_t cls)
++{
++	switch (cls & 0x1f) {
++	case 1: case 2: case 7: case 10: case 13: return KB_A;
++	case 3: case 8: case 11: return KB_C;
++	default: return KB_D;
++	}
++}
++
++struct kb_hmac { SHA256_CTX in, out; };
++
++static void
++kbHmacInit(struct kb_hmac *h, const uint8_t *key, size_t klen)
++{
++	uint8_t pad[64], k[32];
++	if (klen > 64) {
++		SHA256_CTX c;
++		SHA256_Init(&c);
++		SHA256_Update(&c, key, klen);
++		SHA256_Final(k, &c);
++		key = k;
++		klen = 32;
++	}
++	for (size_t i = 0; i < 64; i++) pad[i] = (uint8_t)((i < klen ? key[i] : 0) ^ 0x36);
++	SHA256_Init(&h->in);
++	SHA256_Update(&h->in, pad, 64);
++	for (size_t i = 0; i < 64; i++) pad[i] ^= 0x36 ^ 0x5c;
++	SHA256_Init(&h->out);
++	SHA256_Update(&h->out, pad, 64);
++	bzero(pad, sizeof(pad));
++	bzero(k, sizeof(k));
++}
++
++static void
++kbHmacRun(const struct kb_hmac *h, const void *a, size_t al, const void *b, size_t bl, uint8_t out[32])
++{
++	SHA256_CTX c = h->in;
++	if (al) SHA256_Update(&c, a, al);
++	if (bl) SHA256_Update(&c, b, bl);
++	SHA256_Final(out, &c);
++	c = h->out;
++	SHA256_Update(&c, out, 32);
++	SHA256_Final(out, &c);
++	bzero(&c, sizeof(c));
++}
++
++/* PBKDF2-HMAC-SHA256, one block. One trailing NUL is ignored so a C-string and a counted passcode match. */
++static void
++kbKdf(const uint8_t *pc, size_t len, const uint8_t salt[16], uint32_t iters, uint8_t out[32])
++{
++	static const uint8_t one[4] = { 0, 0, 0, 1 };
++	struct kb_hmac h;
++	uint8_t u[32];
++	uint64_t t0 = kbMicros();
++
++	if (len && pc[len - 1] == 0) len--;
++	kbHmacInit(&h, pc, len);
++	kbHmacRun(&h, salt, 16, one, 4, u);
++	memcpy(out, u, 32);
++	for (uint32_t i = 1; i < iters; i++) {
++		kbHmacRun(&h, u, 32, NULL, 0, u);
++		for (int j = 0; j < 32; j++) out[j] ^= u[j];
++	}
++	kb.kdfMs = (uint32_t)((kbMicros() - t0) / 1000);
++	bzero(&h, sizeof(h));
++	bzero(u, sizeof(u));
++}
++
++static void
++kbLabel(const uint8_t kek[32], const char *label, uint8_t idx, uint8_t out[32])
++{
++	struct kb_hmac h;
++	kbHmacInit(&h, kek, 32);
++	kbHmacRun(&h, label, 4, &idx, 1, out);
++	bzero(&h, sizeof(h));
++}
++
++static bool
++kbSame(const uint8_t *a, const uint8_t *b, size_t n)
++{
++	uint8_t d = 0;
++	for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i];
++	return d == 0;
++}
++
++/* kb.key[] (A and C must be present) -> kb.rec.keys/verifier; kek NULL stores them in the clear (no passcode). */
++static void
++kbSeal(const uint8_t *kek)
++{
++	uint8_t pad[32];
++	memcpy(kb.rec.keys, kb.key, sizeof(kb.rec.keys));
++	bzero(kb.rec.verifier, sizeof(kb.rec.verifier));
++	if (kek) {
++		kbLabel(kek, "PKBv", 0, kb.rec.verifier);
++		for (int t = KB_A; t < KB_D; t++) {
++			kbLabel(kek, "PKBk", (uint8_t)t, pad);
++			for (int j = 0; j < 32; j++) kb.rec.keys[t][j] ^= pad[j];
++		}
++	}
++	bzero(pad, sizeof(pad));
++}
++
++static bool
++kbMatch(const uint8_t *pc, size_t len, uint8_t kek[32])
++{
++	uint8_t v[32];
++	kbKdf(pc, len, kb.rec.salt, kb.rec.iters, kek);
++	kbLabel(kek, "PKBv", 0, v);
++	bool ok = kbSame(v, kb.rec.verifier, 32);
++	bzero(v, sizeof(v));
++	if (!ok) bzero(kek, 32);
++	return ok;
++}
++
++static void
++kbOpenKeys(const uint8_t kek[32])
++{
++	uint8_t pad[32];
++	for (int t = KB_A; t < KB_D; t++) {
++		kbLabel(kek, "PKBk", (uint8_t)t, pad);
++		for (int j = 0; j < 32; j++) kb.key[t][j] = kb.rec.keys[t][j] ^ pad[j];
++		kb.have[t] = true;
++	}
++	bzero(pad, sizeof(pad));
++}
++
++static void
++kbSum(const struct kb_rec *r, uint8_t out[32])
++{
++	SHA256_CTX c;
++	SHA256_Init(&c);
++	SHA256_Update(&c, r, __builtin_offsetof(struct kb_rec, sum));
++	SHA256_Final(out, &c);
++}
++
++static bool
++kbValid(const struct kb_rec *r)
++{
++	uint8_t s[32];
++	kbSum(r, s);
++	return r->magic == KB_MAGIC && r->version == 1 && r->has <= 1 && r->iters >= 1000 && r->iters <= 10000000 &&
++	       kbSame(s, r->sum, 32);
++}
++
++/* Writes kb.rec (generation + 1) to the other slot; kb.rec/kb.slot change only when the write succeeded. */
++static int
++kbSave(void)
++{
++	struct kb_rec r = kb.rec;
++	int slot = kb.slot ^ 1, e;
++
++	r.magic = KB_MAGIC;
++	r.version = 1;
++	r.gen++;
++	kbSum(&r, r.sum);
++	e = pong_kfile_rw(KB_PATH, &r, (int)sizeof(r), (long long)slot * (long long)sizeof(r), 1);
++	if (e == ENOENT && pong_kernel_mkdir(KB_DIR, 0700) == 0) {
++		e = pong_kfile_rw(KB_PATH, &r, (int)sizeof(r), (long long)slot * (long long)sizeof(r), 1);
++	}
++	kb.lastErr = e;
++	if (e == 0) {
++		kb.rec = r;
++		kb.slot = slot;
++	}
++	bzero(&r, sizeof(r));
++	return e;
++}
++
++/* State after loading or creating kb.rec: no passcode = all keys, passcode = only D until the first unlock. */
++static void
++kbLoaded(void)
++{
++	bzero(kb.key, sizeof(kb.key));
++	memcpy(kb.key[KB_D], kb.rec.keys[KB_D], 32);
++	kb.have[KB_D] = true;
++	if (!kb.rec.has) {
++		memcpy(kb.key, kb.rec.keys, sizeof(kb.key));
++		kb.have[KB_A] = kb.have[KB_C] = true;
++		kb.locked = 0;
++		kb.once = 1;
++	} else {
++		kb.have[KB_A] = kb.have[KB_C] = false;
++		kb.locked = 1;
++		kb.once = 0;
++	}
++}
++
++static void
++kbFresh(void)
++{
++	bzero(&kb.rec, sizeof(kb.rec));
++	kb.rec.iters = KB_ITERS;
++	read_random(kb.rec.keys, sizeof(kb.rec.keys));
++	kb.slot = 1;   /* the first save goes to slot 0 */
++}
++
++/* Called with the lock held before every passcode-mode answer. create: make a new keybag when there is none. */
++static void
++kbLoad(int create)
++{
++	struct kb_rec s[2];
++	int e[2];
++	bool ok[2];
++	uint64_t now = kbMicros();
++
++	if (kb.state != KB_UNKNOWN || (kb.lastTry && now - kb.lastTry < 1000000)) return;
++	kb.lastTry = now;
++	for (int i = 0; i < 2; i++) {
++		e[i] = pong_kfile_rw(KB_PATH, &s[i], (int)sizeof(s[i]), (long long)i * (long long)sizeof(s[i]), 0);
++		ok[i] = e[i] == 0 && kbValid(&s[i]);
++	}
++	if (ok[0] || ok[1]) {
++		int i = ok[0] && ok[1] ? (s[1].gen > s[0].gen) : ok[1];
++		kb.rec = s[i];
++		kb.slot = i;
++		kb.state = KB_LOADED;
++		kbLoaded();
++		IOLog("MiniAppleKeyStore: keybag loaded (slot %d gen %llu, passcode %s)\n", i,
++		    (unsigned long long)kb.rec.gen, kb.rec.has ? "set" : "none");
++	} else if (e[0] == ENOENT) {
++		if (create && pong_kfile_rw(KB_DATA, NULL, 0, 0, 0) == 0) {
++			kbFresh();
++			if (kbSave() == 0) {
++				kb.state = KB_LOADED;
++				kbLoaded();
++				IOLog("MiniAppleKeyStore: new keybag created\n");
++			} else {
++				bzero(&kb.rec, sizeof(kb.rec));
++			}
++		}
++	} else if (e[0] == 0) {
++		kb.state = KB_BROKEN;
++		IOLog("MiniAppleKeyStore: keybag file damaged; volatile answers until `keybag reset erase`\n");
++	}
++	bzero(s, sizeof(s));
++}
++
++static uint32_t
++kbDelay(uint32_t failed)
++{
++	return failed < 6 ? 0 : failed == 6 ? 60 : failed == 7 ? 300 : failed == 8 ? 900 : 3600;
++}
++
++/* Seconds until the next try is allowed (a clock that went back cannot make it longer than an hour). */
++static uint64_t
++kbWait(void)
++{
++	uint64_t now = kbNow();
++	if (kb.rec.backoff_until <= now) return 0;
++	if (kb.rec.backoff_until - now > 3600) kb.rec.backoff_until = now + 3600;
++	return kb.rec.backoff_until - now;
++}
++
++static void
++kbFail(void)
++{
++	uint32_t d;
++	kb.rec.failed++;
++	d = kbDelay(kb.rec.failed);
++	kb.rec.backoff_until = d ? kbNow() + d : 0;
++	(void)kbSave();
++}
++
++static void
++kbGood(const uint8_t kek[32])
++{
++	kbOpenKeys(kek);
++	if (kb.rec.failed || kb.rec.backoff_until) {
++		kb.rec.failed = 0;
++		kb.rec.backoff_until = 0;
++		(void)kbSave();
++	}
++}
++
++static IOReturn
++kbCheck(const uint8_t *pc, size_t len)
++{
++	uint8_t kek[32];
++	if (!kb.rec.has) return kIOReturnSuccess;
++	if (kbWait()) return kIOReturnNotPermitted;
++	if (!kbMatch(pc, len, kek)) {
++		kbFail();
++		return kIOReturnNotPermitted;
++	}
++	kbGood(kek);
++	bzero(kek, sizeof(kek));
++	return kIOReturnSuccess;
++}
+ 
++static IOReturn
++kbUnlock(const uint8_t *pc, size_t len)
++{
++	IOReturn r = kbCheck(pc, len);
++	if (r == kIOReturnSuccess) {
++		kb.locked = 0;
++		kb.once = 1;
++	}
++	return r;
++}
++
++static void
++kbLock(void)
++{
++	if (!kb.rec.has) return;
++	kb.locked = 1;
++	bzero(kb.key[KB_A], 32);
++	kb.have[KB_A] = false;
++}
++
++/* aks_change_secret: nl == 0 removes the passcode. The file is written before anything changes in memory. */
++static IOReturn
++kbChange(const uint8_t *old, size_t ol, const uint8_t *nw, size_t nl)
++{
++	struct kb_rec prev;
++	uint8_t kek[32];
++	IOReturn r = kbCheck(old, ol);
++
++	if (r != kIOReturnSuccess) return r;
++	if (!kb.have[KB_A] || !kb.have[KB_C]) return kIOReturnNotPermitted;
++	prev = kb.rec;
++	if (nl == 0) {
++		kb.rec.has = 0;
++		bzero(kb.rec.salt, sizeof(kb.rec.salt));
++		kbSeal(NULL);
++	} else {
++		read_random(kb.rec.salt, sizeof(kb.rec.salt));
++		kb.rec.iters = KB_ITERS;
++		kbKdf(nw, nl, kb.rec.salt, kb.rec.iters, kek);
++		kb.rec.has = 1;
++		kbSeal(kek);
++		bzero(kek, sizeof(kek));
++	}
++	kb.rec.failed = 0;
++	kb.rec.backoff_until = 0;
++	kb.rec.changed_at = kbNow();
++	if (kbSave() != 0) {
++		kb.rec = prev;
++		bzero(&prev, sizeof(prev));
++		return kIOReturnIOError;
++	}
++	bzero(&prev, sizeof(prev));
++	kb.locked = 0;
++	kb.once = 1;
++	return kIOReturnSuccess;
++}
++
++/* aks_verify_password: try the OCTET/UTF8/context strings of the DER request (format unconfirmed, PLAN.md D2). */
++static IOReturn
++kbVerifyDer(const uint8_t *der, size_t len)
++{
++	uint8_t kek[32];
++	size_t i = 0;
++	int tries = 0;
++
++	if (!kb.rec.has) return kIOReturnSuccess;
++	if (kbWait()) return kIOReturnNotPermitted;
++	while (i + 2 <= len) {
++		uint8_t tag = der[i++];
++		size_t l = der[i++];
++		if (l & 0x80) {
++			size_t n = l & 0x7f;
++			if (n == 0 || n > 2 || i + n > len) break;
++			for (l = 0; n; n--) l = (l << 8) | der[i++];
++		}
++		if (tag & 0x20) continue;          /* constructed: walk into it */
++		if (l > len - i) break;
++		if ((tag == 0x04 || tag == 0x0c || (tag & 0xc0) == 0x80) && l && l <= KB_PC_MAX && tries < 4) {
++			tries++;
++			if (kbMatch(der + i, l, kek)) {
++				bool wasA = kb.have[KB_A], wasC = kb.have[KB_C];
++				kbGood(kek);
++				if (!wasA) { bzero(kb.key[KB_A], 32); kb.have[KB_A] = false; }   /* checking does not unlock */
++				if (!wasC) { bzero(kb.key[KB_C], 32); kb.have[KB_C] = false; }
++				bzero(kek, sizeof(kek));
++				return kIOReturnSuccess;
++			}
++		}
++		i += l;
++	}
++	kbFail();
++	return kIOReturnNotPermitted;
++}
++
++/* out must hold 8 + len. */
++static IOReturn
++kbWrap(uint32_t cls, const uint8_t *in, size_t len, uint8_t *out)
++{
++	int t = kbTier(cls);
++	struct kb_hmac h;
++	uint8_t tag[32], blk[32], hdr[6] = { 'P', 'K', 'w', 't', (uint8_t)cls, (uint8_t)len };
++
++	if (!kb.have[t]) return kIOReturnNotPermitted;
++	kbHmacInit(&h, kb.key[t], 32);
++	kbHmacRun(&h, hdr, sizeof(hdr), in, len, tag);
++	out[0] = 'P';
++	out[1] = (uint8_t)cls;
++	memcpy(out + 2, tag, 6);
++	for (size_t i = 0; i < len; i++) {
++		if (i % 32 == 0) {
++			uint8_t ctr[9];
++			memcpy(ctr, out, 8);
++			ctr[8] = (uint8_t)(i / 32);
++			kbHmacRun(&h, "PKwe", 4, ctr, 9, blk);
++		}
++		out[8 + i] = in[i] ^ blk[i % 32];
++	}
++	bzero(&h, sizeof(h));
++	bzero(blk, sizeof(blk));
++	return kIOReturnSuccess;
++}
++
++/* blob = 'P' wrap of 8 + len bytes; out gets len bytes. */
++static IOReturn
++kbUnwrap(const uint8_t *blob, size_t len, uint8_t *out)
++{
++	uint8_t cls = blob[1];
++	int t = kbTier(cls);
++	struct kb_hmac h;
++	uint8_t tag[32], blk[32], hdr[6] = { 'P', 'K', 'w', 't', cls, (uint8_t)len };
++	bool ok;
++
++	if (!kb.have[t]) return kIOReturnNotPermitted;
++	kbHmacInit(&h, kb.key[t], 32);
++	for (size_t i = 0; i < len; i++) {
++		if (i % 32 == 0) {
++			uint8_t ctr[9];
++			memcpy(ctr, blob, 8);
++			ctr[8] = (uint8_t)(i / 32);
++			kbHmacRun(&h, "PKwe", 4, ctr, 9, blk);
++		}
++		out[i] = blob[8 + i] ^ blk[i % 32];
++	}
++	kbHmacRun(&h, hdr, sizeof(hdr), out, len, tag);
++	ok = kbSame(tag, blob + 2, 6);
++	bzero(&h, sizeof(h));
++	bzero(blk, sizeof(blk));
++	if (!ok) {
++		bzero(out, len);
++		return kIOReturnBadArgument;
++	}
++	return kIOReturnSuccess;
++}
++
++/* USB `keybag reset [erase]`: 0 done, -1 keys not in memory (needs erase), -2 Data volume absent, -3 write failed. */
++static int
++kbReset(int erase)
++{
++	struct kb_rec prev;
++
++	if (kb.state != KB_LOADED) {
++		if (!erase) return -1;
++		if (pong_kfile_rw(KB_DATA, NULL, 0, 0, 0) != 0) return -2;
++		kbFresh();
++		if (kbSave() != 0) return -3;
++		kb.state = KB_LOADED;
++		kbLoaded();
++		return 0;
++	}
++	if (!kb.have[KB_A] || !kb.have[KB_C]) {
++		if (!erase) return -1;
++		for (int t = KB_A; t < KB_D; t++) {
++			if (!kb.have[t]) {
++				read_random(kb.key[t], 32);
++				kb.have[t] = true;
++			}
++		}
++	}
++	prev = kb.rec;
++	kb.rec.has = 0;
++	kb.rec.failed = 0;
++	kb.rec.backoff_until = 0;
++	kb.rec.changed_at = kbNow();
++	bzero(kb.rec.salt, sizeof(kb.rec.salt));
++	kbSeal(NULL);
++	if (kbSave() != 0) {
++		kb.rec = prev;
++		bzero(&prev, sizeof(prev));
++		return -3;
++	}
++	bzero(&prev, sizeof(prev));
++	kb.locked = 0;
++	kb.once = 1;
++	return 0;
++}
+ static size_t
+-derPut(uint8_t *buf, size_t length, const char *key, uint8_t value)
++derPut(uint8_t *buf, size_t length, const char *key, uint64_t value)
+ {
+-	size_t keyLength = strlen(key);
++	size_t keyLength = strlen(key), n = 1;
++	while (n < 8 && value >= (1ULL << (8 * n - 1))) n++;
+ 	buf[length++] = 0x30;
+-	buf[length++] = (uint8_t)(keyLength + 5);
++	buf[length++] = (uint8_t)(keyLength + 4 + n);
+ 	buf[length++] = 0x0c;
+ 	buf[length++] = (uint8_t)keyLength;
+ 	memcpy(buf + length, key, keyLength);
+ 	length += keyLength;
+ 	buf[length++] = 0x02;
+-	buf[length++] = 0x01;
+-	buf[length++] = value;
++	buf[length++] = (uint8_t)n;
++	while (n--) buf[length++] = (uint8_t)(value >> (8 * n));
+ 	return length;
+ }
+ 
++/* Entries were written from offset 3; close the SET with a minimal DER length. */
+ static size_t
+-deviceState(uint8_t *buf)
++derSet(uint8_t *buf, size_t length)
+ {
+-	size_t length = 2;
+-	length = derPut(buf, length, "sb", 0);
++	size_t content = length - 3;
++	buf[0] = 0x31;
++	if (content < 0x80) {
++		buf[1] = (uint8_t)content;
++		memmove(buf + 2, buf + 3, content);
++		return content + 2;
++	}
++	buf[1] = 0x81;
++	buf[2] = (uint8_t)content;
++	return length;
++}
++
++static size_t
++deviceState(uint8_t *buf, uint64_t ss, uint64_t sls, uint64_t sb, uint64_t sfa)
++{
++	size_t length = 3;
++	length = derPut(buf, length, "sb", sb);
+ 	length = derPut(buf, length, "sr", 0);
+-	length = derPut(buf, length, "ss", kAKSStateFlags);
++	length = derPut(buf, length, "ss", ss);
+ 	length = derPut(buf, length, "sas", 0);
+-	length = derPut(buf, length, "sfa", 0);
++	length = derPut(buf, length, "sfa", sfa);
+ 	length = derPut(buf, length, "sgs", 0);
+-	length = derPut(buf, length, "sls", kAKSLockStateDisabled);
++	length = derPut(buf, length, "sls", sls);
+ 	length = derPut(buf, length, "sgpe", 0);
+ 	length = derPut(buf, length, "srcd", 0);
+-	buf[0] = 0x31;
+-	buf[1] = (uint8_t)(length - 2);
+-	return length;
++	return derSet(buf, length);
+ }
+ 
+ static size_t
+ configuration(uint8_t *buf)
+ {
+-	size_t length = 2;
++	size_t length = 3;
+ 	length = derPut(buf, length, "bd", 0);
+ 	length = derPut(buf, length, "gp", 0);
+ 	length = derPut(buf, length, "mua", 10);
+-	buf[0] = 0x31;
+-	buf[1] = (uint8_t)(length - 2);
+-	return length;
++	return derSet(buf, length);
+ }
+ 
++/* ==== keybag core end ==== */
++
++enum {
++	kAKSOpenCheck           = 0x00,
++	kAKSGetLockState        = 0x07,
++	kAKSLockDevice          = 0x08,
++	kAKSUnlockDevice        = 0x09,
++	kAKSWrapKey             = 0x0a,
++	kAKSUnwrapKey           = 0x0b,
++	kAKSUnlockBag           = 0x0c,
++	kAKSLockBag             = 0x0d,
++	kAKSGetSystem           = 0x0e,
++	kAKSChangeSecret        = 0x0f,
++	kAKSGetDeviceState      = 0x11,
++	kAKSGetBagUUID          = 0x17,
++	kAKSAssertHold          = 0x1a,
++	kAKSAssertDrop          = 0x1b,
++	kAKSGetConfiguration    = 0x1f,
++	kAKSLockDeviceNow       = 0x20,
++	kAKSGetExtendedState    = 0x23,
++	kAKSGeneration          = 0x28,
++	kAKSVerifyPassword      = 0x2a,
++	kAKSAssertPromote       = 0x64,
++	kAKSAssertConsume       = 0x65,
++	kAKSNotifyStateSet      = 0x66,
++	kAKSNotifyStateIsSet    = 0x67,
++	kAKSChangeSecretEpilog  = 0x69,
++	kAKSPrewarm             = 0x73,
++};
++
++#define kAKSStateFlags        0x6 /* no passcode, unlocked since boot */
++#define kAKSLockStateDisabled 3
++
++static uint64_t gAKSLogged[4];
++static bool gAKSNotifyState;
++static IOLock *gKBLock;
++static struct { uint8_t sel; int32_t ret; char who[12]; } gKBRing[8];
++static unsigned gKBRingN;
++
+ class AppleKeyStore : public IOService
+ {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -108,14 +705,15 @@ AppleKeyStore::start(IOService *provider)
+ {
+ 	if (!IOService::start(provider)) return false;
+ 	if (!setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient") ||
+-	    !setProperty("PongVolatileSoftwareKeybag", kOSBooleanTrue)) {
++	    !setProperty("PongVolatileSoftwareKeybag", kb.on ? kOSBooleanFalse : kOSBooleanTrue)) {
+ 		IOLog("MiniAppleKeyStore: incomplete software keybag properties; service not published\n");
+ 		IOService::stop(provider);
+ 		return false;
+ 	}
+ 	setName("AppleKeyStore");
+ 	registerService();
+-	IOLog("MiniAppleKeyStore: no-passcode software keybag published; software wrap/unwrap enabled\n");
++	IOLog("MiniAppleKeyStore: %s software keybag published; software wrap/unwrap enabled\n",
++	    kb.on ? "passcode" : "no-passcode");
+ 	return true;
+ }
+ 
+@@ -123,6 +721,7 @@ class AppleKeyStoreUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(AppleKeyStoreUserClient);
+ 	static IOReturn answer(IOExternalMethodArguments *, const uint8_t *, size_t);
++	static IOReturn passcodeMethod(uint32_t, IOExternalMethodArguments *);
+ public:
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn registerNotificationPort(mach_port_t, UInt32, io_user_reference_t) APPLE_KEXT_OVERRIDE;
+@@ -142,22 +741,11 @@ IOReturn
+ AppleKeyStoreUserClient::registerNotificationPort(mach_port_t port,
+     __unused UInt32 type, __unused io_user_reference_t refCon)
+ {
+-	/* No hardware-backed keys/bags are ever queued for backup. */
++	/* No hardware-backed keys/bags are ever queued for backup; lock-state notices are not sent (PLAN.md D3). */
+ 	releaseNotificationPort(port);
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Match the upstream development format; the fixed pattern is not a secret. */
+-static const uint8_t kWrapMark[4] = { 'H', 'K', 'w', 'r' };
+-
+-static void
+-wrapMix(uint8_t *bytes, size_t length)
+-{
+-	for (size_t i = 0; i < length; i++) {
+-		bytes[i] ^= (uint8_t)(0x5a + 37 * i);
+-	}
+-}
+-
+ IOReturn
+ AppleKeyStoreUserClient::answer(IOExternalMethodArguments *args,
+     const uint8_t *bytes, size_t length)
+@@ -181,6 +769,119 @@ AppleKeyStoreUserClient::answer(IOExternalMethodArguments *args,
+ 	return kIOReturnSuccess;
+ }
+ 
++static IOReturn
++kbCopyin(uint64_t addr, uint64_t len, uint8_t *buf, size_t cap, size_t *outLen)
++{
++	if (len > cap) return kIOReturnBadArgument;
++	if (len && (!addr || copyin((user_addr_t)addr, buf, (size_t)len) != 0)) return kIOReturnBadArgument;
++	*outLen = (size_t)len;
++	return kIOReturnSuccess;
++}
++
++/* Called with gKBLock held. KB_PASS: let the volatile keybag below answer. */
++IOReturn
++AppleKeyStoreUserClient::passcodeMethod(uint32_t selector, IOExternalMethodArguments *args)
++{
++	static uint8_t req[1024], neu[KB_PC_MAX];
++	uint64_t *out = args->scalarOutput;
++	const uint64_t *in = args->scalarInput;
++	size_t ol = 0, nl = 0;
++	uint8_t der[192];
++	IOReturn r;
++
++	if (selector == kAKSUnwrapKey) {
++		const uint8_t *blob = (const uint8_t *)args->structureInput;
++		size_t length = args->structureInputSize;
++		uint8_t key[64];
++		if (!blob || length <= 8 || length > 8 + sizeof(key)) return KB_PASS;
++		if (blob[0] == 'P') {
++			kbLoad(kb.on);
++			if (kb.state != KB_LOADED) return kIOReturnNotReady;
++			r = kbUnwrap(blob, length - 8, key);
++			if (r == kIOReturnSuccess) r = answer(args, key, length - 8);
++			bzero(key, sizeof(key));
++			return r;
++		}
++		if (kb.on && kb.state == KB_LOADED && memcmp(blob, kWrapMark, sizeof(kWrapMark)) == 0 &&
++		    !kb.have[kbTier(blob[4])])
++			return kIOReturnNotPermitted;   /* old blobs follow the same lock rules */
++		return KB_PASS;
++	}
++	if (!kb.on) return KB_PASS;
++	kbLoad(1);
++	if (kb.state != KB_LOADED) {
++		return selector == kAKSChangeSecret || selector == kAKSVerifyPassword ? kIOReturnNotReady : KB_PASS;
++	}
++	switch (selector) {
++	case kAKSGetLockState:
++		if (args->scalarOutputCount < 1) return kIOReturnBadArgument;
++		out[0] = (uint64_t)((kb.rec.has && kb.locked ? 1 : 0) | (kb.rec.has ? 0 : 2) | (kb.once ? 4 : 0));
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++	case kAKSGetDeviceState:
++	case kAKSGetExtendedState: {
++		uint64_t ss = (kb.rec.has && kb.locked ? 1 : 0) | (kb.rec.has ? 0 : 2) | (kb.once ? 4 : 0);
++		uint64_t sls = !kb.rec.has ? kAKSLockStateDisabled : kb.locked ? 1 : 0;
++		return answer(args, der, deviceState(der, ss, sls, kbWait(), kb.rec.failed));
++	}
++	case kAKSLockDevice:
++	case kAKSLockDeviceNow:
++	case kAKSLockBag:
++		kbLock();
++		return kIOReturnSuccess;
++	case kAKSUnlockDevice:
++	case kAKSUnlockBag:
++		if (args->scalarInputCount >= 3) {
++			r = kbCopyin(in[1], in[2], req, KB_PC_MAX, &ol);
++		} else if (args->structureInput && args->structureInputSize <= KB_PC_MAX) {
++			ol = args->structureInputSize;
++			memcpy(req, args->structureInput, ol);
++			r = kIOReturnSuccess;
++		} else {
++			r = kIOReturnBadArgument;
++		}
++		if (r == kIOReturnSuccess) r = kbUnlock(req, ol);
++		bzero(req, sizeof(req));
++		return r;
++	case kAKSChangeSecret:
++		if (args->scalarInputCount < 7) return kIOReturnBadArgument;
++		r = kbCopyin(in[3], in[4], req, KB_PC_MAX, &ol);
++		if (r == kIOReturnSuccess) r = kbCopyin(in[5], in[6], neu, KB_PC_MAX, &nl);
++		if (r == kIOReturnSuccess) r = kbChange(req, ol, neu, nl);
++		bzero(req, sizeof(req));
++		bzero(neu, sizeof(neu));
++		if (r == kIOReturnSuccess && args->scalarOutputCount >= 1) {
++			out[0] = 0;
++			args->scalarOutputCount = 1;
++		}
++		return r;
++	case kAKSVerifyPassword:
++		if (args->scalarInputCount < 4) return kIOReturnBadArgument;
++		r = kbCopyin(in[2], in[3], req, sizeof(req), &ol);
++		if (r == kIOReturnSuccess) r = kbVerifyDer(req, ol);
++		bzero(req, sizeof(req));
++		return r;
++	case kAKSChangeSecretEpilog:
++		return kIOReturnSuccess;
++	case kAKSWrapKey: {
++		uint8_t wrapped[8 + 64];
++		size_t length = args->structureInputSize;
++		if (!args->structureInput || length == 0 || length > 64 || args->scalarInputCount < 2)
++			return kIOReturnBadArgument;
++		r = kbWrap((uint32_t)in[1], (const uint8_t *)args->structureInput, length, wrapped);
++		if (r == kIOReturnSuccess) r = answer(args, wrapped, 8 + length);
++		bzero(wrapped, sizeof(wrapped));
++		if (r == kIOReturnSuccess && args->scalarOutputCount >= 1) {
++			out[0] = in[1];
++			args->scalarOutputCount = 1;
++		}
++		return r;
++	}
++	default:
++		return KB_PASS;
++	}
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector,
+     IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
+@@ -191,6 +892,23 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector,
+ 	};
+ 	uint8_t der[128];
+ 	uint64_t *out = args->scalarOutput;
++
++	if (gKBLock && (kb.on || selector == kAKSUnwrapKey)) {
++		IOLockLock(gKBLock);
++		IOReturn ret = passcodeMethod(selector, args);
++		if (kb.on && selector != kAKSGetLockState && selector != kAKSGetDeviceState &&
++		    selector != kAKSGetExtendedState && selector != kAKSWrapKey && selector != kAKSUnwrapKey &&
++		    selector != kAKSGetConfiguration && selector != kAKSGetBagUUID && selector != kAKSGeneration &&
++		    selector != kAKSGetSystem && selector != kAKSOpenCheck && selector != kAKSAssertHold &&
++		    selector != kAKSAssertDrop && selector != kAKSAssertPromote && selector != kAKSAssertConsume) {
++			unsigned slot = gKBRingN++ % 8;
++			gKBRing[slot].sel = (uint8_t)selector;
++			gKBRing[slot].ret = ret == KB_PASS ? 0 : ret;
++			proc_selfname(gKBRing[slot].who, sizeof(gKBRing[slot].who));
++		}
++		IOLockUnlock(gKBLock);
++		if (ret != KB_PASS) return ret;
++	}
+ 	switch (selector) {
+ 	case kAKSOpenCheck:
+ 	case kAKSLockDevice:
+@@ -217,7 +935,7 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector,
+ 		return kIOReturnSuccess;
+ 	case kAKSGetDeviceState:
+ 	case kAKSGetExtendedState:
+-		return answer(args, der, deviceState(der));
++		return answer(args, der, deviceState(der, kAKSStateFlags, kAKSLockStateDisabled, 0, 0));
+ 	case kAKSGetConfiguration:
+ 		return answer(args, der, configuration(der));
+ 	case kAKSGetBagUUID:
+@@ -271,11 +989,51 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector,
+ 	return kIOReturnUnsupported;
+ }
+ 
++/* USB `keybag`, `keybag reset`, `keybag reset erase` (bsd/dev/pong_usb_ctl.c). Never shows keys or passcodes. */
++extern "C" int pong_keybag_usb(char *reply, size_t cap, const char *cmd);
++int
++pong_keybag_usb(char *reply, size_t cap, const char *cmd)
++{
++	static const char *states[] = { "unknown", "loaded", "damaged" };
++	int rc = 0, n;
++	bool reset = strncmp(cmd, "keybag reset", 12) == 0;
++
++	if (!gKBLock) return snprintf(reply, cap, "keybag: AppleKeyStore not started (pong_software_keybag)\n");
++	IOLockLock(gKBLock);
++	if (reset) {
++		kb.lastTry = 0;
++		kbLoad(1);
++		rc = kbReset(strcmp(cmd, "keybag reset erase") == 0);
++	}
++	n = snprintf(reply, cap, "keybag:%s%s on=%d file=%s has=%u locked=%d once=%d keys=%d%d%d failed=%u wait=%llus "
++	    "iters=%u kdf=%ums gen=%llu slot=%d save_e=%d changed=%llu |",
++	    reset ? " reset=" : "", reset ? (rc == 0 ? "ok" : rc == -1 ? "need-erase" : rc == -2 ? "no-data" : "write-failed") : "",
++	    kb.on, states[kb.state], kb.rec.has, kb.locked, kb.once, kb.have[KB_A], kb.have[KB_C], kb.have[KB_D],
++	    kb.rec.failed, (unsigned long long)(kb.state == KB_LOADED ? kbWait() : 0), kb.rec.iters, kb.kdfMs,
++	    (unsigned long long)kb.rec.gen, kb.slot, kb.lastErr, (unsigned long long)kb.rec.changed_at);
++	for (unsigned i = 0; i < 8 && i < gKBRingN && n > 0 && (size_t)n < cap; i++) {
++		unsigned slot = (gKBRingN - 1 - i) % 8;
++		n += snprintf(reply + n, cap - (size_t)n, " %x:%s:%x", gKBRing[slot].sel, gKBRing[slot].who,
++		    (unsigned)gKBRing[slot].ret);
++	}
++	IOLockUnlock(gKBLock);
++	if (n > 0 && (size_t)n < cap - 1) {
++		reply[n++] = '\n';
++		reply[n] = '\0';
++	}
++	return rc;
++}
++
+ void
+ MiniAppleKeyStoreStart(void)
+ {
+ 	IOService *resources = IOService::getResourceService();
+ 	AppleKeyStore *store = OSTypeAlloc(AppleKeyStore);
++	uint32_t passcode = 0;
++
++	(void)PE_parse_boot_argn("pong_keybag_passcode", &passcode, sizeof(passcode));
++	kb.on = passcode != 0;
++	gKBLock = IOLockAlloc();
+ 	if (!resources || !store || !store->init() || !store->attach(resources)) {
+ 		OSSafeReleaseNULL(store);
+ 		IOLog("MiniAppleKeyStore: software service creation failed\n");
