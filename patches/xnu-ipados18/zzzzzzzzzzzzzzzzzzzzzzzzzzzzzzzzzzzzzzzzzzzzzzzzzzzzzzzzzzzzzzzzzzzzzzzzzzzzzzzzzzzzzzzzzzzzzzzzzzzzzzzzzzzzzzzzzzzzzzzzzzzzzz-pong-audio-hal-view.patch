@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index d71a2be..fc9afca 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -749,8 +749,15 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 		for (unsigned i = 0; i < 4; i++) {
+ 			AD_ADD("%c%#x:%#x", i ? ',' : '=', t970_audio_amp[i][0], t970_audio_amp[i][1]);
+ 		}
+-		AD_ADD(" i2c=%u/%u/%u svc=%d/%d halt=%#x\n", t970_audio_i2c[0], t970_audio_i2c[1], t970_audio_i2c[2],
++		AD_ADD(" i2c=%u/%u/%u svc=%d/%d halt=%#x", t970_audio_i2c[0], t970_audio_i2c[1], t970_audio_i2c[2],
+ 		    t970_audio_service[0], t970_audio_service[1], t970_audio_halt);
++		{
++			/* capture (T970Audio.cpp t970_audio_mic): stage, error, frames, peak, the ldoc5 vote; plug-in reads, silent reads */
++			extern volatile int32_t t970_audio_mic[20], t970_audio_micp[4];
++
++			AD_ADD(" mic=%d/%d frames=%d peak=%d bias=%d reads=%d/%d\n", t970_audio_mic[0], t970_audio_mic[1], t970_audio_mic[7],
++			    t970_audio_mic[8], t970_audio_mic[16], t970_audio_micp[0], t970_audio_micp[1]);
++		}
+ 		return 0;
+ 	}
+ 	if (args && *args) {
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 5a55376..4e7be2e 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -75,6 +75,8 @@
+ #include <sys/param.h>
+ 
+ #include <IOKit/IOBSD.h>
++#include <pexpert/arm64/board_config.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "bindfs.h"
+ 
+@@ -164,6 +166,33 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 		goto error;
+ 	}
+ 
++#if defined(PONG)
++	/* iOSPort sound (work/sound_scope/PLAN.md): with the boot argument pong_audio_hal=1, init's board HAL view (the empty
++	 * /pong/audio-hal18 on the read-only OS volume, bound over /System/Library/Audio/Plug-Ins/HAL) comes from the Data volume
++	 * instead, so the audio server plug-in is installed over USB (fsput) without a new OS image. Only a directory owned by root
++	 * and not writable by group or others is taken; otherwise the empty view stays. */
++	{
++		static const char board_hal[] = "/pong/audio-hal18", data_hal[] = "/private/var/pong/audio-hal18";
++		uint32_t on = 0;
++		vnode_t alt = NULLVP;
++
++		if (strcmp(data, board_hal) == 0 && PE_parse_boot_argn("pong_audio_hal", &on, sizeof(on)) && on == 1 &&
++		    vnode_lookup(data_hal, 0, &alt, ctx) == 0) {
++			struct vnode_attr va;
++
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_uid);
++			VATTR_WANTED(&va, va_mode);
++			if (vnode_isdir(alt) && vnode_getattr(alt, &va, ctx) == 0 && VATTR_IS_SUPPORTED(&va, va_uid) &&
++			    VATTR_IS_SUPPORTED(&va, va_mode) && va.va_uid == 0 && !(va.va_mode & 022)) {
++				strlcpy(data, data_hal, sizeof(data));
++			}
++			printf("PONG audio HAL view: %s\n", data);
++			vnode_put(alt);
++		}
++	}
++#endif
++
+ 	error = vnode_lookup(data, 0, &lowerrootvp, ctx);
+ 	if (error) {
+ 		BINDFSERROR("lookup of %s failed error: %d\n", data, error);
