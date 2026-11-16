@@ -1,0 +1,44 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 813b3af..7308b20 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5995,6 +5995,27 @@ sysctl_exec_inject(__unused struct sysctl_oid *oidp, __unused void *arg1,
+ SYSCTL_PROC(_kern, OID_AUTO, exec_inject, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_exec_inject, "A", "LIBRARY NAME... [; LIBRARY NAME...]");
+ 
++/* Boot argument pong_ui18_var=1: insert the UI library from the Data volume (put there over USB `fsput`) instead of the
++ * read-only system copy, but only while that file exists, so a missing file leaves the old library in place (z125). */
++#define PONG_UI18_SYS "/pong/libpong-ui18.dylib"
++#define PONG_UI18_VAR "/private/var/pong/libpong-ui18.dylib"
++static bool
++exec_inject_ui18_var(void)
++{
++	static int enabled = -1;
++	vnode_t vp = NULLVP;
++
++	if (enabled < 0) {
++		int value = 0;
++		enabled = PE_parse_boot_argn("pong_ui18_var", &value, sizeof(value)) && value == 1;
++	}
++	if (!enabled || vnode_lookup(PONG_UI18_VAR, 0, &vp, vfs_context_kernel()) != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -6021,6 +6042,11 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 			if ((size_t)(p - word) == imgp->ip_ndp->ni_cnd.cn_namelen &&
+ 			    p != word && strncmp(word, name, p - word) == 0) matched = true;
+ 		}
++		if (matched && liblen == sizeof(PONG_UI18_SYS) - 1 && strncmp(library, PONG_UI18_SYS, liblen) == 0 &&
++		    exec_inject_ui18_var()) {
++			library = PONG_UI18_VAR;
++			liblen = sizeof(PONG_UI18_VAR) - 1;
++		}
+ 		if (matched && liblen && *library == '/') {
+ 			if (used + (any ? 1 : 0) + liblen >= size) return false;
+ 			if (any) env[used++] = ':';
