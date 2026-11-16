@@ -1,0 +1,194 @@
+name: kernel-precheck
+
+# Compile check of the kernel only, in minutes instead of the package run's hour.
+#
+# It runs the same kernel step the package job reaches through `unixnu release`
+# (kits/PongPlatform24/build-with-runtime.py --tree <shared tree>, the
+# components.toml recipe), at the same paths, with the same resolved
+# configuration (configs/pong_ipados18_ci_defconfig: the package job's
+# PONG_BUILD_RESULT.json settings equal it key for key) and the same uuid5
+# placeholder volume layout, so it restores the package job's XNU tree and
+# ccache and compiles what the package job would compile: the patched XNU, the
+# driver archives and the T970 ath11k archive with its import check.
+#
+# What it leaves out: UniXNU and `release` (deps, preflight, the shared tree's
+# own patch step), uefi-pong, the payload and boot images. No IPSW, no chip id
+# secret, no prelink. The Apple sources are the public apple-oss-distributions
+# tags feeds.toml pins, as in the package job.
+#
+# MAKEFLAGS=k makes the XNU make keep going after a failed object, so one run
+# lists every compile error of the XNU stage. The driver builders run before
+# that make and still stop at their own first failure.
+#
+# Its concurrency group is its own: it never cancels a package run, and a newer
+# precheck of the same ref replaces an older one. It saves no cache, so it never
+# evicts the package job's.
+#
+#   gh workflow run kernel-precheck.yml --repo kmu1757/UniXNU-y2q [--ref <branch>]
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "drivers/**"
+      - "scripts/**"
+      - "kits/**"
+      - ".github/workflows/kernel-precheck.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-precheck-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OS_PROFILE: ipados-18.7.10-22H374
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,file_macro
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  LLVM_KEG: /usr/local/opt/llvm@18
+  LLD_KEG: /usr/local/opt/lld
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  kernel:
+    name: kernel compile check
+    runs-on: macos-15-intel
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+      - name: tools
+        run: |
+          set -euo pipefail
+          needed=()
+          command -v dtc >/dev/null 2>&1 || needed+=(dtc)
+          command -v ccache >/dev/null 2>&1 || needed+=(ccache)
+          [ ${#needed[@]} -eq 0 ] || brew install "${needed[@]}"
+          ok=1
+          for t in dtc ccache cmake ninja make unifdef python3; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+      - name: build inputs
+        run: |
+          set -euo pipefail
+          # The package job's paths: `release` builds the configuration in
+          # UniXNU/out/pong/<os>/<config>, its shared tree is tree/ there, and
+          # local.toml puts the device tree at ./tree. Same paths, same ccache keys.
+          out="$GITHUB_WORKSPACE/UniXNU/out/pong/${OS_PROFILE}/pong_ipados18_ci"
+          mkdir -p "$out/tree/refer"
+          cp -f device/configs/pong_ipados18_ci_defconfig "$out/.config"
+          python3 - "$out/tree/refer" <<'PY'
+          import json, subprocess, sys, tomllib, uuid
+          from pathlib import Path
+          refer = Path(sys.argv[1])
+          # The package job's placeholder layout, byte for byte (no userdata image).
+          namespace = uuid.UUID('6f1b6a3e-7c2d-4a91-9e5b-0c4d8f2a1b77')
+          doc = {'ci_placeholder': True, 'build': '22H374', 'lba_bytes': 4096}
+          for role in ('os', 'systemos', 'data'):
+              doc[role] = {'uuid': str(uuid.uuid5(namespace, 'pong-%s' % role))}
+          Path('ci-volume-layout.json').write_text(json.dumps(doc, indent=2) + '\n')
+          developer = subprocess.check_output(['xcode-select', '-p'], text=True).strip()
+          Path('device/local.toml').write_text('\n'.join([
+              '# Written on the runner; not a developer machine path.',
+              '[pong_build]',
+              'tree = ' + json.dumps(str(Path('tree').resolve())),
+              'developer_dir = ' + json.dumps(developer),
+              'volume_layout = ' + json.dumps(str(Path('ci-volume-layout.json').resolve())),
+              '']))
+          # The Apple sources the shared tree holds after `release` deps: the
+          # public tags feeds.toml pins, checked against their commits.
+          for source in tomllib.loads(Path('device/feeds.toml').read_text())['source']:
+              if source.get('kind') != 'refer':
+                  continue
+              target = refer / source['name']
+              subprocess.run(['git', 'clone', '-q', '--depth', '1', '--branch', source['ref'],
+                              source['git'], str(target)], check=True)
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=target, text=True).strip()
+              if head != source['commit']:
+                  raise SystemExit('%s: %s is not the pinned %s' % (source['name'], head, source['commit']))
+              print(source['name'], head)
+          PY
+          {
+            printf 'PRECHECK_OUT=%s\n' "$out"
+            printf 'PONG_VOLUME_LAYOUT=%s\n' "$PWD/ci-volume-layout.json"
+            printf 'PATH=%s:%s:%s\n' "${LLVM_KEG}/bin" "${LLD_KEG}/bin" "$PATH"
+          } >> "$GITHUB_ENV"
+      # Restore only, with the package job's own keys: this job reads its cache
+      # and never writes one.
+      - name: XNU tree and build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            tree/.cache
+            tree/build
+          key: xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-${{ hashFiles('device/patches/xnu-ipados18/**') }}
+          restore-keys: |
+            xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-
+      - name: restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-
+      - name: kernel compile
+        working-directory: device
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          UNIXNU_DEVICE: ${{ github.workspace }}/device
+          PONG_LLVM: ${{ env.LLVM_KEG }}/bin
+          MAKEFLAGS: k
+        run: |
+          set -euo pipefail
+          mkdir -p "$CCACHE_DIR"; ccache -z >/dev/null || true
+          ncpu=$(sysctl -n hw.ncpu)
+          python3 kits/PongPlatform24/build-with-runtime.py \
+            --artifact-dir "$PRECHECK_OUT/kernel" --tree "$PRECHECK_OUT/tree" --jobs "$ncpu" \
+            2>&1 | tee "$GITHUB_WORKSPACE/precheck-console.log"
+      - name: errors
+        if: always()
+        run: |
+          set -uo pipefail
+          ccache -s || true
+          # The build log (build-*.log beside the device tree), the per-object logs
+          # of the ath11k and driver builders, and this job's console.
+          logs=$(find . -maxdepth 1 -name 'build-*.log'; \
+                 find tree/build UniXNU/out -name '*.log' 2>/dev/null; \
+                 echo precheck-console.log)
+          pattern='error:|RuntimeError:|Undefined symbols|undefined symbol:|unimplemented ath11k imports|compile failures|Patch does not apply|refusing'
+          # Same line from two logs (the build log is also copied to kernel/) counts once.
+          found=$(grep -hE "$pattern" $logs 2>/dev/null | grep -v 'ccache' | awk '!seen[$0]++' | head -n 300)
+          undefined=$(grep -hA20 'Undefined symbols' $logs 2>/dev/null | awk '!seen[$0]++' | head -n 60)
+          if [ -n "$found" ]; then
+            n=$(printf '%s\n' "$found" | grep -c .)
+            echo "================ ${n} error line(s) ================"
+            printf '%s\n' "$found"
+            [ -z "$undefined" ] || { echo '---- undefined symbols ----'; printf '%s\n' "$undefined"; }
+            echo "=================================================="
+            { echo "### kernel precheck: ${n} error line(s)"; echo '```'; printf '%s\n' "$found"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'no error lines in the build logs'
+          echo '### kernel precheck: no error lines' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-precheck-logs
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            build-*.log
+            precheck-console.log
+            tree/build/t970-ath11k/*.log
