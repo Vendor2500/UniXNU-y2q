@@ -21,8 +21,8 @@ name: kernel-precheck
 # that make and still stop at their own first failure.
 #
 # Its concurrency group is its own: it never cancels a package run, and a newer
-# precheck of the same ref replaces an older one. It saves no cache, so it never
-# evicts the package job's.
+# precheck of the same ref replaces an older one. It reads the package job's XNU
+# tree cache without writing it, and keeps a ccache of its own (ccache-precheck-*).
 #
 #   gh workflow run kernel-precheck.yml --repo kmu1757/UniXNU-y2q [--ref <branch>]
 
@@ -135,12 +135,16 @@ jobs:
           key: xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-${{ hashFiles('device/patches/xnu-ipados18/**') }}
           restore-keys: |
             xnu-tree-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ hashFiles('device/scripts/build-xnu-ipados18.sh', 'device/scripts/build-ipados18-pong-macos.py', 'device/scripts/prepare-xnu-source.py', 'device/kits/PongPlatform24/build-support/merged-scripts/build-xnu-ipados18.sh', 'device/kits/PongPlatform24/build-support/merged-scripts/build-ipados18-pong-macos.py', 'device/board.toml') }}-
+      # Its own ccache first: a cancelled package run saves an empty .ccache
+      # (177 bytes) under the package prefix, and that newest entry is what a
+      # restore by prefix gets. The package job's entries are the fallback.
       - name: restore ccache
         uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-precheck-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            ccache-precheck-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-
             ccache-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-
       - name: kernel compile
         working-directory: device
@@ -169,8 +173,8 @@ jobs:
                  echo precheck-console.log)
           pattern='error:|RuntimeError:|Undefined symbols|undefined symbol:|unimplemented ath11k imports|compile failures|Patch does not apply|refusing'
           # Same line from two logs (the build log is also copied to kernel/) counts once.
-          found=$(grep -hE "$pattern" $logs 2>/dev/null | grep -v 'ccache' | awk '!seen[$0]++' | head -n 300)
-          undefined=$(grep -hA20 'Undefined symbols' $logs 2>/dev/null | awk '!seen[$0]++' | head -n 60)
+          found=$(grep -hE "$pattern" $logs 2>/dev/null | grep -v 'ccache' | awk '!seen[$0]++' | head -n 300 || true)
+          undefined=$(grep -hA20 'Undefined symbols' $logs 2>/dev/null | awk '!seen[$0]++' | head -n 60 || true)
           if [ -n "$found" ]; then
             n=$(printf '%s\n' "$found" | grep -c .)
             echo "================ ${n} error line(s) ================"
@@ -182,6 +186,14 @@ jobs:
           fi
           echo 'no error lines in the build logs'
           echo '### kernel precheck: no error lines' >> "$GITHUB_STEP_SUMMARY"
+      # A failed compile still leaves every object that did compile; a cancelled
+      # run saves nothing, so it cannot leave an empty entry behind.
+      - name: save ccache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-precheck-${{ runner.os }}-${{ hashFiles('device/feeds.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
