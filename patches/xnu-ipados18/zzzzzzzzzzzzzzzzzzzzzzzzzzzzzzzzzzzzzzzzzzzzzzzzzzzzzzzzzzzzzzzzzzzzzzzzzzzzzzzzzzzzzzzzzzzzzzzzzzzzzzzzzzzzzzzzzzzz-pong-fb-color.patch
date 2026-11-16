@@ -1,12 +1,12 @@
 diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-index 434004c..1f832d4 100644
+index 434004c..82407fa 100644
 --- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 +++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
 @@ -74,11 +74,15 @@ enum {
  	kFBMethodRequestPowerChange     = 12,
  	kFBMethodSwapSignal             = 20,
  	kFBMethodSetDisplayDevice       = 22,
-+	kFBMethodSetWhiteOnBlackMode    = 19,           /* (19, 51, 54, 55: _kern_* / IOMobileFramebuffer* of 22H374, z110) */
++	kFBMethodSetWhiteOnBlackMode    = 19,           /* (19, 51, 54, 55: _kern_* / IOMobileFramebuffer* of 22H374, z116) */
  	kFBMethodGetDigitalOutState     = 25,
  	kFBMethodGetDotPitch            = 28,
  	kFBMethodGetDisplayArea         = 29,
@@ -34,7 +34,7 @@ index 434004c..1f832d4 100644
  static bool             gFlipping;
  
 +/*
-+ * Colour (z110, boot-arg fb_color=1; 0, the default: these selectors are refused as before). What iOS
++ * Colour (z116, boot-arg fb_color=1; 0, the default: these selectors are refused as before). What iOS
 + * asks of the display's colour -- IOMobileFramebufferSetMatrix(fb, scope, double m[9]) (selector 55;
 + * the boot calls it with scope 9), SetWhiteOnBlackMode (19: inverted colours), SetColorRemapMode (51)
 + * -- is kept, and the frames are copied to the panel through one 3 x 3 matrix made of it: every scope's
