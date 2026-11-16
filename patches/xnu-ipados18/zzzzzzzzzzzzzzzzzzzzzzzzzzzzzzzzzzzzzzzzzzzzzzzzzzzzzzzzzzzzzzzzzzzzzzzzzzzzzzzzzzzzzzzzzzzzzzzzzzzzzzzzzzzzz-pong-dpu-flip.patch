@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
-index f4b0e76..d2b8657 100644
+index f4b0e76..c102dd4 100644
 --- a/bsd/dev/pong_usb_ctl.c
 +++ b/bsd/dev/pong_usb_ctl.c
 @@ -2097,6 +2097,15 @@ dispatch_command(const char *cmd)
@@ -8,7 +8,7 @@ index f4b0e76..d2b8657 100644
  		cmd_handle_usbrole(cmd + 7);
 +	} else if (strcmp(cmd, "dpu") == 0) {
 +		/* the display controller, read only: clocks, CTL, mixers, pipes, INTF1/2 tear check, frames a second, flipping
-+		 * (iokit/Kernel/MiniIOMobileFramebuffer.cpp, z105) */
++		 * (iokit/Kernel/MiniIOMobileFramebuffer.cpp, z109) */
 +		extern int pong_dpu_usb(char *reply, size_t cap);
 +		static char dp_reply[3600];
 +
