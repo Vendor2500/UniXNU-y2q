@@ -1,0 +1,887 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 503f599..648ee53 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -428,6 +428,7 @@ bsd/dev/pong_bt.c			standard
+ bsd/dev/qbt_transport.c			standard
+ bsd/dev/pong_slpi.c			standard
+ bsd/dev/pong_ssc.c			standard
++bsd/dev/pong_fastrpc.c			standard
+ bsd/dev/qcom/QcomSmem.c			standard
+ bsd/dev/qcom/QcomSmp2p.c			standard
+ bsd/dev/qcom/QcomGlink.c			standard
+diff --git a/bsd/dev/pong_fastrpc.c b/bsd/dev/pong_fastrpc.c
+new file mode 100644
+index 0000000..beb6fc0
+--- /dev/null
++++ b/bsd/dev/pong_fastrpc.c
+@@ -0,0 +1,816 @@
++/*
++ * SM-T970 sensor DSP (SLPI): FastRPC to its sensors PD, stage 3b of auto-brightness / auto-rotation
++ * (iOSPort work/sensors_scope/SCOPE.md). On the device (11-16) the SLPI booted and its sensor client service answered,
++ * but with no sensor: the physical sensor drivers live in the "sensors" user PD, which waits for an APPS client to
++ * attach over FastRPC (GLINK channel fastrpcglink-apps-dsp) and to serve its reverse calls (its registry and JSON
++ * configuration are read from APPS files). That is what Android's sscrpcd and Linux's hexagonrpcd -s do; this file
++ * does the same from the kernel, written from the protocol only (wire layouts as Linux drivers/misc/fastrpc.c and
++ * linux-msm/hexagonrpc use them; no code taken).
++ *
++ * All off by default. USB (pong_slpi.c passes `slpi rpc ...` here):
++ *   slpi boot rpc     (or boot argument pong_slpi_rpc=1) also accepts the SLPI's fastrpcglink-apps-dsp channel; the
++ *                     SLPI opens it while booting, so this has to be chosen before `slpi boot`
++ *   slpi rpc          status: channel, SMMU streams 0x540-0x543 (SMR/S2CR scan, reads only), invoke state, the paths
++ *                     the PD asked for
++ *   slpi rpc smmu     installs one SMR (stream 0x540, mask 3) routed to bypass, if no valid SMR covers those streams
++ *                     (writes the APPS SMMU; the hypervisor may refuse it: the status line then shows it unchanged)
++ *   slpi rpc go       attach to the sensors PD (INIT_ATTACH, pd 2), register adsp_default_listener, adsp_listener
++ *                     init2, then serve reverse calls (next2 loop) from SR_ROOT on the Data volume:
++ *                       <root>/registry/<f>     for /mnt/vendor/persist/sensors/registry/registry/<f> (and /persist/...)
++ *                       <root>/config/<f>       for /vendor/etc/sensors/config/<f>; <root>/config.list names them
++ *                                               (one per line: readdir answers from it)
++ *                       <root>/sns_reg_config   for /vendor/etc/sensors/sns_reg_config
++ *
++ * Addresses: the SLPI reaches APPS buffers through the APPS SMMU with stream 0x541..0x543 (DT sdsprpc-smd context
++ * banks 13..15); the DSP takes the upper 32 bits of a buffer address as the context bank (Android adsprpc adds
++ * cb << 32) and the lower 32 bits as the address, so buffers are below 4 GiB and, with the bypass SMR, physical.
++ * Decision points the device answers: whether the hypervisor takes the SMR, whether the PD accepts the attach,
++ * which files it asks for, whether it needs apps_mem (answered unsupported here, and logged).
++ * Not tested on the device when written (z128).
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLib.h>
++#include "qcom/QcomGlink.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
++extern void IOFreeContiguous(void *address, vm_size_t size);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++
++bool pong_fastrpc_wanted(void);
++void pong_fastrpc_want(void);
++void pong_fastrpc_channel(QcomGlink *g);
++void pong_fastrpc_poll(void);
++int pong_fastrpc_usb(char *reply, size_t cap, const char *args);
++
++/* ---- constants (Linux fastrpc.c, hexagonrpc) ---- */
++#define FR_CHANNEL      "fastrpcglink-apps-dsp"
++#define FR_INTENT       0x80u           /* DT qcom,intents <0x64 0x40>: 100-byte messages */
++#define FR_INTENTS      16u
++#define FR_INIT_HANDLE  1u
++#define FR_PD_SENSORS   2u
++#define FR_CLIENT       1u              /* any nonzero process id (fastrpc.c: session index + 1) */
++#define FR_NOTIFY_CTX   0xabcdabcdull   /* a PD notification, not a response */
++#define FR_REMOTECTL    0u
++#define FR_LISTENER     3u
++#define FR_SC(m, in, out)   (((uint32_t)(m) & 0x1fu) << 24 | ((uint32_t)(in) & 0xffu) << 16 | ((uint32_t)(out) & 0xffu) << 8)
++#define FR_SC_METHOD(sc)    (((sc) >> 24) & 0x1fu)
++#define FR_SC_IN(sc)        (((sc) >> 16) & 0xffu)
++#define FR_SC_OUT(sc)       (((sc) >> 8) & 0xffu)
++#define FR_MAXARGS      8u
++#define FR_BUF          0x10000u        /* one invoke at a time: meta + arguments */
++#define FR_REVERSE      256u            /* adsp_listener next2: the reverse call's input blob */
++#define FR_RBLOB        0x4000u         /* a reverse call's encoded outbufs (fread data), sent back in next2 */
++/* AEE errors (hexagonrpc error.h) */
++#define AEE_EFAILED     1u
++#define AEE_EBADPARM    14u
++#define AEE_EUNSUPPORTED 20u
++#define AEE_ENOSUCH     39u
++#define AEE_EBADHANDLE  44u
++/* APPS SMMU (stock DTS apps-smmu@15000000, SMMUv2 global space 0; pong_wifi_link.c) */
++#define FR_SMMU         0x15000000UL
++#define FR_SCR0         0x000u
++#define FR_IDR0         0x020u
++#define FR_SGFSR        0x048u
++#define FR_SGFSYNR1     0x054u
++#define FR_SMR(n)       (0x800u + 4u * (n))
++#define FR_S2CR(n)      (0xc00u + 4u * (n))
++#define FR_SID          0x540u
++#define FR_SID_MASK     0x3u
++#define SR_ROOT         "/private/var/mobile/Library/Pong/sensors"
++
++enum { FR_OFF, FR_WAIT_UP, FR_ATTACH, FR_OPEN_DL, FR_REGISTER, FR_INIT2, FR_NEXT2, FR_STOPPED };
++static const char *const fr_state_name[] = { "off", "wait", "attach", "open-dl", "register", "init2", "next2", "stopped" };
++
++static struct {
++	volatile bool wanted, go;
++	int state;
++	QcomGlink *g;
++	QcomGlinkChannel *ch;
++	uint8_t *buf;                   /* FR_BUF bytes, physically contiguous below 4 GiB */
++	uint64_t pa;
++	uint32_t cb;                    /* context bank put in address bits 63:32 (pong_slpi_rpc_cb, default 1) */
++	uint64_t seq;
++	bool pending, sent, answered;   /* an invoke built and not answered; sent: it went out; answered: not handled yet */
++	uint8_t msg[40];
++	uint64_t ctx;
++	int32_t retval;
++	uint32_t handle, sc, nin, nout;
++	uint32_t off[FR_MAXARGS], len[FR_MAXARGS];      /* argument i in buf */
++	uint32_t dl;                    /* adsp_default_listener's handle */
++	uint32_t rctx, rres, rlen;      /* the reverse call answered in the next next2 */
++	uint8_t rblob[FR_RBLOB];        /* its encoded outbufs */
++	uint32_t invokes, responses, reverse, notifies, unmatched, last_err, stop_why;
++	uint32_t smr_installed;         /* SMR index + 1 */
++	char paths[400];                /* the paths asked for, in order */
++	char last[96];
++} fr;
++
++static void
++fr_note(const char *text)
++{
++	char line[128];
++	const int n = snprintf(line, sizeof(line), "[PONG_FASTRPC] %s\n", text);
++
++	pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++	strlcpy(fr.last, text, sizeof(fr.last));
++}
++static void
++fr_stop(uint32_t why, const char *text)
++{
++	fr.stop_why = why;
++	fr.state = FR_STOPPED;
++	fr_note(text);
++}
++static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
++static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, (uint32_t)(v >> 32)); }
++static uint64_t le64(const uint8_t *p) { return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32; }
++static void
++fr_cache(const void *p, size_t n)   /* clean and invalidate to the point of coherency: the bypass stream may not snoop */
++{
++	for (uintptr_t a = (uintptr_t)p & ~(uintptr_t)63; a < (uintptr_t)p + n; a += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---- channel ---- */
++bool pong_fastrpc_wanted(void) { uint32_t v = 0; return fr.wanted || (PE_parse_boot_argn("pong_slpi_rpc", &v, sizeof(v)) && v); }
++void pong_fastrpc_want(void) { fr.wanted = true; }
++
++static void
++fr_receive(void *c, QcomGlinkChannel *ch, const uint8_t *data, uint32_t length)
++{
++	(void)c;
++	(void)ch;
++	if (length < 12) {
++		return;
++	}
++	const uint64_t ctx = le64(data);
++	if (ctx == FR_NOTIFY_CTX) {
++		fr.notifies++;
++		return;
++	}
++	if (!fr.pending || ((ctx ^ fr.ctx) & ~0xffull)) {    /* index and sequence must be ours */
++		fr.unmatched++;
++		return;
++	}
++	fr.retval = (int32_t)le32(data + 8);
++	fr.responses++;
++	fr.pending = false;
++	fr.answered = true;
++}
++static void
++fr_state_cb(void *c, QcomGlinkChannel *ch, int up)
++{
++	(void)c;
++	(void)ch;
++	fr_note(up ? "channel up" : "channel down");
++}
++void
++pong_fastrpc_channel(QcomGlink *g)
++{
++	static const QcomGlinkClient client = { fr_state_cb, fr_receive };
++	static uint8_t *storage;
++	uint32_t v = 1;
++
++	(void)PE_parse_boot_argn("pong_slpi_rpc_cb", &v, sizeof(v));
++	fr.cb = v & 0xfu;
++	storage = kalloc_data(FR_INTENT * FR_INTENTS, Z_WAITOK);
++	fr.g = g;
++	fr.ch = storage ? qcom_glink_channel(g, FR_CHANNEL, FR_INTENT, FR_INTENTS, storage, &client, NULL, 0) : NULL;
++	fr.state = fr.ch ? FR_WAIT_UP : FR_OFF;
++	fr_note(fr.ch ? "channel registered" : "channel not registered");
++}
++
++/* ---- one invoke: arguments into buf (meta first: remote args, invoke bufs, pages, fd and crc lists), then the message ---- */
++static uint64_t fr_dsp(uint64_t pa) { return (pa & 0xffffffffull) | (uint64_t)fr.cb << 32; }
++
++static bool
++fr_build(uint32_t handle, uint32_t sc, uint32_t client, uint32_t pd, const uint8_t *const *in, const uint32_t *inlen,
++    const uint32_t *outlen)
++{
++	const uint32_t nin = FR_SC_IN(sc), nout = FR_SC_OUT(sc), n = nin + nout;
++	uint32_t pos;
++
++	if (n > FR_MAXARGS || fr.pending) {
++		return false;
++	}
++	bzero(fr.buf, FR_BUF);
++	pos = (40u * n + 388u + 127u) & ~127u;
++	for (uint32_t i = 0; i < n; i++) {
++		const uint32_t l = i < nin ? inlen[i] : outlen[i - nin];
++		uint8_t *rpra = fr.buf + 16u * i, *list = fr.buf + 16u * n + 8u * i, *page = fr.buf + 24u * n + 16u * i;
++
++		if (pos + l > FR_BUF) {
++			return false;
++		}
++		fr.off[i] = pos;
++		fr.len[i] = l;
++		if (i < nin && l) {
++			memcpy(fr.buf + pos, in[i], l);
++		}
++		put64(rpra, (uint64_t)(uintptr_t)(fr.buf + pos));     /* pv: only its offset in the page matters to the DSP */
++		put64(rpra + 8, l);
++		put32(list, l ? 1u : 0u);
++		put32(list + 4, i);
++		if (l) {
++			const uint64_t first = (fr.pa + pos) & ~0xfffull, end = (fr.pa + pos + l + 0xfffu) & ~0xfffull;
++
++			put64(page, fr_dsp(first));
++			put64(page + 8, end - first);
++		}
++		pos = (pos + l + 127u) & ~127u;
++	}
++	fr_cache(fr.buf, FR_BUF);
++	fr.handle = handle;
++	fr.sc = sc;
++	fr.nin = nin;
++	fr.nout = nout;
++	fr.seq++;
++	fr.ctx = (fr.seq << 16) | (1ull << 8) | pd;        /* context index 1, sequence, PD */
++	put32(fr.msg, client);
++	put32(fr.msg + 4, 1);                               /* tid */
++	put64(fr.msg + 8, fr.ctx);
++	put32(fr.msg + 16, handle);
++	put32(fr.msg + 20, sc);
++	put64(fr.msg + 24, fr_dsp(fr.pa));
++	put64(fr.msg + 32, (pos + 0xfffu) & ~0xfffu);
++	fr.pending = true;
++	fr.sent = false;
++	fr.invokes++;
++	return true;
++}
++static const uint8_t *fr_out(uint32_t i) { return fr.buf + fr.off[fr.nin + i]; }
++
++/* ---- the reverse calls (DSP -> APPS): remotectl 0, apps_std 1, apps_mem 2 ---- */
++struct fr_rev { uint32_t nin; const uint8_t *in[8]; uint32_t inlen[8]; uint32_t nout; uint8_t *out[4]; uint32_t outlen[4]; };
++static uint8_t fr_ob0[300], fr_ob1[FR_RBLOB - 0x100];
++static struct { vnode_t vp; vfs_context_t ctx; uint64_t off; bool used; } fr_files[8];
++static struct { bool used; uint32_t next; } fr_dirs[2];
++
++static void
++fr_path(const char *path)
++{
++	const size_t at = strnlen(fr.paths, sizeof(fr.paths));
++
++	if (at < sizeof(fr.paths) - 1) {
++		snprintf(fr.paths + at, sizeof(fr.paths) - at, "%s%s", at ? " " : "", path);
++	}
++}
++/* A DSP path to a Data volume path; 0 when it is one of the mapped ones. */
++static int
++fr_map(const char *dsp, char *out, size_t cap)
++{
++	static const struct { const char *from, *to; } map[] = {
++		{ "/mnt/vendor/persist/sensors/registry/registry", "/registry" }, { "/persist/sensors/registry/registry", "/registry" },
++		{ "/vendor/etc/sensors/config", "/config" }, { "/system/vendor/etc/sensors/config", "/config" },
++		{ "/vendor/etc/sensors/sns_reg_config", "/sns_reg_config" }, { "/system/vendor/etc/sensors/sns_reg_config", "/sns_reg_config" },
++	};
++	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++		const size_t n = strlen(map[i].from);
++
++		if (!strncmp(dsp, map[i].from, n) && (dsp[n] == '\0' || dsp[n] == '/') && !strstr(dsp, "..")) {
++			snprintf(out, cap, "%s%s%s", SR_ROOT, map[i].to, dsp + n);
++			return 0;
++		}
++	}
++	return -1;
++}
++static uint32_t
++fr_open(const char *path, uint32_t *fd)
++{
++	char real[200];
++	unsigned i;
++
++	fr_path(path);
++	if (fr_map(path, real, sizeof(real))) {
++		return AEE_ENOSUCH;
++	}
++	for (i = 0; i < 8 && fr_files[i].used; i++) {
++	}
++	if (i == 8) {
++		return AEE_EFAILED;
++	}
++	fr_files[i].ctx = vfs_context_create(NULL);
++	if (vnode_open(real, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &fr_files[i].vp, fr_files[i].ctx)) {
++		vfs_context_rele(fr_files[i].ctx);
++		return AEE_ENOSUCH;
++	}
++	fr_files[i].used = true;
++	fr_files[i].off = 0;
++	*fd = i + 1;
++	return 0;
++}
++static bool fr_fd_ok(uint32_t fd) { return fd >= 1 && fd <= 8 && fr_files[fd - 1].used; }
++static uint64_t
++fr_size(uint32_t fd)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	return vnode_getattr(fr_files[fd - 1].vp, &va, fr_files[fd - 1].ctx) || !VATTR_IS_SUPPORTED(&va, va_data_size) ? 0 :
++	       va.va_data_size;
++}
++
++/* Answers one reverse call; returns its AEE result and fills r->out (sizes in r->outlen). */
++static uint32_t
++fr_serve(uint32_t handle, uint32_t method, struct fr_rev *r)
++{
++	const uint8_t *p = r->nin ? r->in[0] : NULL;     /* the primitive inputs */
++	const uint32_t pl = r->nin ? r->inlen[0] : 0;
++	uint8_t *o = r->out[0];
++
++	if (handle == 0 && method == 0 && pl >= 8 && r->nin >= 2) {          /* remotectl open(name) */
++		const char *name = (const char *)r->in[1];
++		uint32_t h = 0;
++
++		if (r->inlen[1] && name[r->inlen[1] - 1] == '\0') {
++			h = !strcmp(name, "apps_std") ? 1u : !strcmp(name, "apps_mem") ? 2u : 0u;
++			fr_path(name);
++		}
++		r->outlen[0] = 8;
++		r->outlen[1] = le32(p + 4) <= sizeof(fr_ob0) ? le32(p + 4) : 0;
++		put32(o, h);
++		put32(o + 4, h ? 0u : 0xfffffffbu);
++		return h ? 0u : 0xfffffffbu;
++	}
++	if (handle == 0 && method == 1 && pl >= 8) {                       /* remotectl close */
++		r->outlen[0] = 4;
++		r->outlen[1] = le32(p + 4) <= sizeof(fr_ob0) ? le32(p + 4) : 0;
++		put32(o, 0);
++		return 0;
++	}
++	if (handle == 1) {                                                 /* apps_std */
++		if (method == 31 && pl >= 4) {                                  /* a method id above 30: the first word */
++			method = le32(p);
++			p += 4;
++		}
++		switch (method) {
++		case 0: {                                                       /* fopen(name, mode) */
++			uint32_t fd = 0, rc;
++			const char *name = r->nin >= 3 && r->inlen[1] ? (const char *)r->in[1] : "";
++
++			if (r->nin < 3 || name[r->inlen[1] - 1] != '\0') {
++				return AEE_EBADPARM;
++			}
++			rc = fr_open(name, &fd);
++			r->outlen[0] = 4;
++			put32(o, fd);
++			return rc;
++		}
++		case 19: {                                                      /* fopen_with_env(env, delim, name, mode) */
++			uint32_t fd = 0, rc;
++			const char *name = r->nin >= 5 && r->inlen[3] ? (const char *)r->in[3] : "";
++
++			if (r->nin < 5 || name[r->inlen[3] - 1] != '\0') {
++				return AEE_EBADPARM;
++			}
++			rc = fr_open(name, &fd);
++			r->outlen[0] = 4;
++			put32(o, fd);
++			return rc;
++		}
++		case 4: {                                                       /* fread(fd, buffer) */
++			const uint32_t fd = le32(p), want = le32(p + 4);
++			uint32_t got = 0;
++			int resid = 0;
++
++			if (!fr_fd_ok(fd) || want > sizeof(fr_ob1)) {
++				return AEE_EBADPARM;
++			}
++			if (want && vn_rdwr(UIO_READ, fr_files[fd - 1].vp, (caddr_t)r->out[1], (int)want, (off_t)fr_files[fd - 1].off,
++			    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT, vfs_context_ucred(fr_files[fd - 1].ctx), &resid, current_proc()) == 0) {
++				got = want - (uint32_t)resid;
++			}
++			fr_files[fd - 1].off += got;
++			r->outlen[0] = 8;
++			r->outlen[1] = got;
++			put32(o, got);
++			put32(o + 4, got < want ? 1u : 0u);
++			return 0;
++		}
++		case 3: {                                                       /* fclose(fd) */
++			const uint32_t fd = le32(p);
++
++			if (fr_fd_ok(fd)) {
++				(void)vnode_close(fr_files[fd - 1].vp, FREAD, fr_files[fd - 1].ctx);
++				vfs_context_rele(fr_files[fd - 1].ctx);
++				fr_files[fd - 1].used = false;
++			}
++			return 0;
++		}
++		case 2:                                                         /* fflush */
++			return 0;
++		case 9: {                                                       /* fseek(fd, offset, whence 0 set 1 cur 2 end) */
++			const uint32_t fd = le32(p), whence = le32(p + 8);
++			const int32_t offset = (int32_t)le32(p + 4);
++			int64_t to;
++
++			if (!fr_fd_ok(fd) || whence > 2) {
++				return AEE_EBADPARM;
++			}
++			to = (whence == 0 ? 0 : whence == 1 ? (int64_t)fr_files[fd - 1].off : (int64_t)fr_size(fd)) + offset;
++			if (to < 0) {
++				return AEE_EBADPARM;
++			}
++			fr_files[fd - 1].off = (uint64_t)to;
++			return 0;
++		}
++		case 31: {                                                      /* stat(name): 96 bytes */
++			uint32_t fd = 0, rc;
++			const char *name = r->nin >= 2 && r->inlen[1] ? (const char *)r->in[1] : "";
++
++			if (r->nin < 2 || name[r->inlen[1] - 1] != '\0') {
++				return AEE_EBADPARM;
++			}
++			rc = fr_open(name, &fd);
++			r->outlen[0] = 96;
++			bzero(o, 96);
++			if (!rc) {
++				put32(o + 24, 0100444);                                 /* mode: a regular file (u32 at 24, nlink 28) */
++				put32(o + 28, 1);
++				put64(o + 40, fr_size(fd));
++				(void)vnode_close(fr_files[fd - 1].vp, FREAD, fr_files[fd - 1].ctx);
++				vfs_context_rele(fr_files[fd - 1].ctx);
++				fr_files[fd - 1].used = false;
++			}
++			return rc;
++		}
++		case 26: {                                                      /* opendir(name): 8-byte handle */
++			const char *name = r->nin >= 2 && r->inlen[1] ? (const char *)r->in[1] : "";
++			char real[200];
++
++			fr_path(name);
++			if (r->nin < 2 || name[r->inlen[1] - 1] != '\0' || fr_map(name, real, sizeof(real)) || fr_dirs[0].used) {
++				return AEE_ENOSUCH;
++			}
++			fr_dirs[0].used = true;
++			fr_dirs[0].next = 0;
++			r->outlen[0] = 8;
++			put64(o, 1);
++			return 0;
++		}
++		case 28: {                                                      /* readdir: inode, name[256], eof, from config.list */
++			uint32_t line = 0, n = 0;
++			uint8_t c;
++			int resid;
++
++			r->outlen[0] = 264;
++			bzero(o, 264);
++			if (!fr_dirs[0].used) {
++				return AEE_EBADPARM;
++			}
++			put32(o + 260, 1);
++			{
++				vfs_context_t ctx = vfs_context_create(NULL);
++				vnode_t vp = NULLVP;
++				uint64_t off = 0;
++
++				if (!vnode_open(SR_ROOT "/config.list", FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++					for (; n < 255; off++) {
++						resid = 0;
++						if (vn_rdwr(UIO_READ, vp, (caddr_t)&c, 1, (off_t)off, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++						    vfs_context_ucred(ctx), &resid, current_proc()) || resid) {
++							break;
++						}
++						if (c == '\n') {
++							if (line++ == fr_dirs[0].next) {
++								break;
++							}
++							n = 0;
++						} else if (line == fr_dirs[0].next) {
++							o[4 + n++] = c;
++						}
++					}
++					(void)vnode_close(vp, FREAD, ctx);
++				}
++				vfs_context_rele(ctx);
++			}
++			if (n) {
++				put32(o, fr_dirs[0].next + 1);
++				put32(o + 260, 0);
++				fr_dirs[0].next++;
++			} else {
++				bzero(o + 4, 256);
++			}
++			return 0;
++		}
++		case 27:                                                        /* closedir */
++			fr_dirs[0].used = false;
++			return 0;
++		default:
++			return AEE_EUNSUPPORTED;
++		}
++	}
++	if (handle == 2) {                                                 /* apps_mem: not served yet (decision point) */
++		fr_path(method == 2 ? "apps_mem.request_map64" : "apps_mem.?");
++		return AEE_EUNSUPPORTED;
++	}
++	return AEE_EBADHANDLE;
++}
++
++/* Decodes the reverse call next2 returned, serves it and encodes its outbufs for the next next2. */
++static void
++fr_reverse(void)
++{
++	const uint8_t *prim = fr_out(0), *blob = fr_out(1);
++	const uint32_t rctx = le32(prim), handle = le32(prim + 4), sc = le32(prim + 8), blen = le32(prim + 12);
++	struct fr_rev r;
++	uint32_t pos = 0, result, method = FR_SC_METHOD(sc);
++
++	bzero(&r, sizeof(r));
++	fr.reverse++;
++	r.nin = FR_SC_IN(sc);
++	r.nout = FR_SC_OUT(sc);
++	result = (sc & 0xffu) || r.nin > 8 || r.nout > 2 || blen > FR_REVERSE ? AEE_EBADPARM : 0;
++	for (uint32_t i = 0; !result && i < r.nin; i++) {                   /* u32 size, 8-aligned data */
++		uint32_t n;
++
++		if (pos + 4 > blen) {
++			result = AEE_EBADPARM;
++			break;
++		}
++		n = le32(blob + pos);
++		pos += 4;
++		if (n) {
++			pos = (pos + 7u) & ~7u;
++		}
++		if (pos + n > blen) {
++			result = AEE_EBADPARM;
++			break;
++		}
++		r.in[i] = blob + pos;
++		r.inlen[i] = n;
++		pos += n;
++	}
++	bzero(fr_ob0, sizeof(fr_ob0));
++	r.out[0] = fr_ob0;
++	r.out[1] = fr_ob1;
++	if (!result) {
++		result = fr_serve(handle, method, &r);
++	}
++	/* the outbufs the call declared: u32 size, then the data 8-aligned */
++	pos = 0;
++	for (uint32_t i = 0; i < FR_SC_OUT(sc) && i < 4; i++) {
++		const uint32_t n = i < 2 && pos + 16 + r.outlen[i] <= FR_RBLOB ? r.outlen[i] : 0;
++
++		put32(fr.rblob + pos, n);
++		pos += 4;
++		if (n) {
++			pos = (pos + 7u) & ~7u;
++			memcpy(fr.rblob + pos, i ? fr_ob1 : fr_ob0, n);
++			pos += n;
++		}
++	}
++	fr.rctx = rctx;
++	fr.rres = result;
++	fr.rlen = pos;
++	snprintf(fr.last, sizeof(fr.last), "rev h%u m%u in%u out%u -> %u", handle, method, r.nin, r.nout, result);
++}
++
++/* ---- the sequence, one step per answer ---- */
++static bool
++fr_send(uint32_t handle, uint32_t sc, uint32_t client, const uint8_t *const *in, const uint32_t *inlen, const uint32_t *outlen)
++{
++	if (!fr_build(handle, sc, client, FR_PD_SENSORS, in, inlen, outlen)) {
++		fr_stop(1, "build failed");
++		return false;
++	}
++	return true;
++}
++static void
++fr_next(void)
++{
++	switch (fr.state) {
++	case FR_ATTACH: {                                                  /* INIT_ATTACH(client id) on handle 1 */
++		uint8_t id[4];
++		const uint8_t *in[1] = { id };
++		const uint32_t inlen[1] = { 4 };
++
++		put32(id, FR_CLIENT);
++		(void)fr_send(FR_INIT_HANDLE, FR_SC(0, 1, 0), 0, in, inlen, NULL);
++		break;
++	}
++	case FR_OPEN_DL: {                                                 /* remotectl open("adsp_default_listener") */
++		static const char name[] = "adsp_default_listener";
++		uint8_t prim[8];
++		const uint8_t *in[2] = { prim, (const uint8_t *)name };
++		const uint32_t inlen[2] = { 8, sizeof(name) }, outlen[2] = { 8, 256 };
++
++		put32(prim, sizeof(name));
++		put32(prim + 4, 256);
++		(void)fr_send(FR_REMOTECTL, FR_SC(0, 2, 2), FR_CLIENT, in, inlen, outlen);
++		break;
++	}
++	case FR_REGISTER:                                                  /* adsp_default_listener register: method 0 */
++		(void)fr_send(fr.dl, FR_SC(0, 0, 0), FR_CLIENT, NULL, NULL, NULL);
++		break;
++	case FR_INIT2:
++		(void)fr_send(FR_LISTENER, FR_SC(3, 0, 0), FR_CLIENT, NULL, NULL, NULL);
++		break;
++	case FR_NEXT2: {                                                   /* next2(rctx, result, outbufs) -> the next call */
++		uint8_t prim[16];
++		const uint8_t *in[2] = { prim, fr.rblob };
++		const uint32_t inlen[2] = { 16, fr.rlen }, outlen[2] = { 16, FR_REVERSE };
++
++		put32(prim, fr.rctx);
++		put32(prim + 4, fr.rres);
++		put32(prim + 8, fr.rlen);
++		put32(prim + 12, FR_REVERSE);
++		(void)fr_send(FR_LISTENER, FR_SC(4, 2, 2), FR_CLIENT, in, inlen, outlen);
++		break;
++	}
++	default:
++		break;
++	}
++}
++/* An answer came: check it and move on. */
++static void
++fr_answered(void)
++{
++	fr_cache(fr.buf, FR_BUF);
++	if (fr.retval) {
++		char text[64];
++
++		fr.last_err = (uint32_t)fr.retval;
++		snprintf(text, sizeof(text), "%s failed %d", fr_state_name[fr.state], (int)fr.retval);
++		fr_stop((uint32_t)fr.state, text);
++		return;
++	}
++	switch (fr.state) {
++	case FR_ATTACH:
++		fr_note("attached to the sensors PD");
++		fr.state = FR_OPEN_DL;
++		break;
++	case FR_OPEN_DL:
++		if (le32(fr_out(0) + 4)) {
++			fr_stop(FR_OPEN_DL, "adsp_default_listener not opened");
++			return;
++		}
++		fr.dl = le32(fr_out(0));
++		fr.state = FR_REGISTER;
++		break;
++	case FR_REGISTER:
++		fr.state = FR_INIT2;
++		break;
++	case FR_INIT2:
++		fr.rctx = 0;
++		fr.rres = 0xffffffffu;
++		fr.rlen = 0;
++		fr.state = FR_NEXT2;
++		fr_note("listener running");
++		break;
++	case FR_NEXT2:
++		fr_reverse();
++		break;
++	default:
++		break;
++	}
++}
++
++void
++pong_fastrpc_poll(void)
++{
++	if (!fr.ch || fr.state == FR_OFF || fr.state == FR_STOPPED) {
++		return;
++	}
++	if (fr.state == FR_WAIT_UP) {
++		if (!fr.ch->up || !fr.go) {
++			return;
++		}
++		if (!fr.buf) {
++			for (int tries = 0; tries < 4 && !fr.buf; tries++) {
++				IOPhysicalAddress pa = 0;
++				void *b = IOMallocContiguous(FR_BUF, 0x1000, &pa);
++
++				if (b && pa && (uint64_t)pa + FR_BUF <= (1ull << 32)) {
++					fr.buf = b;
++					fr.pa = pa;
++				} else if (b) {
++					IOFreeContiguous(b, FR_BUF);         /* ponytail: retried a few times; a low-memory pool if this fails */
++				}
++			}
++			if (!fr.buf) {
++				fr_stop(2, "no buffer below 4 GiB");
++				return;
++			}
++		}
++		fr.state = FR_ATTACH;
++	}
++	if (fr.pending && !fr.sent) {
++		const int rc = qcom_glink_send(fr.g, fr.ch, fr.msg, sizeof(fr.msg));
++
++		if (rc == QcomGlinkOk) {
++			fr.sent = true;
++		} else if (rc != QcomGlinkAgain) {
++			fr_stop(3, "send failed");
++		}
++		return;
++	}
++	if (fr.pending) {
++		return;                                                        /* next2 waits for the DSP's next call */
++	}
++	if (fr.answered) {
++		fr.answered = false;
++		fr_answered();
++		if (fr.state == FR_STOPPED) {
++			return;
++		}
++	}
++	fr_next();
++}
++
++/* ---- USB ---- */
++static vm_offset_t fr_smmu;
++
++static int
++fr_smmu_scan(char *out, size_t cap, int install)
++{
++	uint32_t groups, cover = 0, first_free = 0xffffffffu;
++	int k = 0;
++
++	if (!fr_smmu) {
++		fr_smmu = ml_io_map_unmappable(FR_SMMU, 0x1000, 0x7u);
++	}
++	if (!fr_smmu) {
++		return snprintf(out, cap, " smmu=unmapped");
++	}
++#define SR(o) (*(volatile uint32_t *)(fr_smmu + (o)))
++	groups = SR(FR_IDR0) & 0xffu;
++	for (uint32_t i = 0; i < groups && i < 128; i++) {
++		const uint32_t smr = SR(FR_SMR(i)), id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++
++		if (!(smr & 0x80000000u)) {
++			if (first_free == 0xffffffffu) {
++				first_free = i;
++			}
++			continue;
++		}
++		if (((id ^ FR_SID) & ~(mask | FR_SID_MASK)) == 0) {               /* overlaps 0x540..0x543 */
++			if (!cover) {
++				k += snprintf(out + k, cap - (size_t)k, " smr%u=%x/s2cr=%x", i, smr, SR(FR_S2CR(i)));
++			}
++			cover++;
++		}
++	}
++	if (install && !cover && first_free != 0xffffffffu && !fr.smr_installed) {
++		SR(FR_S2CR(first_free)) = 1u << 16;                             /* bypass */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		SR(FR_SMR(first_free)) = 0x80000000u | FR_SID_MASK << 16 | FR_SID;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		fr.smr_installed = first_free + 1;
++		k += snprintf(out + k, cap - (size_t)k, " installed smr%u=%x s2cr=%x", first_free, SR(FR_SMR(first_free)),
++		    SR(FR_S2CR(first_free)));
++	}
++	k += snprintf(out + k, cap - (size_t)k, " smmu scr0=%x groups=%u cover=%u free=%d gfsr=%x syn1=%x", SR(FR_SCR0), groups,
++	    cover, first_free == 0xffffffffu ? -1 : (int)first_free, SR(FR_SGFSR), SR(FR_SGFSYNR1));
++#undef SR
++	return k;
++}
++
++int
++pong_fastrpc_usb(char *reply, size_t cap, const char *args)
++{
++	int k;
++
++	if (!reply || cap < 160) {
++		return -1;
++	}
++	if (args && !strcmp(args, "go")) {
++		if (!fr.ch) {
++			snprintf(reply, cap, "slpi rpc: no channel (slpi boot rpc, or pong_slpi_rpc=1, before the SLPI boots)\n");
++			return -1;
++		}
++		fr.go = true;
++		snprintf(reply, cap, "slpi rpc: attach requested (slpi rpc)\n");
++		return 0;
++	}
++	k = snprintf(reply, cap, "slpi rpc: state=%s why=%u ch=%s cb=%u inv=%u rsp=%u rev=%u notify=%u unmatched=%u err=%d last=%s",
++	    fr_state_name[fr.state], fr.stop_why, !fr.ch ? "none" : fr.ch->up ? "up" : "down", fr.cb, fr.invokes, fr.responses,
++	    fr.reverse, fr.notifies, fr.unmatched, (int)fr.last_err, fr.last[0] ? fr.last : "-");
++	if (k > 0 && (size_t)k < cap) {
++		k += fr_smmu_scan(reply + k, cap - (size_t)k, args && !strcmp(args, "smmu"));
++	}
++	if (k > 0 && (size_t)k < cap) {
++		k += snprintf(reply + k, cap - (size_t)k, " paths=[%s]\n", fr.paths);
++	}
++	return 0;
++}
++#endif /* PONG */
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index ea4965f..bfbbded 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -69,6 +69,12 @@ void pong_ssc_server(uint32_t type, uint32_t service, uint32_t node, uint32_t po
+ void pong_ssc_poll(void);
+ void pong_ssc_enable(void);
+ size_t pong_ssc_stat(char *out, size_t cap);
++/* FastRPC to the sensors PD (pong_fastrpc.c, z128): its channel on this file's GLINK, polled on this file's thread. */
++bool pong_fastrpc_wanted(void);
++void pong_fastrpc_want(void);
++void pong_fastrpc_channel(QcomGlink *g);
++void pong_fastrpc_poll(void);
++int pong_fastrpc_usb(char *reply, size_t cap, const char *args);
+ /* Shared with the audio DSP (pong_adsp.c): the same SMEM, mutex, IPCC, AOSS and RSC, one QMP link, counted lcx/lmx votes. */
+ QcomSmem *pong_q6_smem(void);
+ int pong_q6_alloc(QcomSmemPartition *part, uint16_t id, uint32_t size);
+@@ -833,6 +839,7 @@ sl_service(void)
+ 		}
+ 		(void)qcom_glink_poll(&sl_g);
+ 		pong_ssc_poll();
++		pong_fastrpc_poll();
+ 		sl_pump();
+ 		if (sl_g.version_agreed) {
+ 			sl_stage(SL_GLINK);
+@@ -931,6 +938,9 @@ sl_boot(void)
+ 			sl_fail(SL_GLINK, -4);
+ 			return false;
+ 		}
++		if (pong_fastrpc_wanted()) {
++			pong_fastrpc_channel(&sl_g);   /* the SLPI opens fastrpcglink-apps-dsp while it boots (pong_fastrpc.c) */
++		}
+ 	}
+ 	return true;
+ }
+@@ -975,6 +985,17 @@ pong_slpi_usb(char *reply, size_t cap, const char *args)
+ 		snprintf(reply, cap, "slpi: map failed\n");
+ 		return -1;
+ 	}
++	if (args && strncmp(args, "rpc", 3) == 0 && (args[3] == '\0' || args[3] == ' ')) {
++		args += 3;
++		while (*args == ' ') {
++			args++;
++		}
++		return pong_fastrpc_usb(reply, cap, args);    /* FastRPC to the sensors PD (pong_fastrpc.c) */
++	}
++	if (args && strcmp(args, "boot rpc") == 0) {
++		pong_fastrpc_want();
++		args = "boot";
++	}
+ 	if (args && strcmp(args, "boot") == 0) {
+ 		thread_t th;
+ 
