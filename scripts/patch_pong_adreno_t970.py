@@ -168,7 +168,7 @@ ACCEL_CPP_REPLACEMENTS = (
     ('extern "C" void PongAdrenoAcceleratorStaticInit(void);\n',
      'extern "C" void PongAdrenoAcceleratorStaticInit(void);\nextern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);\n'),
     ('    service->setProperty("MetalPluginName","PongAdrenoMetal");\n',
-     '    {char plugin[96]="PongAdrenoMetal";(void)PE_parse_boot_argn("pong_metal_plugin",plugin,sizeof(plugin));\n'
+     '    {char plugin[96]="../../../var/pong/PongAdrenoMetal";(void)PE_parse_boot_argn("pong_metal_plugin",plugin,sizeof(plugin));\n'
      '     service->setProperty("MetalPluginName",plugin);}\n'),
 )
 
