@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index d30af97..e86795c 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -752,6 +752,17 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 		for (unsigned i = 0; i < 16; i++) {
+ 			AD_ADD("%c%d", i ? ',' : '=', t970_audio_cmd[i]);
+ 		}
++		{
++			/* device mode (bit 32), T970Audio.cpp t970_audio_stream / t970_audio_bytes: runs started/stopped/failed, periods to the
++			 * DSP sent/returned/returned with an error, peak per TDM slot (FL FR RL RR) of what went into the DSP buffers, the last
++			 * failed start (stage << 16 | error); the tone's periods= above stay 0 in device mode */
++			extern volatile uint32_t t970_audio_stream[16], t970_audio_bytes[12];
++
++			AD_ADD(" dev=%u/%u/%u sent=%u/%u/%u slotpk=%u,%u,%u,%u late=%u lead=%u fail=%#x", t970_audio_stream[0],
++			    t970_audio_stream[1], t970_audio_stream[2], t970_audio_stream[3], t970_audio_stream[4], t970_audio_stream[5],
++			    t970_audio_bytes[0], t970_audio_bytes[1], t970_audio_bytes[2], t970_audio_bytes[3], t970_audio_stream[6],
++			    t970_audio_stream[10], t970_audio_stream[11]);
++		}
+ 		AD_ADD(" dma=%#x/%#x amp", t970_audio_dma[0], t970_audio_dma[6]);
+ 		for (unsigned i = 0; i < 4; i++) {
+ 			AD_ADD("%c%#x:%#x", i ? ',' : '=', t970_audio_amp[i][0], t970_audio_amp[i][1]);
