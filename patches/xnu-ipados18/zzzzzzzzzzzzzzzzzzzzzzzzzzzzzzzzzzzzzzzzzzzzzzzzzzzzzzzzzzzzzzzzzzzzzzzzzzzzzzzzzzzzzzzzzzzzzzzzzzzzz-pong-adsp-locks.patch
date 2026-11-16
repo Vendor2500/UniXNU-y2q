@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index 6f2d860..f1bcc1c 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -36,6 +36,7 @@
+ #include <sys/proc.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <libkern/OSAtomic.h>
+@@ -268,6 +269,7 @@ sl_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint6
+ 	}
+ 	return out;
+ }
++/* Interrupts stay on, as sl_scm (the GPU's gz_scm masks them; a large image's auth takes long). */
+ int64_t
+ pong_q6_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
+ {
+@@ -276,28 +278,23 @@ pong_q6_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c,
+ QcomSmem *pong_q6_smem(void) { return sl_map() ? &sl_sm : NULL; }
+ void pong_q6_ring(uint32_t client, uint32_t signal) { if (sl_map()) { sl_ring(client, signal); } }
+ 
+-/* A spin flag for the shared QMP link and votes: both are taken by hand-typed boots, seconds apart. */
+-static void
+-sl_take(volatile UInt32 *flag)
+-{
+-	while (!OSCompareAndSwap(0, 1, flag)) {
+-		sl_ms(1);
+-	}
+-}
+-static void sl_give(volatile UInt32 *flag) { (void)OSCompareAndSwap(1, 0, flag); }
++/* sl_q6_lock: the shared QMP link and the vote count; sl_rsc_lock: every RSC write of the DSP boots (the SLPI's and the ADSP's
++ * threads can vote at the same time). Touch, goodix and Wi-Fi still write the RSC without it. */
++static LCK_GRP_DECLARE(sl_lock_group, "pong-q6");
++static LCK_MTX_DECLARE(sl_q6_lock, &sl_lock_group);
++static LCK_MTX_DECLARE(sl_rsc_lock, &sl_lock_group);
+ 
+ /* One AOSS QMP link for every DSP (a second qcom_qmp_init would restart the handshake under the first): opened on first use, then
+  * text sent and answered. Returns the link state, QcomQmpOpen when the AOP took the message. */
+ int
+ pong_q6_qmp(const char *text)
+ {
+-	static volatile UInt32 busy;
+ 	int state;
+ 
+ 	if (!sl_map()) {
+ 		return QcomQmpBadDescriptor;
+ 	}
+-	sl_take(&busy);
++	lck_mtx_lock(&sl_q6_lock);
+ 	if (sl_q.state != QcomQmpOpen) {
+ 		qcom_qmp_init(&sl_q, (volatile uint32_t *)sl_aoss, 0x400, sl_kick_aop, NULL);
+ 		for (unsigned i = 0; i < 200 && qcom_qmp_step(&sl_q) > 0 && sl_q.state != QcomQmpOpen; i++) {
+@@ -314,16 +311,16 @@ pong_q6_qmp(const char *text)
+ 	if (state != QcomQmpOpen) {
+ 		qcom_qmp_abandon(&sl_q);
+ 	}
+-	sl_give(&busy);
++	lck_mtx_unlock(&sl_q6_lock);
+ 	return state;
+ }
+ 
+ /* ---- RPMh (one ACTIVE write on DRV2 TCS 0/1, as pong_wifi_link.c wl_rpmh) ----
+- * ponytail: a fourth unlocked DRV2 writer next to touch, goodix and Wi-Fi; fine while `slpi boot` is typed by hand long after
+- * those voted, needs one shared lock before anything here runs at boot. */
++ * ponytail: sl_rsc_lock covers the SLPI and ADSP boots only; touch, goodix and Wi-Fi are other DRV2 writers without it, fine
++ * while the boots are typed by hand long after those voted, one board-wide lock before anything here runs at boot. */
+ #define SL_TCS(n, r)    (0xd00u + 0x2a0u * (n) + (r))
+ static int
+-sl_rpmh(uint32_t address, uint32_t value)
++sl_rpmh_once(uint32_t address, uint32_t value)
+ {
+ 	uint32_t ctl = 0, status;
+ 	unsigned t, i;
+@@ -363,6 +360,16 @@ sl_rpmh(uint32_t address, uint32_t value)
+ 	sl_wr(sl_rsc, 0xd08, 1u << t);
+ 	return (status & (1u << 8 | 1u << 16)) == (1u << 8 | 1u << 16) ? 0 : 5;
+ }
++static int
++sl_rpmh(uint32_t address, uint32_t value)
++{
++	int rc;
++
++	lck_mtx_lock(&sl_rsc_lock);
++	rc = sl_rpmh_once(address, value);
++	lck_mtx_unlock(&sl_rsc_lock);
++	return rc;
++}
+ 
+ static QcomRpmhResource sl_lcx, sl_lmx, sl_l8;
+ /* Proxy votes: lcx/lmx at their top level while the SLPI boots (qcom_q6v5_pas proxy_pd), 0 after its handover; the sensor
+@@ -403,7 +410,6 @@ sl_cmd_db(void)
+ int
+ pong_q6_cxmx(bool on)
+ {
+-	static volatile UInt32 busy;
+ 	static int users;
+ 	uint32_t il = 0, im = 0;
+ 	int rc = 0;
+@@ -411,7 +417,7 @@ pong_q6_cxmx(bool on)
+ 	if (!sl_map() || sl_cmd_db()) {
+ 		return 1;
+ 	}
+-	sl_take(&busy);
++	lck_mtx_lock(&sl_q6_lock);
+ 	if (on ? users == 0 : users == 1) {
+ 		if (qcom_rpmh_level_index(&sl_lcx, on ? 0xffffffffu : 0, &il) ||
+ 		    qcom_rpmh_level_index(&sl_lmx, on ? 0xffffffffu : 0, &im)) {
+@@ -427,7 +433,7 @@ pong_q6_cxmx(bool on)
+ 	if (!rc && (on || users > 0)) {
+ 		users += on ? 1 : -1;
+ 	}
+-	sl_give(&busy);
++	lck_mtx_unlock(&sl_q6_lock);
+ 	return rc;
+ }
+ static int
+@@ -445,7 +451,7 @@ sl_vote(bool on)
+ 		}
+ 		if (rc) {
+ 			(void)pong_q6_cxmx(false);     /* the caller does not unvote a failed vote */
+-			rc += 20;                      /* 20 + RSC error: the sensor rail (lcx/lmx: 1, 2, 10 + RSC error) */
++			rc += 10;                      /* 10 + RSC error, as z97 */
+ 		}
+ 	}
+ 	return rc;

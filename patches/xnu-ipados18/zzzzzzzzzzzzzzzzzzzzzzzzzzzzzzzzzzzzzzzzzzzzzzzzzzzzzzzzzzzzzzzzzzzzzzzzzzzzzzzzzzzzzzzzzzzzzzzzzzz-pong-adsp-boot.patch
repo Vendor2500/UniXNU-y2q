@@ -1,0 +1,991 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index e102683..fdd675a 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -19,10 +19,19 @@
+ #include <pexpert/arm64/board_config.h>
+ #if defined(PONG)
+ #include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
+ #include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
+ #include <mach/mach_types.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
++#include "qcom/QcomGlink.h"
++#include "qcom/QcomMdt.h"
++#include "qcom/QcomQmp.h"
++#include "qcom/QcomScm.h"
++#include "qcom/QcomSmem.h"
++#include "qcom/QcomSmp2p.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+@@ -200,9 +209,381 @@ pong_adsp_usb(char *reply, size_t reply_cap, int mode)
+ 	} else {
+ 		ADSP_ADD(" mutex3=%#x", *(const volatile uint32_t *)g_adsp_mutex);
+ 	}
+-	ADSP_ADD(" next=adspfw\n");
++	ADSP_ADD(" next=adsp\n");
+ 	pong_ramoops_diagnostic_write(line, k);
+ 	strlcpy(reply, line, reply_cap);
+ 	return 0;
+ }
++
++/*
++ * ---- stage 1 of sound (iOSPort work/sound_scope/PLAN.md): `adsp` check, `adsp boot` (once per boot), `adsp stat` ----
++ * The audio DSP boots as the SLPI does (pong_slpi.c, whose shared pong_q6_* pieces it uses): our SMP2P item 429, AOP
++ * load_state adsp, lcx/lmx votes, PAS 1 load of adsp.mbn (adsp.mdt + .bNN joined by squash-mdt.py) into pil_adsp_region,
++ * auth_and_reset, the DSP's "ready" on SMP2P 443, then GLINK on the lpass edge (IPCC client 3) with "apr_audio_svc" registered:
++ * the DSP opens it and we answer. Stage 1 ends with that channel up; the APR packets (AVCS/AFE/ADM/ASM) are stage 2.
++ * Facts from rui12366B/UniXNU-gts7xlwifi package/T970Adsp.cpp (BSD-2-Clause-Patent) and the live T970 device tree
++ * (qcom,lpass@17300000: pas-id 1, smem-id 423, pil_adsp_region reg 0x8a700000 + 0x2c00000 no-map). Polled every 20 ms like the
++ * SLPI: nothing attaches IPCC SPI 229. Not tested on the device when written (z99).
++ */
++QcomSmem *pong_q6_smem(void);
++int pong_q6_alloc(QcomSmemPartition *part, uint16_t id, uint32_t size);
++void pong_q6_ring(uint32_t client, uint32_t signal);
++int64_t pong_q6_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1);
++int pong_q6_qmp(const char *text);
++int pong_q6_cxmx(bool on);
++unsigned pong_q6_ram_pages(uint64_t base, uint64_t size);
++int pong_q6_fw_check(const char *path, QcomMdtImage *img, uint64_t *size);
++int pong_q6_pas_boot(uint32_t pas, uint64_t base, uint64_t span, const char *path, QcomMdtImage *img, uint32_t *kib, int *step);
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern uint64_t mach_absolute_time(void);
++
++int pong_adsp_boot_usb(char *reply, size_t cap, const char *args);
++
++#define AD_REGION       0x8a700000ULL
++#define AD_REGION_SIZE  0x2c00000ULL
++#define AD_PAS          1u
++#define AD_ITEM_IN      443u
++#define AD_ITEM_OUT     429u
++#define AD_ITEM_CRASH   423u
++#define AD_ITEM_GDESC   478u
++#define AD_ITEM_GTX     479u
++#define AD_ITEM_GRX     480u
++#define AD_FIFO         0x4000u
++#define AD_FATAL        (1u << 0)
++#define AD_READY        (1u << 1)
++#define AD_HANDOVER     (1u << 2)
++#define AD_FW           "/private/var/mobile/Library/Pong/adsp.mbn"
++#define AD_INTENT       1024u           /* T970Audio.cpp: 1 KiB receive intents, 12 of them, for apr_audio_svc */
++#define AD_INTENTS      12u
++
++enum { AD_MAPPED = 1, AD_SMP2P, AD_LOADSTATE, AD_RAILS, AD_FIRMWARE, AD_LOADED, AD_STARTED, AD_ITSREADY, AD_GLINK, AD_APR };
++
++static struct {
++	volatile int stage;              /* highest stage reached, or -(stage that failed) */
++	volatile int err, qmp;
++	volatile uint32_t slave, kib, ready_ms, apr_rx, apr_op;
++	char note[96];
++} ad;
++static QcomSmem *ad_sm;
++static QcomSmemPartition ad_part;
++static QcomSmp2p ad_p2p;
++static QcomGlink ad_g;
++static QcomGlinkChannel *ad_apr;
++static QcomMdtImage ad_img;
++static bool ad_glink_on, ad_handed;
++static volatile UInt32 ad_started;
++
++static void ad_fail(int stage, int err) { ad.err = err; ad.stage = -stage; }
++static void ad_stage(int s) { if (ad.stage >= 0 && s > ad.stage) { ad.stage = s; } }
++static void ad_ms(uint32_t ms) { delay_for_interval(ms, 1000000u); }
++static void ad_kick(void *c) { (void)c; pong_q6_ring(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP); }
++static void
++ad_log(const char *text)
++{
++	char out[128];
++	int n = snprintf(out, sizeof(out), "[PONG_ADSP] %s\n", text);
++
++	pong_ramoops_diagnostic_write(out, n < (int)sizeof(out) ? n : (int)sizeof(out) - 1);
++}
++static volatile uint8_t *
++ad_item(uint16_t id, uint32_t *size)
++{
++	uint32_t at = 0, bytes = 0;
++
++	if (qcom_smem_find(ad_sm, &ad_part, id, &at, &bytes)) {
++		return NULL;
++	}
++	if (size) {
++		*size = bytes;
++	}
++	return ad_sm->base + at;
++}
++/* The DSP's own failure text (global SMEM item 423) into the note. */
++static void
++ad_crash(void)
++{
++	QcomSmemPartition global;
++	uint32_t at = 0, size = 0;
++	size_t n;
++
++	if (qcom_smem_partition(ad_sm, QCOM_SMEM_HOST_GLOBAL, QCOM_SMEM_HOST_GLOBAL, &global) ||
++	    qcom_smem_find(ad_sm, &global, AD_ITEM_CRASH, &at, &size) || !size) {
++		return;
++	}
++	strlcpy(ad.note, "crash: ", sizeof(ad.note));
++	for (n = 7; n < sizeof(ad.note) - 1 && n - 7 < size; n++) {
++		const char c = (char)ad_sm->base[at + n - 7];
++
++		if (!c) {
++			break;
++		}
++		ad.note[n] = c >= 32 && c < 127 ? c : '.';
++	}
++	ad.note[n] = '\0';
++	if (n > 7) {
++		ad_log(ad.note);
++	}
++}
++
++static void
++ad_apr_state(void *c, QcomGlinkChannel *ch, int up)
++{
++	(void)c;
++	(void)ch;
++	ad_log(up ? "apr_audio_svc up" : "apr_audio_svc down");
++	if (up) {
++		ad_stage(AD_APR);
++	}
++}
++/* Stage 1 only counts what arrives and keeps the last APR opcode (header bytes 16..19); stage 2 answers it. */
++static void
++ad_apr_rx(void *c, QcomGlinkChannel *ch, const uint8_t *data, uint32_t length)
++{
++	uint32_t op = 0;
++
++	(void)c;
++	(void)ch;
++	ad.apr_rx++;
++	if (length >= 20) {
++		memcpy(&op, data + 16, 4);
++		ad.apr_op = op;
++	}
++}
++
++static void
++ad_service(void)
++{
++	uint32_t value = 0, changed = 0;
++
++	if (ad_p2p.out) {
++		if (!ad_p2p.in) {
++			ad_p2p.in = (volatile uint32_t *)(volatile void *)ad_item(AD_ITEM_IN, NULL);
++		}
++		if (ad_p2p.in) {
++			if (qcom_smp2p_service(&ad_p2p, "slave-kernel", &value, &changed)) {
++				pong_q6_ring(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P);
++			}
++			ad.slave = value;
++			if (changed & value & AD_FATAL) {
++				ad_crash();
++			}
++			if ((value & AD_HANDOVER) && !ad_handed) {
++				ad_handed = true;
++				(void)pong_q6_cxmx(false);
++			}
++		}
++	}
++	if (ad_glink_on) {
++		if (!ad_g.rx.data) {
++			uint32_t size = 0;
++			volatile uint8_t *rx = ad_item(AD_ITEM_GRX, &size);
++
++			if (rx) {
++				qcom_glink_set_rx(&ad_g, rx, size);
++			}
++		}
++		(void)qcom_glink_poll(&ad_g);
++		if (ad_g.version_agreed) {
++			ad_stage(AD_GLINK);
++		}
++	}
++}
++
++static bool
++ad_boot(void)
++{
++	uint64_t r1 = 0, ns = 0, began;
++	uint32_t kib = 0;
++	int rc, step = 0;
++
++	if ((rc = pong_q6_alloc(&ad_part, AD_ITEM_OUT, QCOM_SMP2P_ITEM_BYTES)) || !ad_item(AD_ITEM_OUT, NULL)) {
++		ad_fail(AD_SMP2P, rc ? rc : -2);
++		return false;
++	}
++	qcom_smp2p_init_out(&ad_p2p, (volatile uint32_t *)(volatile void *)ad_item(AD_ITEM_OUT, NULL), 0, SMEM_HOST_ADSP);
++	qcom_smp2p_add_entry(&ad_p2p, "master-kernel");
++	pong_q6_ring(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P);
++	ad_stage(AD_SMP2P);
++
++	ad.qmp = pong_q6_qmp("{class: image, res: load_state, name: adsp, val: on}");
++	if (ad.qmp != QcomQmpOpen) {
++		ad_fail(AD_LOADSTATE, ad.qmp);
++		return false;
++	}
++	ad_stage(AD_LOADSTATE);
++
++	if ((rc = pong_q6_cxmx(true))) {
++		ad_fail(AD_RAILS, rc);
++		return false;
++	}
++	ad_stage(AD_RAILS);
++
++	rc = pong_q6_pas_boot(AD_PAS, AD_REGION, AD_REGION_SIZE, AD_FW, &ad_img, &kib, &step);
++	ad.kib = kib;
++	if (rc) {
++		ad_fail(step == 1 ? AD_FIRMWARE : step == 2 ? AD_LOADED : AD_STARTED, rc);
++		(void)pong_q6_cxmx(false);
++		return false;
++	}
++	began = mach_absolute_time();
++	ad_stage(AD_STARTED);
++	ad_log("started");
++	for (unsigned i = 0; i < 250 && !(ad.slave & (AD_READY | AD_FATAL)); i++) {
++		ad_service();
++		ad_ms(20);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++	ad.ready_ms = (uint32_t)(ns / 1000000u);
++	if (!(ad.slave & AD_READY) || (ad.slave & AD_FATAL)) {
++		ad_crash();
++		ad_fail(AD_ITSREADY, ad.slave & AD_FATAL ? -5 : -60);
++		(void)pong_q6_scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), AD_PAS, 0, 0, &r1);
++		if (!ad_handed) {
++			(void)pong_q6_cxmx(false);
++		}
++		return false;
++	}
++	ad_stage(AD_ITSREADY);
++	ad_log("ready");
++
++	/* GLINK: descriptor and our FIFO in SMEM, apr_audio_svc registered before the first poll (the DSP opens it) */
++	{
++		static const QcomGlinkClient client = { ad_apr_state, ad_apr_rx };
++		uint8_t *storage = kalloc_data(AD_INTENT * AD_INTENTS, Z_WAITOK);
++		uint32_t size = 0;
++		volatile uint32_t *d;
++		volatile uint8_t *txf;
++
++		rc = pong_q6_alloc(&ad_part, AD_ITEM_GDESC, 32);
++		if (!rc) {
++			rc = pong_q6_alloc(&ad_part, AD_ITEM_GTX, AD_FIFO);
++		}
++		d = (volatile uint32_t *)(volatile void *)ad_item(AD_ITEM_GDESC, NULL);
++		txf = ad_item(AD_ITEM_GTX, &size);
++		if (rc || !d || !txf || !storage) {
++			ad_fail(AD_GLINK, rc ? rc : -2);
++			return false;
++		}
++		const QcomGlinkFifo tx = { &d[1], &d[0], txf, size }, rx = { &d[3], &d[2], NULL, 0 };
++
++		qcom_glink_init(&ad_g, tx, rx, ad_kick, NULL);
++		ad_glink_on = true;
++		ad_apr = qcom_glink_channel(&ad_g, "apr_audio_svc", AD_INTENT, AD_INTENTS, storage, &client, NULL, 0);
++		if (!ad_apr) {
++			ad_fail(AD_GLINK, -4);
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++ad_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	if (ad_boot()) {
++		/* ponytail: 20 ms poll without the IPCC interrupt, as the SLPI; attach SPI 229 when playback needs the latency */
++		for (;;) {
++			ad_service();
++			ad_ms(20);
++		}
++	}
++	ad_log("boot stopped");
++}
++
++#define AD_ADD(...) do { \
++	if (k < cap - 1) { \
++		int a_ = snprintf(reply + k, cap - k, __VA_ARGS__); \
++		if (a_ > 0) { k += (size_t)a_; } \
++	} \
++	if (k > cap - 1) { k = cap - 1; } \
++} while (0)
++
++int
++pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
++{
++	size_t k = 0;
++
++	if (!reply || cap < 64) {
++		return -1;
++	}
++	reply[0] = '\0';
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (!ad_sm && !(ad_sm = pong_q6_smem())) {
++		snprintf(reply, cap, "adsp: map failed\n");
++		return -1;
++	}
++	if (args && strcmp(args, "boot") == 0) {
++		thread_t th;
++
++		if (!OSCompareAndSwap(0, 1, &ad_started)) {
++			snprintf(reply, cap, "adsp: boot already started (adsp stat)\n");
++			return -1;
++		}
++		if (qcom_smem_partition(ad_sm, QCOM_SMEM_HOST_APPS, SMEM_HOST_ADSP, &ad_part)) {
++			ad_fail(AD_MAPPED, -2);
++			snprintf(reply, cap, "adsp: no SMEM partition with host %u\n", SMEM_HOST_ADSP);
++			return -1;
++		}
++		ad_stage(AD_MAPPED);
++		if (kernel_thread_start((thread_continue_t)ad_thread, NULL, &th) != KERN_SUCCESS) {
++			ad_fail(AD_MAPPED, -7);
++			snprintf(reply, cap, "adsp: no thread\n");
++			return -1;
++		}
++		thread_deallocate(th);
++		snprintf(reply, cap, "adsp: boot started from %s (adsp stat)\n", AD_FW);
++		return 0;
++	}
++	if (args && strcmp(args, "stat") == 0) {
++		AD_ADD("adsp: stage=%d err=%d slave=%#x kib=%u ready_ms=%u qmp=%d glink=%u/%u ver=%u bad=%u unk=%u[%s]"
++		    " apr=%u rx=%u op=%#x note=%s\n", ad.stage, ad.err, ad.slave, ad.kib, ad.ready_ms, ad.qmp, ad_g.rx_messages,
++		    ad_g.tx_messages, ad_g.version_agreed, ad_g.broken, ad_g.unknown_opens, ad_g.unknown_names,
++		    ad_apr && ad_apr->up ? 1u : 0u, ad.apr_rx, ad.apr_op, ad.note[0] ? ad.note : "-");
++		return 0;
++	}
++	if (args && *args) {
++		snprintf(reply, cap, "adsp: usage adsp | adsp boot | adsp stat\n");
++		return -1;
++	}
++
++	/* check before `adsp boot`: reads, and the PAS "is supported" query */
++	{
++		QcomSmemPartition part;
++		uint32_t slave = 0xffffffffu, at = 0, size = 0;
++		uint64_t r1 = 0, fsize = 0;
++		int64_t pas;
++		int fe = -1;
++
++		if (!qcom_smem_partition(ad_sm, QCOM_SMEM_HOST_APPS, SMEM_HOST_ADSP, &part) &&
++		    !qcom_smem_find(ad_sm, &part, AD_ITEM_IN, &at, &size)) {
++			QcomSmp2p view = { 0 };
++
++			view.in = (volatile uint32_t *)(volatile void *)(ad_sm->base + at);
++			view.remote_pid = SMEM_HOST_ADSP;
++			if (!qcom_smp2p_check_in(view.in, 0, SMEM_HOST_ADSP)) {
++				const int e = qcom_smp2p_find_in(&view, "slave-kernel");
++
++				if (e >= 0) {
++					slave = qcom_smp2p_in_value(&view, e);
++				}
++			}
++		}
++		pas = pong_q6_scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), AD_PAS, 0, 0, &r1);
++		if (!ad_started) {
++			fe = pong_q6_fw_check(AD_FW, &ad_img, &fsize);
++		}
++		AD_ADD("adsp: check slave=%#x pas1=%lld/%llu region_ram_pages=%u fw=%s e=%d size=%llu", slave, (long long)pas,
++		    (unsigned long long)r1, pong_q6_ram_pages(AD_REGION, AD_REGION_SIZE), AD_FW, fe, (unsigned long long)fsize);
++		if (fe == 0) {
++			AD_ADD(" elf64=%u segs=%u span=%#llx/%#llx reloc=%u", ad_img.elf64, ad_img.count,
++			    (unsigned long long)qcom_mdt_span(&ad_img), (unsigned long long)AD_REGION_SIZE, ad_img.relocatable);
++		}
++		AD_ADD(" stage=%d next=%s\n", ad.stage, ad_started ? "adsp stat" : "adsp boot");
++	}
++	return 0;
++}
+ #endif /* PONG */
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index cdadff3..6f2d860 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -17,6 +17,11 @@
+  * code is that repository's QcomSmem/QcomSmp2p/QcomGlink/QcomQmp/QcomMdt/QcomRpmh/T970Ssc, copied unchanged into
+  * bsd/dev/qcom/. Addresses from the live T970 device tree (qcom,ssc@5c00000: pas-id 12, smem-id 424, pil_slpi_region
+  * 0x89200000 + 0x1500000 no-map, sensor_vdd = pm8150a_l8 1.8 V). Not tested on the device when written (z97).
++ *
++ * z99: the pieces the audio DSP boot (pong_adsp.c) needs too are exported as pong_q6_*: one mapping of the shared blocks, one
++ * AOSS QMP link, counted lcx/lmx votes and the PAS load; segments are copied through 256 KiB windows (the ADSP carveout is 44 MiB).
++ * ponytail: the two boot sequences (SMP2P, QMP, votes, PAS, ready, GLINK) are still written out twice; one descriptor-driven
++ * sequence once both have booted on the device.
+  */
+ 
+ #include <pexpert/arm64/board_config.h>
+@@ -56,6 +61,16 @@ extern uint64_t mach_absolute_time(void);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ 
+ int pong_slpi_usb(char *reply, size_t cap, const char *args);
++/* Shared with the audio DSP (pong_adsp.c): the same SMEM, mutex, IPCC, AOSS and RSC, one QMP link, counted lcx/lmx votes. */
++QcomSmem *pong_q6_smem(void);
++int pong_q6_alloc(QcomSmemPartition *part, uint16_t id, uint32_t size);
++void pong_q6_ring(uint32_t client, uint32_t signal);
++int64_t pong_q6_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1);
++int pong_q6_qmp(const char *text);
++int pong_q6_cxmx(bool on);
++unsigned pong_q6_ram_pages(uint64_t base, uint64_t size);
++int pong_q6_fw_check(const char *path, QcomMdtImage *img, uint64_t *size);
++int pong_q6_pas_boot(uint32_t pas, uint64_t base, uint64_t span, const char *path, QcomMdtImage *img, uint32_t *kib, int *step);
+ 
+ #define SL_WIMG_IO      0x7u            /* osfmk/arm/memory_types.h VM_WIMG_IO */
+ #define SL_WIMG_WCOMB   0x6u            /* VM_WIMG_WCOMB */
+@@ -169,12 +184,16 @@ sl_item(uint16_t id, uint32_t *size)
+ 	}
+ 	return sl_sm.base + at;
+ }
+-static int
+-sl_alloc(uint16_t id, uint32_t size)
++/* An SMEM item in the partition with one DSP, under TCSR mutex 3 (shared with pong_adsp.c). */
++int
++pong_q6_alloc(QcomSmemPartition *part, uint16_t id, uint32_t size)
+ {
+ 	unsigned i;
+ 	int rc;
+ 
++	if (!sl_map()) {
++		return -12;
++	}
+ 	for (i = 0; i < 1000; i++) {
+ 		sl_wr(sl_mutex, 0, 1);
+ 		if (sl_rd(sl_mutex, 0) == 1) {
+@@ -185,10 +204,11 @@ sl_alloc(uint16_t id, uint32_t size)
+ 	if (i == 1000) {
+ 		return -16;
+ 	}
+-	rc = qcom_smem_alloc(&sl_sm, &sl_part, id, size);
++	rc = qcom_smem_alloc(&sl_sm, part, id, size);
+ 	sl_wr(sl_mutex, 0, 0);
+ 	return rc == QcomSmemExists ? 0 : rc;
+ }
++static int sl_alloc(uint16_t id, uint32_t size) { return pong_q6_alloc(&sl_part, id, size); }
+ static void
+ sl_crash(void)
+ {
+@@ -248,6 +268,55 @@ sl_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint6
+ 	}
+ 	return out;
+ }
++int64_t
++pong_q6_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	return sl_scm(cmd, arginfo, a, b, c, r1);
++}
++QcomSmem *pong_q6_smem(void) { return sl_map() ? &sl_sm : NULL; }
++void pong_q6_ring(uint32_t client, uint32_t signal) { if (sl_map()) { sl_ring(client, signal); } }
++
++/* A spin flag for the shared QMP link and votes: both are taken by hand-typed boots, seconds apart. */
++static void
++sl_take(volatile UInt32 *flag)
++{
++	while (!OSCompareAndSwap(0, 1, flag)) {
++		sl_ms(1);
++	}
++}
++static void sl_give(volatile UInt32 *flag) { (void)OSCompareAndSwap(1, 0, flag); }
++
++/* One AOSS QMP link for every DSP (a second qcom_qmp_init would restart the handshake under the first): opened on first use, then
++ * text sent and answered. Returns the link state, QcomQmpOpen when the AOP took the message. */
++int
++pong_q6_qmp(const char *text)
++{
++	static volatile UInt32 busy;
++	int state;
++
++	if (!sl_map()) {
++		return QcomQmpBadDescriptor;
++	}
++	sl_take(&busy);
++	if (sl_q.state != QcomQmpOpen) {
++		qcom_qmp_init(&sl_q, (volatile uint32_t *)sl_aoss, 0x400, sl_kick_aop, NULL);
++		for (unsigned i = 0; i < 200 && qcom_qmp_step(&sl_q) > 0 && sl_q.state != QcomQmpOpen; i++) {
++			sl_ms(20);
++		}
++	}
++	if (sl_q.state == QcomQmpOpen) {
++		(void)qcom_qmp_send(&sl_q, text);
++		for (unsigned i = 0; i < 50 && qcom_qmp_step(&sl_q) != QcomQmpOpen; i++) {
++			sl_ms(20);
++		}
++	}
++	state = sl_q.state;
++	if (state != QcomQmpOpen) {
++		qcom_qmp_abandon(&sl_q);
++	}
++	sl_give(&busy);
++	return state;
++}
+ 
+ /* ---- RPMh (one ACTIVE write on DRV2 TCS 0/1, as pong_wifi_link.c wl_rpmh) ----
+  * ponytail: a fourth unlocked DRV2 writer next to touch, goodix and Wi-Fi; fine while `slpi boot` is typed by hand long after
+@@ -299,11 +368,8 @@ static QcomRpmhResource sl_lcx, sl_lmx, sl_l8;
+ /* Proxy votes: lcx/lmx at their top level while the SLPI boots (qcom_q6v5_pas proxy_pd), 0 after its handover; the sensor
+  * supply pm8150a_l8 at 1.8 V, HPM, on (the DT's active-reg sensor_vdd: the hub's chips need it, the boot does not). */
+ static int
+-sl_vote(bool on)
++sl_cmd_db(void)
+ {
+-	uint32_t il = 0, im = 0;
+-	int rc;
+-
+ 	if (!sl_lcx.address) {
+ 		uint8_t *db = kalloc_data(SL_CMDDB_SIZE, Z_WAITOK);
+ 		vm_offset_t va = ml_io_map_unmappable(SL_CMDDB_PHYS, SL_CMDDB_SIZE, SL_WIMG_IO);
+@@ -330,13 +396,45 @@ sl_vote(bool on)
+ 			return 1;
+ 		}
+ 	}
+-	if (qcom_rpmh_level_index(&sl_lcx, on ? 0xffffffffu : 0, &il) || qcom_rpmh_level_index(&sl_lmx, on ? 0xffffffffu : 0, &im)) {
+-		return 2;
++	return 0;
++}
++/* The lcx/lmx proxy votes of every DSP boot, counted: raised by the first boot, dropped when the last one hands over or gives up
++ * (so the SLPI's handover cannot drop the levels under an ADSP still booting). 0, 1 no command DB, 2 no level, 10 + RSC error. */
++int
++pong_q6_cxmx(bool on)
++{
++	static volatile UInt32 busy;
++	static int users;
++	uint32_t il = 0, im = 0;
++	int rc = 0;
++
++	if (!sl_map() || sl_cmd_db()) {
++		return 1;
++	}
++	sl_take(&busy);
++	if (on ? users == 0 : users == 1) {
++		if (qcom_rpmh_level_index(&sl_lcx, on ? 0xffffffffu : 0, &il) ||
++		    qcom_rpmh_level_index(&sl_lmx, on ? 0xffffffffu : 0, &im)) {
++			rc = 2;
++		} else {
++			rc = sl_rpmh(sl_lcx.address, il);
++			if (!rc) {
++				rc = sl_rpmh(sl_lmx.address, im);
++			}
++			rc = rc ? 10 + rc : 0;
++		}
+ 	}
+-	rc = sl_rpmh(sl_lcx.address, il);
+-	if (!rc) {
+-		rc = sl_rpmh(sl_lmx.address, im);
++	if (!rc && (on || users > 0)) {
++		users += on ? 1 : -1;
+ 	}
++	sl_give(&busy);
++	return rc;
++}
++static int
++sl_vote(bool on)
++{
++	int rc = pong_q6_cxmx(on);
++
+ 	if (!rc && on && sl_l8.address) {
+ 		rc = sl_rpmh(sl_l8.address, 1800);
+ 		if (!rc) {
+@@ -345,8 +443,12 @@ sl_vote(bool on)
+ 		if (!rc) {
+ 			rc = sl_rpmh(sl_l8.address + 4, 1);
+ 		}
++		if (rc) {
++			(void)pong_q6_cxmx(false);     /* the caller does not unvote a failed vote */
++			rc += 20;                      /* 20 + RSC error: the sensor rail (lcx/lmx: 1, 2, 10 + RSC error) */
++		}
+ 	}
+-	return rc ? 10 + rc : 0;
++	return rc;
+ }
+ 
+ /* ---- the firmware file ---- */
+@@ -365,7 +467,7 @@ sl_read(void *context, uint64_t off, void *to, size_t len)
+ 	return e || resid ? -1 : 0;
+ }
+ static int
+-sl_open(struct sl_file *f)
++sl_open(struct sl_file *f, const char *path, QcomMdtImage *img)
+ {
+ 	struct vnode_attr va;
+ 	int e;
+@@ -373,7 +475,7 @@ sl_open(struct sl_file *f)
+ 	f->vp = NULLVP;
+ 	f->size = 0;
+ 	f->ctx = vfs_context_create(NULL);
+-	e = vnode_open(SL_FW, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &f->vp, f->ctx);
++	e = vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &f->vp, f->ctx);
+ 	if (e) {
+ 		f->vp = NULLVP;
+ 		return e;
+@@ -385,7 +487,7 @@ sl_open(struct sl_file *f)
+ 		e = EIO;
+ 	}
+ 	f->size = e ? 0 : va.va_data_size;
+-	return e ? e : qcom_mdt_parse(&sl_img, f->size, sl_read, f) ? 1000 : 0;
++	return e ? e : qcom_mdt_parse(img, f->size, sl_read, f) ? 1000 : 0;
+ }
+ static void
+ sl_close(struct sl_file *f)
+@@ -400,16 +502,152 @@ sl_close(struct sl_file *f)
+ 	f->ctx = NULL;
+ }
+ /* Pages of the carveout XNU manages as RAM: must be 0 before anything is written there. */
+-static unsigned
+-sl_region_ram(void)
++unsigned
++pong_q6_ram_pages(uint64_t base, uint64_t size)
+ {
+ 	unsigned n = 0;
+ 
+-	for (uint64_t pa = SL_REGION; pa < SL_REGION + SL_REGION_SIZE; pa += 0x1000) {
++	for (uint64_t pa = base; pa < base + size; pa += 0x1000) {
+ 		n += pmap_pong_pa_valid(pa) ? 1u : 0u;
+ 	}
+ 	return n;
+ }
++static unsigned sl_region_ram(void) { return pong_q6_ram_pages(SL_REGION, SL_REGION_SIZE); }
++
++/* Opens and parses a joined .mbn, then closes it: 0 or the open / parse error. */
++int
++pong_q6_fw_check(const char *path, QcomMdtImage *img, uint64_t *size)
++{
++	struct sl_file f;
++	const int e = sl_open(&f, path, img);
++
++	*size = f.size;
++	sl_close(&f);
++	return e;
++}
++
++/* Copies len bytes from src (or zeroes, src NULL) to the carveout at physical pa, 256 KiB at a time through a window mapped for
++ * that piece only: the ADSP's 44 MiB carveout is too much for one I/O mapping. */
++static int
++sl_carve(uint64_t pa, const uint8_t *src, uint64_t len)
++{
++	while (len) {
++		const uint64_t n = len < 256u * 1024u ? len : 256u * 1024u, page = pa & ~0xfffull, lead = pa - page;
++		const vm_size_t span = (vm_size_t)((lead + n + 0xfffu) & ~0xfffull);
++		const vm_offset_t va = ml_io_map_unmappable((vm_offset_t)page, span, SL_WIMG_WCOMB);
++
++		if (!va) {
++			return -12;
++		}
++		if (src) {
++			memcpy((void *)(va + lead), src, (size_t)n);
++			src += n;
++		} else {
++			bzero((void *)(va + lead), (size_t)n);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(va, span);
++		pa += n;
++		len -= n;
++	}
++	return 0;
++}
++
++/* The PAS boot of one DSP (qcom_q6v5_pas load + start): the joined firmware, the carveout check (must not be XNU RAM), metadata in
++ * contiguous memory and init_image, mem_setup when relocatable, every loadable segment, auth_and_reset. 0, or the error with
++ * *step = 1 (firmware / carveout), 2 (load) or 3 (start); a failure after init_image shuts the PAS down again. */
++int
++pong_q6_pas_boot(uint32_t pas, uint64_t base, uint64_t span, const char *path, QcomMdtImage *img, uint32_t *kib, int *step)
++{
++	struct sl_file f;
++	IOPhysicalAddress meta_pa = 0;
++	uint8_t *meta = NULL, *bounce = NULL;
++	vm_size_t meta_cap = 0;
++	uint64_t r1 = 0;
++	int64_t r;
++	int rc;
++
++	*step = 1;
++	if ((rc = sl_open(&f, path, img))) {
++		goto out;
++	}
++	*kib = (uint32_t)(f.size >> 10);
++	if (pong_q6_ram_pages(base, span)) {
++		rc = -1;
++		goto out;
++	}
++
++	/* metadata (ELF headers + hash segment) in physically contiguous memory, written back, then init_image */
++	*step = 2;
++	meta_cap = (vm_size_t)((qcom_mdt_metadata_size(img) + 0xfffu) & ~0xfffull);
++	meta = meta_cap ? IOMallocContiguous(meta_cap, 0x1000, &meta_pa) : NULL;
++	if (!meta || !meta_pa || qcom_mdt_metadata(img, sl_read, &f, meta, meta_cap)) {
++		rc = -12;
++		goto out;
++	}
++	for (uintptr_t p = (uintptr_t)meta; p < (uintptr_t)meta + meta_cap; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	r = sl_scm(QCOM_SCM_PAS_INIT_IMAGE, qcom_scm_args(2, QCOM_SCM_VAL, QCOM_SCM_RW, 0), pas, meta_pa, 0, &r1);
++	if (r || r1) {
++		rc = -1000 - (int)r1;
++		goto out;
++	}
++	if (img->relocatable) {
++		r = sl_scm(QCOM_SCM_PAS_MEM_SETUP, qcom_scm_args(3, 0, 0, 0), pas, base, qcom_mdt_span(img), &r1);
++		if (r || r1) {
++			rc = -2000 - (int)r1;
++			goto shutdown;
++		}
++	}
++	bounce = kalloc_data(256u * 1024u, Z_WAITOK);
++	rc = bounce ? 0 : -12;
++	for (unsigned i = 0; !rc && i < img->count; i++) {
++		const QcomMdtSegment *s = &img->segment[i];
++		uint64_t at = 0;
++
++		if (!s->load) {
++			continue;
++		}
++		if (qcom_mdt_place(img, i, base, span, &at)) {
++			rc = -7;
++			break;
++		}
++		for (uint64_t done = 0; !rc && done < s->file_size;) {
++			const size_t n = s->file_size - done < 256u * 1024u ? (size_t)(s->file_size - done) : 256u * 1024u;
++
++			rc = sl_read(&f, s->file_offset + done, bounce, n) ? -5 : sl_carve(base + at + done, bounce, n);
++			done += n;
++		}
++		if (!rc && s->memory_size > s->file_size) {
++			rc = sl_carve(base + at + s->file_size, NULL, s->memory_size - s->file_size);
++		}
++	}
++	if (bounce) {
++		kfree_data(bounce, 256u * 1024u);
++	}
++	if (rc) {
++		goto shutdown;
++	}
++
++	*step = 3;
++	r = sl_scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), pas, 0, 0, &r1);
++	if (r || r1) {
++		rc = -3000 - (int)r1;
++		goto shutdown;
++	}
++	goto out;
++
++shutdown:
++	(void)sl_scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), pas, 0, 0, &r1);
++out:
++	if (meta) {
++		IOFreeContiguous(meta, meta_cap);
++	}
++	sl_close(&f);
++	return rc;
++}
+ 
+ /* ---- QRTR on the IPCRTR channel ---- */
+ static void
+@@ -542,141 +780,50 @@ sl_service(void)
+ static bool
+ sl_boot(void)
+ {
+-	static struct sl_file f;
+-	IOPhysicalAddress meta_pa = 0;
+-	uint8_t *meta = NULL, *bounce = NULL;
+-	vm_size_t meta_cap = 0;
+-	vm_offset_t region = 0;
+ 	uint64_t r1 = 0, ns = 0, began;
+-	int64_t r;
+-	int rc;
+-
+-	if ((rc = sl_open(&f))) {
+-		sl_fail(SL_FIRMWARE, rc);
+-		goto fail;
+-	}
+-	sl.kib = (uint32_t)(f.size >> 10);
+-	if (sl_region_ram()) {
+-		sl_fail(SL_FIRMWARE, -1);       /* the carveout is XNU RAM: needs a reservation first (SCOPE.md 1b) */
+-		goto fail;
+-	}
+-	sl_stage(SL_FIRMWARE);
++	uint32_t kib = 0;
++	int rc, step = 0;
+ 
+ 	if ((rc = sl_alloc(SL_ITEM_OUT, QCOM_SMP2P_ITEM_BYTES)) || !sl_item(SL_ITEM_OUT, NULL)) {
+ 		sl_fail(SL_SMP2P, rc ? rc : -2);
+-		goto fail;
++		return false;
+ 	}
+ 	qcom_smp2p_init_out(&sl_p2p, (volatile uint32_t *)(volatile void *)sl_item(SL_ITEM_OUT, NULL), 0, SL_PID);
+ 	qcom_smp2p_add_entry(&sl_p2p, "master-kernel");
+ 	sl_ring(SL_CLIENT, QCOM_IPCC_SIGNAL_SMP2P);
+ 	sl_stage(SL_SMP2P);
+ 
+-	qcom_qmp_init(&sl_q, (volatile uint32_t *)sl_aoss, 0x400, sl_kick_aop, NULL);
+-	for (unsigned i = 0; i < 200 && qcom_qmp_step(&sl_q) > 0 && sl_q.state != QcomQmpOpen; i++) {
+-		sl_ms(20);
+-	}
+-	if (sl_q.state == QcomQmpOpen) {
+-		(void)qcom_qmp_send(&sl_q, "{class: image, res: load_state, name: slpi, val: on}");
+-		for (unsigned i = 0; i < 50 && qcom_qmp_step(&sl_q) != QcomQmpOpen; i++) {
+-			sl_ms(20);
+-		}
+-	}
+-	sl.qmp = sl_q.state;
+-	if (sl_q.state != QcomQmpOpen) {
+-		qcom_qmp_abandon(&sl_q);
+-		sl_fail(SL_LOADSTATE, sl_q.state);
+-		goto fail;
++	sl.qmp = pong_q6_qmp("{class: image, res: load_state, name: slpi, val: on}");
++	if (sl.qmp != QcomQmpOpen) {
++		sl_fail(SL_LOADSTATE, sl.qmp);
++		return false;
+ 	}
+ 	sl_stage(SL_LOADSTATE);
+ 
+ 	if ((rc = sl_vote(true))) {
+ 		sl.rails = (uint32_t)rc;
+ 		sl_fail(SL_RAILS, rc);
+-		goto fail;
++		return false;
+ 	}
+ 	sl_stage(SL_RAILS);
+ 
+-	/* metadata (ELF headers + hash segment) in physically contiguous memory, written back, then init_image */
+-	meta_cap = (vm_size_t)((qcom_mdt_metadata_size(&sl_img) + 0xfffu) & ~0xfffull);
+-	meta = meta_cap ? IOMallocContiguous(meta_cap, 0x1000, &meta_pa) : NULL;
+-	if (!meta || !meta_pa || qcom_mdt_metadata(&sl_img, sl_read, &f, meta, meta_cap)) {
+-		sl_fail(SL_LOADED, -12);
+-		goto unvote;
+-	}
+-	for (uintptr_t p = (uintptr_t)meta; p < (uintptr_t)meta + meta_cap; p += 64) {
+-		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	r = sl_scm(QCOM_SCM_PAS_INIT_IMAGE, qcom_scm_args(2, QCOM_SCM_VAL, QCOM_SCM_RW, 0), SL_PAS, meta_pa, 0, &r1);
+-	if (r || r1) {
+-		sl_fail(SL_LOADED, -1000 - (int)r1);
+-		goto unvote;
+-	}
+-	if (sl_img.relocatable) {
+-		r = sl_scm(QCOM_SCM_PAS_MEM_SETUP, qcom_scm_args(3, 0, 0, 0), SL_PAS, SL_REGION, qcom_mdt_span(&sl_img), &r1);
+-		if (r || r1) {
+-			sl_fail(SL_LOADED, -2000 - (int)r1);
+-			goto shutdown;
+-		}
+-	}
+-	region = ml_io_map_unmappable((vm_offset_t)SL_REGION, (vm_size_t)SL_REGION_SIZE, SL_WIMG_WCOMB);
+-	bounce = kalloc_data(256u * 1024u, Z_WAITOK);
+-	rc = region && bounce ? 0 : -12;
+-	for (unsigned i = 0; !rc && i < sl_img.count; i++) {
+-		const QcomMdtSegment *s = &sl_img.segment[i];
+-		uint64_t at = 0;
+-
+-		if (!s->load) {
+-			continue;
+-		}
+-		if (qcom_mdt_place(&sl_img, i, SL_REGION, SL_REGION_SIZE, &at)) {
+-			rc = -7;
+-			break;
+-		}
+-		for (uint64_t done = 0; !rc && done < s->file_size;) {
+-			const size_t n = s->file_size - done < 256u * 1024u ? (size_t)(s->file_size - done) : 256u * 1024u;
+-
+-			if (sl_read(&f, s->file_offset + done, bounce, n)) {
+-				rc = -5;
+-				break;
+-			}
+-			memcpy((void *)(region + at + done), bounce, n);
+-			done += n;
+-		}
+-		if (!rc && s->memory_size > s->file_size) {
+-			bzero((void *)(region + at + s->file_size), (size_t)(s->memory_size - s->file_size));
+-		}
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	if (bounce) {
+-		kfree_data(bounce, 256u * 1024u);
+-	}
+-	if (region) {
+-		ml_io_unmap(region, (vm_size_t)SL_REGION_SIZE);
+-	}
++	/* firmware, carveout check (-1: XNU RAM, needs a reservation first, SCOPE.md 1b), load, auth_and_reset */
++	rc = pong_q6_pas_boot(SL_PAS, SL_REGION, SL_REGION_SIZE, SL_FW, &sl_img, &kib, &step);
++	sl.kib = kib;
+ 	if (rc) {
+-		sl_fail(SL_LOADED, rc);
+-		goto shutdown;
++		sl_fail(step == 1 ? SL_FIRMWARE : step == 2 ? SL_LOADED : SL_STARTED, rc);
++		(void)sl_vote(false);
++		return false;
+ 	}
+-	sl_stage(SL_LOADED);
+-
+ 	began = mach_absolute_time();
+-	r = sl_scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), SL_PAS, 0, 0, &r1);
+-	if (r || r1) {
+-		sl_fail(SL_STARTED, -3000 - (int)r1);
+-		goto shutdown;
+-	}
+ 	sl_stage(SL_STARTED);
+ 	sl_log("started");
+-	IOFreeContiguous(meta, meta_cap);
+-	meta = NULL;
+ 	for (unsigned i = 0; i < 250 && !(sl.slave & (SL_READY | SL_FATAL)); i++) {
+ 		sl_service();
+ 		sl_ms(20);
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 	sl.ready_ms = (uint32_t)(ns / 1000000u);
+-	sl_close(&f);
+ 	if (!(sl.slave & SL_READY) || (sl.slave & SL_FATAL)) {
+ 		sl_crash();
+ 		sl_fail(SL_ITSREADY, sl.slave & SL_FATAL ? -5 : -60);
+@@ -719,17 +866,6 @@ sl_boot(void)
+ 		}
+ 	}
+ 	return true;
+-
+-shutdown:
+-	(void)sl_scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), SL_PAS, 0, 0, &r1);
+-unvote:
+-	(void)sl_vote(false);
+-	if (meta) {
+-		IOFreeContiguous(meta, meta_cap);
+-	}
+-fail:
+-	sl_close(&f);
+-	return false;
+ }
+ 
+ static void
+@@ -843,7 +979,7 @@ pong_slpi_usb(char *reply, size_t cap, const char *args)
+ 			items |= 1u << 9;
+ 		}
+ 		pas = sl_scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), SL_PAS, 0, 0, &r1);
+-		fe = sl_started ? -1 : sl_open(&f);
++		fe = sl_started ? -1 : sl_open(&f, SL_FW, &sl_img);
+ 		SL_ADD("slpi: survey items=%#x slave=%#x pas12=%lld/%llu region_ram_pages=%u fw=%s e=%d size=%llu", items, slave,
+ 		    (long long)pas, (unsigned long long)r1, sl_region_ram(), SL_FW, fe, (unsigned long long)(fe == -1 ? 0 : f.size));
+ 		if (fe == 0) {
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index e81bc29..f377f0c 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2090,6 +2090,14 @@ dispatch_command(const char *cmd)
+ 		sl_reply[0] = '\0';
+ 		(void)pong_slpi_usb(sl_reply, sizeof(sl_reply), cmd + 4);
+ 		send_str(sl_reply[0] ? sl_reply : "slpi: no reply\n");
++	} else if (strcmp(cmd, "adsp") == 0 || strncmp(cmd, "adsp ", 5) == 0) {
++		/* the audio DSP: check, `adsp boot` (PAS 1, GLINK, apr_audio_svc), `adsp stat` (bsd/dev/pong_adsp.c, z99) */
++		extern int pong_adsp_boot_usb(char *reply, size_t cap, const char *args);
++		static char ad_reply[1000];
++
++		ad_reply[0] = '\0';
++		(void)pong_adsp_boot_usb(ad_reply, sizeof(ad_reply), cmd + 4);
++		send_str(ad_reply[0] ? ad_reply : "adsp: no reply\n");
+ 	} else if (strcmp(cmd, "adspup") == 0) {
+ 		/* the audio DSP's shared memory, read only (bsd/dev/pong_adsp.c) */
+ 		char adsp_reply[896];
