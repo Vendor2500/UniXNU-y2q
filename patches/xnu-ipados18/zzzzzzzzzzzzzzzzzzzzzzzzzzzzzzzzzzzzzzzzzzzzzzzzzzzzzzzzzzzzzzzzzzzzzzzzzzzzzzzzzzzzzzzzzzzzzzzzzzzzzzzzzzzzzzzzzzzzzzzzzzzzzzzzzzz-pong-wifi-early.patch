@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 4305289..0068605 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -372,6 +372,7 @@ wt_idle_forever(void)
+ }
+ 
+ static void wifi_join_loop(void);   /* below: save the daemon's last join, join it again after a restart (z92) */
++static int gpu_auto_running(void);   /* below: the GPU boot start (pong_gpu_auto=1) has begun and not ended (z131) */
+ static void wifi_mac_prepare(void); /* below: the station address kept on the Data volume (z96) */
+ 
+ static void
+@@ -380,8 +381,26 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 	char reply[96];
+ 
+ 	wt.auto_state = 1;
+-	/* not earlier than the hand-started stack ever ran (about two minutes after boot, never tried sooner) */
+-	delay_for_interval(90000, 1000000u);
++	{
++		/*
++		 * z131, SM-T970: boot argument pong_wifi_early=1 starts the stack once the GPU's boot start is over (it must map
++		 * its windows first) and at least 20 s after boot, instead of 90 s: Wi-Fi was the last thing up (setup assistant
++		 * lists, clock, first menus). Default off: 90 s, the time the stack was always started at.
++		 */
++		uint32_t early = 0;
++
++		(void)PE_parse_boot_argn("pong_wifi_early", &early, sizeof(early));
++		if (early) {
++			delay_for_interval(20000, 1000000u);
++			for (int i = 0; i < 120 && gpu_auto_running(); i++) {
++				delay_for_interval(1000, 1000000u);
++			}
++			native_wifi_logf(6, "wifi-auto: early start (GPU boot start %s)", gpu_auto_running() ? "still running after 140 s" : "done or off");
++		} else {
++			/* not earlier than the hand-started stack ever ran (about two minutes after boot, never tried sooner) */
++			delay_for_interval(90000, 1000000u);
++		}
++	}
+ 	/* the Data volume appears some tens of seconds after boot; try every 2 s for up to 5 minutes */
+ 	for (wt.auto_tries = 0; wt.auto_tries < 150; wt.auto_tries++) {
+ 		delay_for_interval(2000, 1000000u);
+@@ -525,6 +544,12 @@ gpu_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 	wt_idle_forever();
+ }
+ 
++static int
++gpu_auto_running(void)
++{
++	return gs.state == 1;
++}
++
+ /* what 0: `gpuauto` (the boot-time results), 1: `gpusave` */
+ int
+ pong_gpu_tools_usb(char *reply, size_t cap, int what)
