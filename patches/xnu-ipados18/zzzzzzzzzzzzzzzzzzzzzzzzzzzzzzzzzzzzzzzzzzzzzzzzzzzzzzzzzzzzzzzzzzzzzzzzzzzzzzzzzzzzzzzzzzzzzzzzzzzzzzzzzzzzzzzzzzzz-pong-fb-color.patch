@@ -1,0 +1,346 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 434004c..1f832d4 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -74,11 +74,15 @@ enum {
+ 	kFBMethodRequestPowerChange     = 12,
+ 	kFBMethodSwapSignal             = 20,
+ 	kFBMethodSetDisplayDevice       = 22,
++	kFBMethodSetWhiteOnBlackMode    = 19,           /* (19, 51, 54, 55: _kern_* / IOMobileFramebuffer* of 22H374, z110) */
+ 	kFBMethodGetDigitalOutState     = 25,
+ 	kFBMethodGetDotPitch            = 28,
+ 	kFBMethodGetDisplayArea         = 29,
+-	kFBMethodSetColorRemapMode      = 33,
++	kFBMethodEnableDisableVideoPowerSavings = 33,   /* (was taken for SetColorRemapMode, which is 51 in 22H374) */
++	kFBMethodSetColorRemapMode      = 51,
+ 	kFBMethodSwapCancel             = 52,
++	kFBMethodGetMatrix              = 54,           /* in: scope; out: 9 doubles */
++	kFBMethodSetMatrix              = 55,           /* in: scope, 9 doubles (row major) */
+ 	kFBMethodGetColorRemapMode      = 57,
+ 	kFBMethodNotifications          = 72,
+ 	kFBMethodChangeFrameInfo        = 73,
+@@ -300,7 +304,8 @@ public:
+ 	void reportFrameTimes(void);
+ 	void beginGraphics(void);
+ 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+-	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
++	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow, uint32_t * colorRow);
++	uint32_t *      fColorRows[8];          /* fb_color: a row of every drawer, before it goes through the colour matrix */
+ 	static void helperMain(void * self, wait_result_t result);
+ 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
+ 	unsigned        fThreads;
+@@ -412,6 +417,96 @@ static bool             gHwScale;               /* frames are at the display's s
+ static bool             gScaled;                /* ... and the pipes have been told so */
+ static bool             gFlipping;
+ 
++/*
++ * Colour (z110, boot-arg fb_color=1; 0, the default: these selectors are refused as before). What iOS
++ * asks of the display's colour -- IOMobileFramebufferSetMatrix(fb, scope, double m[9]) (selector 55;
++ * the boot calls it with scope 9), SetWhiteOnBlackMode (19: inverted colours), SetColorRemapMode (51)
++ * -- is kept, and the frames are copied to the panel through one 3 x 3 matrix made of it: every scope's
++ * matrix, the lower scope first, then inverted if asked. The kernel has no floating point: the doubles
++ * are read from their bits into 16.16 fixed point, and a pixel is worked out in 8.8 (colorApply()). The
++ * matrix acts on the pixels as they are (gamma encoded), not on linear light. Which scope is Night
++ * Shift, True Tone or a colour filter, and what the remap modes mean, the device test says (USB `dpu`,
++ * and the log of every call): work/gap_audit/DPU_TEST.md.
++ */
++static TUNABLE(uint32_t, gColor, "fb_color", 0);
++#define COLOR_SCOPES            16
++#define Q16_ONE                 (1 << 16)
++static uint64_t         gColorBits[COLOR_SCOPES][9];    /* the doubles as given, for GetMatrix */
++static int32_t          gColorScope[COLOR_SCOPES][9];   /* ... in 16.16 */
++static uint32_t         gColorScopes;           /* the scopes given a matrix */
++static bool             gColorInvert;
++static uint64_t         gColorRemap;
++static uint32_t         gColorCalls;
++static int32_t          gColorQ[12];            /* the matrix the frames go through: 9 coefficients and 3 offsets, 8.8 */
++static bool             gColorActive;           /* ... and it is not the identity */
++
++/* A double's bits in 16.16 (kept within +-64; NaN and infinity: 0). */
++static int32_t
++q16FromDouble(uint64_t bits)
++{
++	int32_t e = (int32_t) (bits >> 52 & 0x7ff) - 1023;
++	uint64_t mant = (bits & ((1ull << 52) - 1)) | (1ull << 52);
++	int32_t v;
++
++	if (e == 1024 || e < -17) {
++		return 0;                       /* (NaN, infinity, zero and anything under 2^-17) */
++	}
++	v = e >= 6 ? 64 * Q16_ONE : (int32_t) (mant >> (36 - e));   /* (mant * 2^(e - 52) * 2^16) */
++	return bits >> 63 ? -v : v;
++}
++
++/* gColorQ from the scopes' matrices and the inversion. With the framebuffer's lock held. */
++static void
++colorRecompute(void)
++{
++	int64_t m[9] = { Q16_ONE, 0, 0, 0, Q16_ONE, 0, 0, 0, Q16_ONE }, t[9];
++
++	for (int s = 0; s < COLOR_SCOPES; s++) {
++		if (!(gColorScopes & (1u << s))) {
++			continue;
++		}
++		for (int i = 0; i < 3; i++) {
++			for (int j = 0; j < 3; j++) {
++				t[3 * i + j] = (gColorScope[s][3 * i] * m[j] + gColorScope[s][3 * i + 1] * m[3 + j] +
++				    gColorScope[s][3 * i + 2] * m[6 + j]) / Q16_ONE;
++				t[3 * i + j] = t[3 * i + j] < -64 * Q16_ONE ? -64 * Q16_ONE : t[3 * i + j] > 64 * Q16_ONE ? 64 * Q16_ONE : t[3 * i + j];
++			}
++		}
++		memcpy(m, t, sizeof(m));
++	}
++	gColorActive = gColorInvert;
++	for (int i = 0; i < 9; i++) {
++		int64_t q = (m[i] + 128) >> 8;
++
++		q = q < -32768 ? -32768 : q > 32767 ? 32767 : q;
++		gColorQ[i] = (int32_t) (gColorInvert ? -q : q);
++		gColorActive |= q != (i % 4 == 0 ? 256 : 0);
++	}
++	for (int i = 9; i < 12; i++) {
++		gColorQ[i] = gColorInvert ? 255 * 256 + 128 : 128;     /* (+128: rounding of the >> 8 in colorApply()) */
++	}
++}
++
++/* Pixels `x0` to `x1` of a row through gColorQ, from `from` (cached) to `to` (the panel's memory). */
++static void
++colorApply(uint32_t * to, const uint32_t * from, int32_t x0, int32_t x1)
++{
++	const int32_t * q = gColorQ;
++
++	for (int32_t x = x0; x < x1; x++) {
++		uint32_t v = from[x];
++		int32_t r = (int32_t) (v >> 16 & 0xff), g = (int32_t) (v >> 8 & 0xff), b = (int32_t) (v & 0xff);
++		int32_t R = (q[0] * r + q[1] * g + q[2] * b + q[9]) >> 8;
++		int32_t G = (q[3] * r + q[4] * g + q[5] * b + q[10]) >> 8;
++		int32_t B = (q[6] * r + q[7] * g + q[8] * b + q[11]) >> 8;
++
++		R = R < 0 ? 0 : R > 255 ? 255 : R;
++		G = G < 0 ? 0 : G > 255 ? 255 : G;
++		B = B < 0 ? 0 : B > 255 ? 255 : B;
++		to[x] = 0xff000000u | (uint32_t) R << 16 | (uint32_t) G << 8 | (uint32_t) B;
++	}
++}
++
+ static inline uint32_t
+ mdssRead(uint32_t offset)
+ {
+@@ -878,6 +973,9 @@ dpuReport(char * out, size_t cap)
+ 	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
+ 	DPU_SAY("last 5 s report: %u frames in %u ms, %u us each in the driver; %u flips, %u replaced; the panel was sent %u frames\n",
+ 	    gLastReport[0], gLastReport[1], gLastReport[2], gLastReport[3], gLastReport[4], gLastReport[5]);
++	DPU_SAY("color: fb_color %u, scopes %x, inverted %d, remap %llu, %s; 8.8 matrix %d %d %d / %d %d %d / %d %d %d, offsets %d %d %d; %u SetMatrix calls\n",
++	    gColor, gColorScopes, gColorInvert, gColorRemap, gColorActive ? "applied" : "identity", gColorQ[0], gColorQ[1], gColorQ[2],
++	    gColorQ[3], gColorQ[4], gColorQ[5], gColorQ[6], gColorQ[7], gColorQ[8], gColorQ[9], gColorQ[10], gColorQ[11], gColorCalls);
+ #undef DPU_SAY
+ 	return at;
+ }
+@@ -974,6 +1072,9 @@ IOMobileFramebuffer::failStart(IOService * provider)
+ 	/* (allocated at the boot framebuffer's width: fPanelWidth may be the display's since, see start()) */
+ 	if (fColumn != NULL) { IODelete(fColumn, uint32_t, vinfo.v_width); fColumn = NULL; }
+ 	if (fColumnWeight != NULL) { IODelete(fColumnWeight, uint16_t, vinfo.v_width); fColumnWeight = NULL; }
++	for (unsigned i = 0; i < 8; i++) {
++		if (fColorRows[i] != NULL) { IODelete(fColorRows[i], uint32_t, vinfo.v_width); fColorRows[i] = NULL; }
++	}
+ 	if (fHelperLock != NULL) { IOLockFree(fHelperLock); fHelperLock = NULL; }
+ 	if (fSwapLock != NULL) { IOLockFree(fSwapLock); fSwapLock = NULL; }
+ 	if (fLock != NULL) { IOLockFree(fLock); fLock = NULL; }
+@@ -1017,6 +1118,15 @@ IOMobileFramebuffer::start(IOService * provider)
+ 		return failStart(provider);
+ 	}
+ 	fThreads = gThreads >= 1 && gThreads <= 8 ? gThreads : 1;
++	if (gColor) {
++		/* fb_color: a row for each of the fThreads drawers (see drawRows()); without them the matrix is not applied */
++		for (unsigned i = 0; i < fThreads; i++) {
++			fColorRows[i] = IONewZero(uint32_t, vinfo.v_width);
++		}
++		colorRecompute();
++		IOLog("MiniIOMobileFramebuffer: fb_color=%u: colour matrix, inverted colours and remap accepted, applied as frames are copied\n",
++		    gColor);
++	}
+ #if XNU_PONG_ADRENO_PLATFORM
+ 	pong_scanout_initialize((uint64_t)fBase,(size_t)fRowBytes*fPanelHeight,
+ 	    fRowBytes,fPanelWidth,fPanelHeight);
+@@ -1168,7 +1278,7 @@ struct RowJob {
+ };
+ 
+ void
+-IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow)
++IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow, uint32_t * colorRow)
+ {
+ 	const uint8_t * pixels = job->pixels;
+ 	uint32_t stride = job->stride;
+@@ -1180,16 +1290,20 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
+ 	if (y0 < 0) y0 = 0;
+ 	if (y1 > (int32_t) fPanelHeight) y1 = (int32_t) fPanelHeight;
+ 	if (y0 >= y1 || cx0 >= cx1) return;
++	/* fb_color: a row is made in `colorRow` (cached, indexed as the panel's) and goes through the matrix into the panel's memory */
++	bool color = gColorActive && colorRow != NULL;
+ 
+ 	for (int32_t y = y0; y < y1; y++) {
+ 		const uint32_t * from;
+-		uint32_t * to;
++		uint32_t * to, * panel;
+ 
+-		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
++		panel = (uint32_t *) (fBase + (size_t) y * fRowBytes);
++		to = color ? colorRow : panel;
+ 		if (job->unscaled) {
+ 			/* not scaled at all */
+ 			const uint32_t *row = (const uint32_t *)(pixels + (size_t)(sy + y - py0) * stride) + sx;
+ 			for (int32_t x=0;x<sw;x++) to[px0+x]=row[x] | 0xff000000u;
++			if (color) colorApply(panel, colorRow, px0, px0 + sw);
+ 			continue;
+ 		}
+ 		if (filter) {
+@@ -1244,6 +1358,9 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
+ 				to[x] = from[fColumn[x]] | 0xff000000u;
+ 			}
+ 		}
++		if (color) {
++			colorApply(panel, colorRow, cx0, cx1);
++		}
+ 	}
+ }
+ 
+@@ -1277,7 +1394,7 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
+ 		y0 = first + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
+ 		y1 = first + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
+ 		blend = fb->fHelperBlend[index];
+-		fb->drawRows(job, y0, y1, blend);
++		fb->drawRows(job, y0, y1, blend, fb->fColorRows[index + 1]);
+ 		IOLockLock(fb->fHelperLock);
+ 		fb->fHelpersBusy--;
+ 		if (fb->fHelpersBusy == 0) {
+@@ -1410,14 +1527,14 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
+ 	job.filter = filter;
+ 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+ 	if (fThreads <= 1 || fDiff) {
+-		drawRows(&job, visibleY0, visibleY1, fBlendRow);
++		drawRows(&job, visibleY0, visibleY1, fBlendRow, fColorRows[0]);
+ 		return;
+ 	}
+ 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
+ 	IOLockLock(fHelperLock);
+ 	if (fHelpersStarted + 1 < fThreads) {
+ 		IOLockUnlock(fHelperLock);
+-		drawRows(&job, visibleY0, visibleY1, fBlendRow);
++		drawRows(&job, visibleY0, visibleY1, fBlendRow, fColorRows[0]);
+ 		return;
+ 	}
+ 	fHelperJob = &job;
+@@ -1425,7 +1542,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
+ 	fHelperGeneration++;
+ 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
+ 	IOLockUnlock(fHelperLock);
+-	drawRows(&job, visibleY0, visibleY0 + (visibleY1 - visibleY0) / fThreads, fBlendRow);
++	drawRows(&job, visibleY0, visibleY0 + (visibleY1 - visibleY0) / fThreads, fBlendRow, fColorRows[0]);
+ 	IOLockLock(fHelperLock);
+ 	while (fHelpersBusy != 0) {
+ 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
+@@ -1717,8 +1834,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	int32_t source[4],destination[4];
+ 	memcpy(source,swap+SWAP_SOURCE(0),sizeof(source));
+ 	memcpy(destination,swap+SWAP_DEST(0),sizeof(destination));
+-	/* (not while flipping: the GPU copy writes the firmware's buffer, which may be on show) */
+-	if(!gFlipping && surfacesReady && base && !swapWord(swap,SWAP_SURFACE(1)) && !swapWord(swap,SWAP_SURFACE(2)) &&
++	/* (not while flipping: the GPU copy writes the firmware's buffer, which may be on show; nor with a colour matrix: it would skip it) */
++	if(!gFlipping && !gColorActive && surfacesReady && base && !swapWord(swap,SWAP_SURFACE(1)) && !swapWord(swap,SWAP_SURFACE(2)) &&
+ 	    !swapWord(swap,SWAP_SURFACE(3)) && canDrawLinearBGRA(base) &&
+ 	    base->info.width>=fPanelWidth && base->info.height>=fPanelHeight &&
+ 	    !source[0] && !source[1] && !destination[0] && !destination[1] &&
+@@ -2122,14 +2239,90 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 
+ 	case kFBMethodGetColorRemapMode:
+ 		if (args->scalarOutputCount < 1) return kIOReturnBadArgument;
+-		/* This software backend presents the source RGB without a remap. */
+-		out[0] = 0;
++		/* This software backend presents the source RGB without a remap (fb_color: what was asked last, kept, see below). */
++		out[0] = gColor ? gColorRemap : 0;
+ 		args->scalarOutputCount = 1;
+ 		return kIOReturnSuccess;
+-	case kFBMethodSetColorRemapMode:
++	case kFBMethodEnableDisableVideoPowerSavings:
++		/* (this selector was once taken for SetColorRemapMode and answered so: kept as it was) */
+ 		if (args->scalarInputCount != 1) return kIOReturnBadArgument;
+ 		return in[0] == 0 ? kIOReturnSuccess : kIOReturnUnsupported;
+ 
++	case kFBMethodSetMatrix:                        /* fb_color: in: scope, 9 doubles */
++		if (!gColor) {
++			break;                          /* (refused, as before) */
++		}
++		if (args->scalarInputCount < 1 || args->structureInput == NULL || args->structureInputSize < 9 * sizeof(uint64_t)) {
++			return kIOReturnBadArgument;
++		}
++		{
++			uint64_t bits[9];
++			uint32_t scope = (uint32_t) in[0];
++			int32_t q[9], milli[9];
++
++			memcpy(bits, args->structureInput, sizeof(bits));
++			for (int i = 0; i < 9; i++) {
++				q[i] = q16FromDouble(bits[i]);
++				milli[i] = (int32_t) ((int64_t) q[i] * 1000 / Q16_ONE);
++			}
++			if (gColorCalls++ < 32) {
++				IOLog("MiniIOMobileFramebuffer: fb_color: SetMatrix scope %u (thousandths): %d %d %d / %d %d %d / %d %d %d\n", scope,
++				    milli[0], milli[1], milli[2], milli[3], milli[4], milli[5], milli[6], milli[7], milli[8]);
++			}
++			if (scope >= COLOR_SCOPES) {
++				return kIOReturnBadArgument;
++			}
++			IOLockLock(fOwner->fLock);      /* (not in the middle of a frame) */
++			memcpy(gColorBits[scope], bits, sizeof(bits));
++			memcpy(gColorScope[scope], q, sizeof(q));
++			gColorScopes |= 1u << scope;
++			colorRecompute();
++			IOLockUnlock(fOwner->fLock);
++		}
++		return kIOReturnSuccess;
++
++	case kFBMethodGetMatrix:                        /* fb_color: in: scope; out: its 9 doubles (the identity if never set) */
++		if (!gColor) {
++			break;
++		}
++		if (args->scalarInputCount < 1 || args->structureOutput == NULL || args->structureOutputSize < 9 * sizeof(uint64_t)) {
++			return kIOReturnBadArgument;
++		}
++		{
++			static const uint64_t identity[9] = { 0x3ff0000000000000ull, 0, 0, 0, 0x3ff0000000000000ull, 0, 0, 0, 0x3ff0000000000000ull };
++			uint32_t scope = (uint32_t) in[0];
++
++			memcpy(args->structureOutput, scope < COLOR_SCOPES && (gColorScopes & (1u << scope)) ? gColorBits[scope] : identity,
++			    sizeof(identity));
++			args->structureOutputSize = sizeof(identity);
++		}
++		return kIOReturnSuccess;
++
++	case kFBMethodSetWhiteOnBlackMode:              /* fb_color: in: on (inverted colours) */
++		if (!gColor) {
++			break;
++		}
++		if (args->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		IOLog("MiniIOMobileFramebuffer: fb_color: SetWhiteOnBlackMode %llu\n", in[0]);
++		IOLockLock(fOwner->fLock);
++		gColorInvert = in[0] != 0;
++		colorRecompute();
++		IOLockUnlock(fOwner->fLock);
++		return kIOReturnSuccess;
++
++	case kFBMethodSetColorRemapMode:                /* fb_color: in: mode -- kept and answered, not applied (what the modes are: the device test) */
++		if (!gColor) {
++			break;
++		}
++		if (args->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		IOLog("MiniIOMobileFramebuffer: fb_color: SetColorRemapMode %llu (kept, not applied)\n", in[0]);
++		gColorRemap = in[0];
++		return kIOReturnSuccess;
++
+ 	case kFBMethodSetDisplayDevice:
+ 		/* 22H374 _kern_SetDisplayDevice sends one device index. This
+ 		 * service is permanently attached to the existing boot panel,
