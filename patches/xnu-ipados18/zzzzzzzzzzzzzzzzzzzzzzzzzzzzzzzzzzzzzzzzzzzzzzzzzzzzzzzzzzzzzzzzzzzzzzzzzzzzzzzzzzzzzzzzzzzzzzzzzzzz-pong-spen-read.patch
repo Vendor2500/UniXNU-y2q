@@ -1,0 +1,541 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f510e2d..1c5f52e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -404,6 +404,7 @@ bsd/dev/pong_input.c			standard
+ bsd/dev/pong_goodix.c			standard
+ bsd/dev/pong_buttons.c			standard
+ bsd/dev/pong_fts.c			standard
++bsd/dev/pong_spen.c			standard
+ bsd/dev/pong_usb_ctl.c			standard
+ bsd/dev/pong_cpu_perf.c			standard
+ bsd/dev/pong_pogo.c			standard
+diff --git a/bsd/dev/pong_spen.c b/bsd/dev/pong_spen.c
+new file mode 100644
+index 0000000..a6d92e8
+--- /dev/null
++++ b/bsd/dev/pong_spen.c
+@@ -0,0 +1,504 @@
++/*
++ * SM-T970 S Pen digitizer, stage 1 (iOSPort work/spen_scope/PLAN.md): read the Wacom W9021 ("wacom,w90xx") and show it over USB.
++ * Nothing reaches the HID system yet; nothing runs unless `spen on` is sent.
++ *
++ *   spen        state, query result (firmware, ranges), counters, last coordinate packet decoded
++ *   spen on     once per boot: map the pins, FWE low, 3.3 V on (GPIO 93), query, survey exit (0x2d) + start (0x31), then a
++ *               kernel thread polls the IRQ line and reads 17-byte packets
++ *   spen raw    the last four raw packets in hex
++ *
++ * Wiring (live T970 device tree, as recorded by the precedent): I2C 0x56 on QUP SE17 pins GPIO 52 SDA / 53 SCL (TLMM SOUTH),
++ * driven here as a GPIO bit-bang master like pong_fts.c; IRQ GPIO 136 (WEST, low while a packet is pending); FWE GPIO 6 and
++ * pen-detect GPIO 7 (NORTH, high = pen in its garage); 3.3 V enable GPIO 93 (NORTH); hall GPIO 110 (NORTH).
++ * Protocol (Samsung wacom_i2c.c): plain reads, no register. Query = 31-byte read, block at byte 16 (0x0f, max x, max y, max
++ * pressure, fw, mpu, bl, tilt x/y, height). Coordinate packet (type = b0 & 15 == 1): b0 bit7 in range, bit6 eraser, bit5 side
++ * button, bit4 tip; x = b1:b2, y = b3:b4, pressure = (b5 & 15):b6, height b7, tilt x/y = s8 b8/b9.
++ * Port of rui12366B/UniXNU-gts7xlwifi 88b34f9 package/T970Pen.cpp stages 1-2 (BSD-2-Clause-Patent); the same protocol is in
++ * JeyKul/gts7xl-mainline linux-patches/0009 (samsung-w90xx.c). Not tested on the device when written.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <mach/mach_types.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++extern void thread_deallocate(thread_t thread);
++extern uint64_t mach_absolute_time(void);
++
++int pong_spen_usb(char *reply, size_t cap, const char *args);
++
++#define SP_NORTH        0x0f900000UL
++#define SP_SOUTH        0x0f500000UL
++#define SP_WEST         0x0f100000UL
++#define SP_SDA          52
++#define SP_SCL          53
++#define SP_IRQ          136
++#define SP_FWE          6
++#define SP_PDCT         7
++#define SP_LDO          93
++#define SP_HALL         110
++#define SP_ADDR         0x56
++#define SP_BOOT_ADDR    0x09
++#define SP_COORD_LEN    17
++#define SP_QUERY_LEN    31
++#define SP_HALF_US      4       /* ~100 kHz */
++
++#define CTL             0
++#define IO              4
++#define PULL_MASK       3u
++#define PULL_UP         3u
++#define FUNC_MASK       0x3cu
++#define OE              (1u << 9)
++#define IN_BIT          1u
++#define OUT_BIT         2u
++
++static vm_offset_t sp_bus, sp_north, sp_ldo, sp_hall, sp_irq;   /* one mapping per pin group */
++static volatile UInt32 sp_started;
++static int sp_event;              /* what sp_sleep_ms waits on */
++static int sp_stage;            /* 0 idle, 1 mapped, 2 powered, 3 bus ok, 4 queried, 5 streaming; negative = failed there */
++static int sp_err;
++static unsigned sp_pins_before, sp_pins_after, sp_nacks, sp_stretch, sp_busy, sp_i2c_err, sp_boot_ack;
++static unsigned sp_fw, sp_mpu, sp_max_x = 0x5880, sp_max_y = 0x3750, sp_max_p = 0xfff, sp_tilt_x, sp_tilt_y, sp_height;
++static unsigned sp_packets, sp_coords, sp_other, sp_types, sp_irq_stuck, sp_hover, sp_tips, sp_side, sp_rate, sp_rate_best;
++static unsigned sp_pdct = 2, sp_pdct_edges, sp_hall_v = 2, sp_hall_edges;
++static uint8_t sp_last[SP_COORD_LEN];
++static uint8_t sp_raw[4][SP_COORD_LEN];
++static unsigned sp_raw_n;
++static char sp_query_hex[2 * 15 + 1];
++static bool sp_prox, sp_tip, sp_side_down;
++
++static volatile uint32_t *
++sp_reg(unsigned pin, unsigned off)
++{
++	vm_offset_t base;
++
++	switch (pin) {
++	case SP_SDA: case SP_SCL: base = sp_bus + (pin - SP_SDA) * 0x1000UL; break;
++	case SP_FWE: case SP_PDCT: base = sp_north + (pin - SP_FWE) * 0x1000UL; break;
++	case SP_LDO: base = sp_ldo; break;
++	case SP_HALL: base = sp_hall; break;
++	default: base = sp_irq; break;
++	}
++	return (volatile uint32_t *)(base + off);
++}
++
++static uint32_t sp_rd(unsigned pin, unsigned off) { return *sp_reg(pin, off); }
++static void
++sp_wr(unsigned pin, unsigned off, uint32_t v)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	*sp_reg(pin, off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static bool sp_high(unsigned pin) { return sp_rd(pin, IO) & IN_BIT; }
++static void sp_input(unsigned pin, uint32_t pull) { sp_wr(pin, CTL, (sp_rd(pin, CTL) & ~(FUNC_MASK | PULL_MASK | OE)) | pull); }
++static void
++sp_output(unsigned pin, bool level)
++{
++	sp_wr(pin, IO, level ? (sp_rd(pin, IO) | OUT_BIT) : (sp_rd(pin, IO) & ~OUT_BIT));
++	sp_wr(pin, CTL, (sp_rd(pin, CTL) & ~(FUNC_MASK | PULL_MASK)) | OE);
++}
++static unsigned
++sp_pin_snapshot(void)
++{
++	return (sp_high(SP_SDA) ? 1 : 0) | (sp_high(SP_SCL) ? 2 : 0) | (sp_high(SP_IRQ) ? 4 : 0) | (sp_high(SP_PDCT) ? 8 : 0) |
++	       (sp_high(SP_FWE) ? 16 : 0) | (sp_high(SP_LDO) ? 32 : 0) | (sp_high(SP_HALL) ? 64 : 0);
++}
++
++/* Spin: delay_for_interval() sleeps on a timer even for microseconds on this board (see pong_fts.c sleep_us). */
++static void
++sp_udelay(uint32_t us)
++{
++	uint64_t interval, deadline;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &interval);
++	deadline = mach_absolute_time() + interval;
++	while (mach_absolute_time() < deadline) {
++	}
++}
++
++static void
++sp_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	assert_wait_deadline((event_t)&sp_event, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- GPIO I2C master on 52/53 (open drain: release = input with the pad pull-up, drive = output low) ---- */
++static void sp_release(unsigned pin) { sp_wr(pin, CTL, sp_rd(pin, CTL) & ~OE); }
++static void sp_drive(unsigned pin) { sp_wr(pin, IO, sp_rd(pin, IO) & ~OUT_BIT); sp_wr(pin, CTL, sp_rd(pin, CTL) | OE); }
++static bool
++sp_scl_up(void)
++{
++	sp_release(SP_SCL);
++	for (unsigned i = 0; i < 2000; i++) {
++		if (sp_high(SP_SCL)) {
++			return true;
++		}
++		sp_udelay(1);
++	}
++	sp_stretch++;
++	return false;
++}
++static void
++sp_recover(void)
++{
++	for (unsigned i = 0; i < 9 && !sp_high(SP_SDA); i++) {
++		sp_drive(SP_SCL); sp_udelay(SP_HALF_US); sp_scl_up(); sp_udelay(SP_HALF_US);
++	}
++}
++static bool
++sp_start(void)
++{
++	sp_release(SP_SDA);
++	if (!sp_scl_up()) {
++		return false;
++	}
++	sp_udelay(SP_HALF_US);
++	if (!sp_high(SP_SDA)) {
++		sp_recover();
++		if (!sp_high(SP_SDA)) {
++			sp_busy++;
++			return false;
++		}
++	}
++	sp_drive(SP_SDA); sp_udelay(SP_HALF_US); sp_drive(SP_SCL); sp_udelay(SP_HALF_US);
++	return true;
++}
++static void
++sp_stop(void)
++{
++	sp_drive(SP_SDA); sp_udelay(SP_HALF_US); sp_scl_up(); sp_udelay(SP_HALF_US); sp_release(SP_SDA); sp_udelay(SP_HALF_US);
++}
++static bool
++sp_write_byte(uint8_t b)
++{
++	for (int bit = 7; bit >= 0; bit--) {
++		if (b & (1u << bit)) {
++			sp_release(SP_SDA);
++		} else {
++			sp_drive(SP_SDA);
++		}
++		sp_udelay(SP_HALF_US);
++		if (!sp_scl_up()) {
++			return false;
++		}
++		sp_udelay(SP_HALF_US);
++		sp_drive(SP_SCL);
++	}
++	sp_release(SP_SDA);
++	sp_udelay(SP_HALF_US);
++	if (!sp_scl_up()) {
++		return false;
++	}
++	bool ack = !sp_high(SP_SDA);
++	sp_udelay(SP_HALF_US);
++	sp_drive(SP_SCL);
++	if (!ack) {
++		sp_nacks++;
++	}
++	return ack;
++}
++static uint8_t
++sp_read_byte(bool ack)
++{
++	uint8_t b = 0;
++
++	sp_release(SP_SDA);
++	for (int bit = 7; bit >= 0; bit--) {
++		sp_udelay(SP_HALF_US); sp_scl_up();
++		if (sp_high(SP_SDA)) {
++			b |= (uint8_t)(1u << bit);
++		}
++		sp_udelay(SP_HALF_US); sp_drive(SP_SCL);
++	}
++	if (ack) {
++		sp_drive(SP_SDA);
++	} else {
++		sp_release(SP_SDA);
++	}
++	sp_udelay(SP_HALF_US); sp_scl_up(); sp_udelay(SP_HALF_US); sp_drive(SP_SCL); sp_release(SP_SDA);
++	return b;
++}
++static bool
++sp_i2c_write(uint8_t addr, const uint8_t *w, unsigned n)
++{
++	bool ok = sp_start() && sp_write_byte((uint8_t)(addr << 1));
++	for (unsigned i = 0; ok && i < n; i++) {
++		ok = sp_write_byte(w[i]);
++	}
++	sp_stop();
++	if (!ok) {
++		sp_i2c_err++;
++	}
++	return ok;
++}
++/* i2c_master_recv: no register address, the controller sends its current packet */
++static bool
++sp_i2c_read(uint8_t addr, uint8_t *r, unsigned n)
++{
++	bool ok = sp_start() && sp_write_byte((uint8_t)((addr << 1) | 1));
++	for (unsigned i = 0; ok && i < n; i++) {
++		r[i] = sp_read_byte(i + 1 < n);
++	}
++	sp_stop();
++	if (!ok) {
++		sp_i2c_err++;
++	}
++	return ok;
++}
++static bool
++sp_command(uint8_t c)
++{
++	bool ok = sp_i2c_write(SP_ADDR, &c, 1);
++	sp_sleep_ms(50);        /* wacom_start_stop_cmd's 50 ms */
++	return ok;
++}
++
++/* ---- W9021 ---- */
++static bool
++sp_query(void)
++{
++	uint8_t d[SP_QUERY_LEN];
++
++	for (unsigned i = 0; i < 5; i++) {
++		memset(d, 0, sizeof(d));
++		if (!sp_i2c_read(SP_ADDR, d, sizeof(d))) {
++			sp_sleep_ms(50);
++			continue;
++		}
++		const uint8_t *q = d + 16;
++		for (unsigned j = 0; j < 15; j++) {
++			snprintf(sp_query_hex + 2 * j, 3, "%02x", q[j]);
++		}
++		if (q[0] != 0x0f) {
++			sp_sleep_ms(50);
++			continue;
++		}
++		unsigned mx = ((unsigned)q[1] << 8) | q[2], my = ((unsigned)q[3] << 8) | q[4], mp = ((unsigned)q[5] << 8) | q[6];
++		if (mx) sp_max_x = mx;
++		if (my) sp_max_y = my;
++		if (mp) sp_max_p = mp;
++		sp_fw = ((unsigned)q[7] << 8) | q[8];
++		sp_mpu = q[9];
++		sp_tilt_x = q[11];
++		sp_tilt_y = q[12];
++		sp_height = q[13];
++		return true;
++	}
++	/* nothing valid at 0x56: is the boot loader answering (FWE high or a broken image)? */
++	sp_boot_ack = sp_start() && sp_write_byte(SP_BOOT_ADDR << 1);
++	sp_stop();
++	return false;
++}
++
++static void
++sp_garage(void)
++{
++	unsigned p = sp_high(SP_PDCT) ? 1 : 0, h = sp_high(SP_HALL) ? 1 : 0;
++
++	if (sp_pdct < 2 && p != sp_pdct) {
++		sp_pdct_edges++;
++	}
++	if (sp_hall_v < 2 && h != sp_hall_v) {
++		sp_hall_edges++;
++	}
++	sp_pdct = p;
++	sp_hall_v = h;
++}
++
++static void
++sp_packet(void)
++{
++	uint8_t d[SP_COORD_LEN] = { 0 };
++
++	if (!sp_i2c_read(SP_ADDR, d, sizeof(d))) {
++		sp_irq_stuck++;
++		sp_sleep_ms(2);
++		return;
++	}
++	sp_packets++;
++	sp_types |= 1u << (d[0] & 15);
++	if ((d[0] & 15) != 1) {
++		sp_other++;
++		memcpy(sp_raw[sp_raw_n++ & 3], d, sizeof(d));
++		return;
++	}
++	sp_coords++;
++	if (sp_coords <= 16 || !(sp_coords & 255)) {
++		memcpy(sp_raw[sp_raw_n++ & 3], d, sizeof(d));
++	}
++	memcpy(sp_last, d, sizeof(d));
++	bool ready = d[0] & 0x80, tip = d[0] & 0x10, side = d[0] & 0x20;
++	if (!ready) {
++		sp_prox = sp_tip = sp_side_down = false;
++		return;
++	}
++	if (!sp_prox) sp_hover++;
++	if (tip && !sp_tip) sp_tips++;
++	if (side && !sp_side_down) sp_side++;
++	sp_prox = true;
++	sp_tip = tip;
++	sp_side_down = side;
++}
++
++static bool
++sp_bring_up(void)
++{
++	sp_bus = ml_io_map(SP_SOUTH + SP_SDA * 0x1000UL, 0x2000);
++	sp_north = ml_io_map(SP_NORTH + SP_FWE * 0x1000UL, 0x2000);
++	sp_ldo = ml_io_map(SP_NORTH + SP_LDO * 0x1000UL, 0x1000);
++	sp_hall = ml_io_map(SP_NORTH + SP_HALL * 0x1000UL, 0x1000);
++	sp_irq = ml_io_map(SP_WEST + SP_IRQ * 0x1000UL, 0x1000);
++	if (!sp_bus || !sp_north || !sp_ldo || !sp_hall || !sp_irq) {
++		sp_stage = -1;
++		return false;
++	}
++	sp_stage = 1;
++	sp_pins_before = sp_pin_snapshot();
++	/* wacom_i2c_probe: FWE output low (normal mode), then power; an FWE found high means a power cycle */
++	bool fwe_high = sp_high(SP_FWE);
++	bool ldo_on = (sp_rd(SP_LDO, CTL) & OE) && (sp_rd(SP_LDO, IO) & OUT_BIT);
++	sp_output(SP_FWE, false);
++	if (fwe_high) {
++		sp_output(SP_LDO, false);
++		sp_sleep_ms(100);
++		sp_output(SP_LDO, true);
++		sp_sleep_ms(200);
++	} else if (!ldo_on) {
++		sp_output(SP_LDO, true);
++		sp_sleep_ms(200);
++	}
++	/* IRQ, pen-detect and hall: inputs without pull (DT bias-disable); the bus pins GPIO with the pad pull-up */
++	sp_input(SP_IRQ, 0);
++	sp_input(SP_PDCT, 0);
++	sp_input(SP_HALL, 0);
++	sp_wr(SP_SDA, IO, sp_rd(SP_SDA, IO) & ~OUT_BIT);
++	sp_input(SP_SDA, PULL_UP);
++	sp_wr(SP_SCL, IO, sp_rd(SP_SCL, IO) & ~OUT_BIT);
++	sp_input(SP_SCL, PULL_UP);
++	sp_sleep_ms(20);
++	sp_stage = 2;
++	sp_pins_after = sp_pin_snapshot();
++	if ((sp_pins_after & 3) != 3) {
++		sp_recover();
++	}
++	if (!sp_high(SP_SDA) || !sp_high(SP_SCL)) {
++		sp_stage = -3;
++		sp_err = (int)sp_pin_snapshot();
++		return false;
++	}
++	sp_stage = 3;
++	if (!sp_query()) {
++		sp_stage = -4;
++		sp_err = (int)(sp_nacks | (sp_busy << 8) | (sp_stretch << 16));
++		return false;
++	}
++	sp_stage = 4;
++	sp_garage();
++	return true;
++}
++
++static void
++sp_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	if (!sp_bring_up()) {
++		return;
++	}
++	bool exit_ok = sp_command(0x2d), start_ok = sp_command(0x31);
++	sp_err = (exit_ok ? 0 : 1) | (start_ok ? 0 : 2);
++	sp_stage = 5;
++	unsigned idle = 0, garage_tick = 0, burst = 0, rate_from = sp_coords;
++	uint64_t one_s, rate_at = mach_absolute_time();
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_s);
++	for (;;) {
++		if (!sp_high(SP_IRQ)) {
++			sp_packet();
++			idle = 0;
++			/* a line that stays low (read failing, or not this controller's IRQ) must not spin a CPU */
++			if (++burst >= 8) {
++				burst = 0;
++				sp_sleep_ms(1);
++			}
++			continue;
++		}
++		burst = 0;
++		if (++garage_tick >= 25) {
++			garage_tick = 0;
++			sp_garage();
++		}
++		if (mach_absolute_time() - rate_at >= one_s) {
++			sp_rate = sp_coords - rate_from;
++			if (sp_rate > sp_rate_best) sp_rate_best = sp_rate;
++			rate_from = sp_coords;
++			rate_at = mach_absolute_time();
++		}
++		/* in range the controller reports every few ms; out of range it is quiet */
++		idle++;
++		sp_sleep_ms(sp_prox || idle < 200 ? 1 : 8);
++	}
++}
++
++int
++pong_spen_usb(char *reply, size_t cap, const char *args)
++{
++	if (!reply || cap < 64) {
++		return -1;
++	}
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (args && strcmp(args, "on") == 0) {
++		thread_t th;
++
++		if (!OSCompareAndSwap(0, 1, &sp_started)) {
++			snprintf(reply, cap, "spen: already started (spen)\n");
++			return -1;
++		}
++		if (kernel_thread_start((thread_continue_t)sp_thread, NULL, &th) != KERN_SUCCESS) {
++			snprintf(reply, cap, "spen: no thread\n");
++			return -1;
++		}
++		thread_deallocate(th);
++		snprintf(reply, cap, "spen: started (spen / spen raw)\n");
++		return 0;
++	}
++	if (args && strcmp(args, "raw") == 0) {
++		size_t k = 0;
++		unsigned n = sp_raw_n;
++		k += (size_t)snprintf(reply + k, cap - k, "spen raw n=%u\n", n);
++		for (unsigned i = n > 4 ? n - 4 : 0; i < n && k + 2 * SP_COORD_LEN + 2 < cap; i++) {
++			for (unsigned j = 0; j < SP_COORD_LEN; j++) {
++				k += (size_t)snprintf(reply + k, cap - k, "%02x", sp_raw[i & 3][j]);
++			}
++			reply[k++] = '\n';
++			reply[k] = '\0';
++		}
++		return 0;
++	}
++	const uint8_t *d = sp_last;
++	unsigned x = ((unsigned)d[1] << 8) | d[2], y = ((unsigned)d[3] << 8) | d[4], p = ((unsigned)(d[5] & 15) << 8) | d[6];
++	snprintf(reply, cap,
++	    "spen st %d err 0x%x pins %02x>%02x i2c %u nack %u busy %u stretch %u boot %u\n"
++	    "query %s fw %04x mpu %02x max %ux%u p %u tilt %u/%u h %u\n"
++	    "pk %u co %u oth %u types 0x%x stuck %u rate %u best %u hover %u tips %u side %u pdct %u/%u hall %u/%u\n"
++	    "last flags %02x %s%s%s%s x %u y %u p %u h %u tilt %d,%d\n",
++	    sp_stage, sp_err, sp_pins_before, sp_pins_after, sp_i2c_err, sp_nacks, sp_busy, sp_stretch, sp_boot_ack,
++	    sp_query_hex[0] ? sp_query_hex : "-", sp_fw, sp_mpu, sp_max_x, sp_max_y, sp_max_p, sp_tilt_x, sp_tilt_y, sp_height,
++	    sp_packets, sp_coords, sp_other, sp_types, sp_irq_stuck, sp_rate, sp_rate_best, sp_hover, sp_tips, sp_side,
++	    sp_pdct, sp_pdct_edges, sp_hall_v, sp_hall_edges,
++	    d[0], (d[0] & 0x80) ? "range" : "out", (d[0] & 0x10) ? " tip" : "", (d[0] & 0x20) ? " side" : "",
++	    (d[0] & 0x40) ? " eraser" : "", x, y, p, d[7], (int)(int8_t)d[8], (int)(int8_t)d[9]);
++	return 0;
++}
++#endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index f377f0c..5f11972 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2001,6 +2001,14 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_fwput(cmd + 6);
+ 	} else if (strcmp(cmd, "fwlist") == 0) {
+ 		cmd_handle_fwlist();
++	} else if (strcmp(cmd, "spen") == 0 || strncmp(cmd, "spen ", 5) == 0) {
++		/* the S Pen digitizer: `spen on` starts reading it, `spen`, `spen raw` (bsd/dev/pong_spen.c, z100) */
++		extern int pong_spen_usb(char *reply, size_t cap, const char *args);
++		static char sp_reply[640];
++
++		sp_reply[0] = '\0';
++		(void)pong_spen_usb(sp_reply, sizeof(sp_reply), cmd + 4);
++		send_str(sp_reply[0] ? sp_reply : "spen: no reply\n");
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
