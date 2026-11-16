@@ -1,0 +1,95 @@
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+index 86271b8..dc89676 100644
+--- a/bsd/dev/pong_backlight_t970.c
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -50,6 +50,7 @@ int pong_backlight_set_dbv(uint32_t dbv);
+ void pong_backlight_svc_state(uint32_t state, uint32_t ms);
+ void pong_panel_power_request(uint64_t state);
+ int pong_panel_is_off(void);
++int pong_panel_power_last(void);
+ 
+ /* ---- addresses ---------------------------------------------------------------------------- */
+ /* One 0x4000 window at ae94000 (one ml_io_map call). Every register this file touches is inside the
+@@ -567,4 +568,11 @@ pong_panel_is_off(void)
+ {
+ 	return __atomic_load_n(&g_pw_off, __ATOMIC_RELAXED);
+ }
++
++/* The window server's last display power request: -1 none seen yet, 0 off, 1 on (the cover sensor's view). */
++int
++pong_panel_power_last(void)
++{
++	return g_pw_reqs == 0 ? -1 : g_pw_last != 0;
++}
+ #endif /* PONG */
+\ No newline at end of file
+diff --git a/bsd/dev/pong_buttons.c b/bsd/dev/pong_buttons.c
+index 662c590..3747965 100644
+--- a/bsd/dev/pong_buttons.c
++++ b/bsd/dev/pong_buttons.c
+@@ -203,6 +203,56 @@ static void look(struct key *k, bool down, unsigned key_idx)
+     }
+ }
+ 
++/*
++ * Book cover hall sensor (pong_buttons bit 2, value 4): TLMM GPIO 157 (west tile), active low (closed = 0), configured
++ * as the stock pinctrl hall_default does (gpio, input, bias-disable, 2 mA) -- the one register write in this file.
++ * Closing the cover presses the power key once if the display is on; opening it presses it once if the display is off.
++ * "On" is the window server's last display power request (z104) when it has made one, else what this code did last.
++ * The first steady reading is only learnt (a pin that never changes never presses anything).
++ */
++#define COVER_GPIO_PHYS (0x0f100000UL + 157 * 0x1000UL)
++extern int pong_panel_power_last(void);         /* bsd/dev/pong_backlight_t970.c: -1 none yet, 0 off, 1 on */
++static vm_offset_t cover_va;
++static int cover_seen = -1, cover_state = -1;
++static unsigned cover_count;
++static bool cover_locked, cover_release;
++static uint32_t pong_cover_edges, pong_cover_presses;  /* (for a debugger; pmsg shows each edge) */
++
++static void cover_poll(void)
++{
++    if (cover_release) {
++        pong_touch_post(PONG_BUTTON_UP, PONG_BUTTON_POWER, 0, 0);
++        cover_release = false;
++        return;
++    }
++    if (!cover_va) {
++        cover_va = ml_io_map(COVER_GPIO_PHYS, 0x1000);
++        if (!cover_va) return;
++        wr(cover_va, 0);                        /* CFG: function gpio, input, no pull, 2 mA */
++    }
++    int v = (int)(rd(cover_va + 4) & 1);        /* IN_OUT bit 0: 1 open, 0 closed */
++    if (v != cover_seen) {
++        cover_seen = v;
++        cover_count = 0;
++        return;
++    }
++    if (++cover_count < 3 || v == cover_state) return;      /* three equal reads, about 100 ms */
++    int was = cover_state;
++    cover_state = v;
++    if (was < 0) return;
++    pong_cover_edges++;
++    int last = pong_panel_power_last();
++    bool on = last >= 0 ? last != 0 : !cover_locked;
++    bool press = v == 0 ? on : !on;
++    if (press) {
++        cover_locked = v == 0;
++        pong_touch_post(PONG_BUTTON_DOWN, PONG_BUTTON_POWER, 0, 0);
++        cover_release = true;
++        pong_cover_presses++;
++    }
++    pmsg_log("[PONG_COVER] %s press=%u panel=%d\n", v ? "open" : "closed", press, last);
++}
++
+ static void keys_thread(__unused void *arg, __unused wait_result_t wait_res)
+ {
+     delay_for_interval(buttons_delay_seconds, NSEC_PER_SEC);
+@@ -323,6 +373,8 @@ static void keys_thread(__unused void *arg, __unused wait_result_t wait_res)
+             }
+         }
+ 
++        if (buttons_mask & 4) cover_poll();
++
+         failures = good ? 0 : failures + 1;
+         if (!summary_logged) {
+             uint64_t elapsed_ns = 0;
