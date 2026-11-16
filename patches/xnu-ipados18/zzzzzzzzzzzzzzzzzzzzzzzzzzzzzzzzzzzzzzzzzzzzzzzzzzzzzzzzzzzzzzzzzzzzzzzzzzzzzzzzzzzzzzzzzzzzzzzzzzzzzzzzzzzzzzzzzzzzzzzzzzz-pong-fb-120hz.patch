@@ -1,0 +1,145 @@
+diff --git a/bsd/dev/pong_backlight_t970.c b/bsd/dev/pong_backlight_t970.c
+index dc89676..14fa811 100644
+--- a/bsd/dev/pong_backlight_t970.c
++++ b/bsd/dev/pong_backlight_t970.c
+@@ -575,4 +575,46 @@ pong_panel_power_last(void)
+ {
+ 	return g_pw_reqs == 0 ? -1 : g_pw_last != 0;
+ }
++
++/*
++ * One DCS long write of `count` (1..16) bytes to the panel, through the same FIFO transport and in-flight guard as
++ * the brightness writes (the framebuffer's fb_120hz sends the panel's frequency register, 0x60 0x20). 0 sent;
++ * -1 busy or no link; -2 the DMA-done never came (bl_send()).
++ */
++int pong_panel_dcs(const uint8_t *bytes, unsigned int count);
++
++int
++pong_panel_dcs(const uint8_t *bytes, unsigned int count)
++{
++	int rc = -1;
++
++	if (bytes == NULL || count == 0 || count > 16) {
++		return -1;
++	}
++	for (int tries = 0; __atomic_exchange_n(&g_bl_busy, 1, __ATOMIC_ACQUIRE); tries++) {
++		if (tries == 50) {
++			return -1;
++		}
++		bl_spin_us(1000);
++	}
++	g_bl_quiet = 1;
++	if (!g_bl_dsi) {
++		g_bl_dsi = ml_io_map(BL_DSI0_PHYS, BL_DSI0_WINDOW);
++	}
++	if (g_bl_dsi) {
++		const uint32_t hw = bl_rd32(BL_REG_HW_VERSION);
++		const uint32_t ctrl = bl_rd32(BL_REG_CTRL);
++		const uint32_t tpg = bl_rd32(BL_REG_TPG_CTRL);
++
++		if (hw && hw != ~0u && (ctrl & 1u) && !(tpg & 1u)) {
++			uint32_t words[8];
++			unsigned int step = 1;
++
++			rc = bl_send(words, bl_pack(bytes, count, words, 8), &step);
++		}
++	}
++	g_bl_quiet = 0;
++	__atomic_store_n(&g_bl_busy, 0, __ATOMIC_RELEASE);
++	return rc;
++}
+ #endif /* PONG */
+\ No newline at end of file
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 82407fa..02dbf72 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -350,6 +350,21 @@ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t siz
+ static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
+ static TUNABLE(uint32_t, gHwScaleArg, "fb_hwscale", 1);
+ static TUNABLE(uint32_t, gAutorefresh, "fb_autorefresh", 0);
++/*
++ * Boot-arg fb_120hz=1: the panel switched to 120 Hz. The UEFI turns it on at 60 (its TE: 60 a second, the device,
++ * 11-16) with the same DSI link the 120 Hz mode uses (the stock dtsi's wqxga120hs and wqxga60hs both run 1530 Mbps,
++ * DSC 2 x 1400 x 12), so only the panel's frequency register changes: DCS 0x60 0x20 (0x00: 60 Hz; stock on-command,
++ * JeyKul's s6tuum3 patch 0020), sent over the running link (pong_panel_dcs(), bsd/dev/pong_backlight_t970.c). Then
++ * INTF1's tear check counts lines at the 120 Hz mode's rate (Linux: vsync clock / (vtotal 1912 x 120)) and sends a
++ * frame on every TE pulse. fb_120hz=2: the DCS only, the tear check left as the UEFI set it.
++ */
++static TUNABLE(uint32_t, g120Hz, "fb_120hz", 0);
++#define INTF_TEAR_SYNC_CONFIG_VSYNC 0x288       /* bits 0-18: vsync clocks a line; 19: count; 20: restart at the TE pin */
++#define VSYNC_CLOCK_HZ          19200000        /* disp_cc_mdss_vsync_clk: from the crystal */
++#define PANEL_120_VTOTAL        (1752 + 48 + 64 + 48)
++extern "C" int pong_panel_dcs(const uint8_t * bytes, unsigned int count);
++static int              g120Sent = -99;         /* pong_panel_dcs()'s answer (-99: not asked) */
++static uint32_t         g120Sync[2];            /* INTF1's SYNC_CONFIG_VSYNC before and after */
+ 
+ #define PANEL_FRONT_PHYS        0x9c000000ull   /* the UEFI's framebuffer: "Display Reserved" (gts7xlwifiPkg MemoryMapLib) */
+ #define PANEL_RESERVED_END      0x9e400000ull   /* ... 36 MB, kept out of the kernel's memory */
+@@ -776,17 +791,36 @@ static void
+ panelAutorefresh(void)
+ {
+ 	uint32_t config = mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH);
++	uint32_t want = gAutorefresh != 0 ? gAutorefresh : g120Hz != 0 ? 1 : 0;     /* (120 Hz: a frame on every TE) */
+ 
+-	if (!(config & AUTOREFRESH_ON) || gAutorefresh == 0 || gAutorefresh > 0xffff || (config & 0xffff) == gAutorefresh) {
++	if (!(config & AUTOREFRESH_ON) || want == 0 || want > 0xffff || (config & 0xffff) == want) {
+ 		IOLog("MiniIOMobileFramebuffer: dpu: intf1 autorefresh %#x left as it is (fb_autorefresh=%u)\n", config, gAutorefresh);
+ 		return;
+ 	}
+-	mdssWrite(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH, AUTOREFRESH_ON | gAutorefresh);
++	mdssWrite(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH, AUTOREFRESH_ON | want);
+ 	IOLog("MiniIOMobileFramebuffer: dpu: intf1 autorefresh %#x now (was %#x)\n", mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH), config);
+ }
+ 
++/* fb_120hz: the panel's frequency register, then INTF1's line counter (see g120Hz). */
++static void
++panel120Hz(void)
++{
++	static const uint8_t freq[2] = { 0x60, 0x20 };
++	uint32_t sync = mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC);
++
++	g120Sync[0] = sync;
++	g120Sent = pong_panel_dcs(freq, sizeof(freq));
++	IOSleep(50);                            /* (the stock on-command waits 50 ms after it) */
++	if (g120Sent == 0 && g120Hz == 1 && (sync & (1u << 19))) {
++		mdssWrite(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC, (sync & ~0x7ffffu) | (VSYNC_CLOCK_HZ / (PANEL_120_VTOTAL * 120)));
++	}
++	g120Sync[1] = mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC);
++	IOLog("MiniIOMobileFramebuffer: dpu: fb_120hz=%u: DCS 60 20 %s (%d), intf1 sync_config_vsync %#x -> %#x\n", g120Hz,
++	    g120Sent == 0 ? "sent" : "NOT SENT", g120Sent, g120Sync[0], g120Sync[1]);
++}
++
+ /*
+- * The panel's controller set up as the boot-args ask: autorefresh, then the pipes that show the
++ * The panel's controller set up as the boot-args ask: 120 Hz, autorefresh, then the pipes that show the
+  * framebuffer, the CTL path that has them, the scalers and the other buffers. Nothing is touched
+  * unless fb_flip or fb_autorefresh is given.
+  */
+@@ -796,7 +830,7 @@ panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWi
+ 	uint64_t frontSize = (uint64_t) rowBytes * height, size, next;
+ 	unsigned want;
+ 
+-	if (gFlip == 0 && gAutorefresh == 0) {
++	if (gFlip == 0 && gAutorefresh == 0 && g120Hz == 0) {
+ 		return;
+ 	}
+ 	if ((uint64_t) vinfo.v_physaddr != PANEL_FRONT_PHYS || PANEL_FRONT_PHYS + frontSize > PANEL_RESERVED_END) {
+@@ -808,6 +842,9 @@ panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWi
+ 		IOLog("MiniIOMobileFramebuffer: dpu: the display block is without power or clock: not touched, one buffer\n");
+ 		return;
+ 	}
++	if (g120Hz != 0) {
++		panel120Hz();
++	}
+ 	panelAutorefresh();
+ 	if (gFlip == 0) {
+ 		return;
+@@ -973,6 +1010,7 @@ dpuReport(char * out, size_t cap)
+ 	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
+ 	DPU_SAY("last 5 s report: %u frames in %u ms, %u us each in the driver; %u flips, %u replaced; the panel was sent %u frames\n",
+ 	    gLastReport[0], gLastReport[1], gLastReport[2], gLastReport[3], gLastReport[4], gLastReport[5]);
++	DPU_SAY("120hz: fb_120hz %u, DCS 60 20 answer %d, intf1 sync_config_vsync %x -> %x\n", g120Hz, g120Sent, g120Sync[0], g120Sync[1]);
+ 	DPU_SAY("color: fb_color %u, scopes %x, inverted %d, remap %llu, %s; 8.8 matrix %d %d %d / %d %d %d / %d %d %d, offsets %d %d %d; %u SetMatrix calls\n",
+ 	    gColor, gColorScopes, gColorInvert, gColorRemap, gColorActive ? "applied" : "identity", gColorQ[0], gColorQ[1], gColorQ[2],
+ 	    gColorQ[3], gColorQ[4], gColorQ[5], gColorQ[6], gColorQ[7], gColorQ[8], gColorQ[9], gColorQ[10], gColorQ[11], gColorCalls);
