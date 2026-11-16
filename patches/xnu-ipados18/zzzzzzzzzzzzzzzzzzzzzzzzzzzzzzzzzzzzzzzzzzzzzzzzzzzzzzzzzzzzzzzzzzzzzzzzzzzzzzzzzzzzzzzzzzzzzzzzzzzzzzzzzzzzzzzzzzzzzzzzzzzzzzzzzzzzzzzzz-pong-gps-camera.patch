@@ -1,0 +1,2504 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4ac0bae..ecd50c5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -426,6 +426,8 @@ bsd/dev/pong_gpu_probe.c		standard
+ bsd/dev/pong_backlight_t970.c		standard
+ bsd/dev/pong_adsp.c			standard
+ bsd/dev/pong_bt.c			standard
++bsd/dev/pong_camera.c			standard
++bsd/dev/pong_gps.c			standard
+ bsd/dev/qbt_transport.c			standard
+ bsd/dev/pong_slpi.c			standard
+ bsd/dev/pong_ssc.c			standard
+diff --git a/bsd/dev/pong_camera.c b/bsd/dev/pong_camera.c
+new file mode 100644
+index 0000000..1d6ae2a
+--- /dev/null
++++ b/bsd/dev/pong_camera.c
+@@ -0,0 +1,1653 @@
++/*
++ * SM-T970 cameras, kernel step K1 (work/gps_camera_scope/SCOPE.md §2.4): power a sensor, read its ID over the CCI, receive
++ * its MIPI CSI-2 stream through a CSIPHY and CSID-lite0, and write one RAW frame to memory through IFE-lite0's RDI write
++ * master. USB commands only, nothing runs at boot (default off). Every command runs on its own thread; `cam` shows the result.
++ *
++ *   cam                         status of the last run (stage, IDs, receive counters, frame measure, AE)
++ *   cam id [front|rear|wide|all]                C1: power, CCI, chip ID (SMIA 0x0000..0x0003), power off
++ *   cam stream [sensor]                         C2a: mode_select on the power-on defaults, frame_count at 100 / 400 ms
++ *   cam rx [sensor] [lanes=N] [settle=N]        C3a: CSIPHY + CSID-lite0 receive for 300 ms, packet / ECC / CRC counters
++ *   cam frame [sensor] [lines=N] [ae] [exp=N] [gain=N] [target=N] [lanes=N] [settle=N] [pa=0x..]
++ *                               C4 (+C4b with `ae`): one RAW frame, lines N around the centre (default 480, 0 = whole frame),
++ *                               measured, 64x48 thumbnail kept; the frame stays in the buffer for `cam save`
++ *   cam thumb [row]             8 thumbnail rows from row (0..47): "tNN <128 hex>" (one Bayer site, 8-bit MSBs)
++ *   cam save [grbg|gbrg]        the last frame as a half-resolution colour PPM (2x2 Bayer quads, black 16, grey world,
++ *                               gamma 2) at /private/var/mobile/Media/DCIM/pong-cam.ppm, fetched with
++ *                               scripts/ios_usb_fileget.py; GBRG by default (JeyKul gts7xl-mainline 0038, front and wide)
++ * Sensors (ref/rui-gts7xlwifi-1111/docs/camera-notes.md:39-63, JeyKul 0033/0035): front S5K4HA CCI0 m1 0x2d CSIPHY 3 lanes
++ * 0..3; rear S5K3M5 CCI0 m0 0x2d CSIPHY 0 lanes reversed (assign 0x0123); wide S5K5E9 CCI1 m0 0x10 CSIPHY 2 two lanes.
++ * Only the front path has produced frames (rui, on the device, 11-11); rear and wide streams run on the sensors' power-on
++ * defaults here, untried.
++ *
++ * Frame buffer: pil_cdsp_region 0x8e300000 (26 MiB, no CDSP is started on this port), only when none of its pages is XNU
++ * RAM (else `cam frame` stops with c4 -1 det -2); pa= overrides it.
++ * The apps SMMU routes the IFE streams (0x800/0x801/0x840/0x841, mask 0x400) to a bypass bank (a bypass-emulation bank already
++ * in use is shared) for the frame only, then restores what it found.
++ *
++ * Port of ref/rui-gts7xlwifi-1111/package/T970Camera.cpp (UniXNU-gts7xlwifi, BSD-2-Clause-Patent, 11-11) stages C1, C2a,
++ * C3a, C4, C4b: same registers, values and order (camcc-sm8250.c, i2c-qcom-cci.c, camss-csiphy-3ph-1-0.c lane_regs_sm8250,
++ * cam_ife_csid_lite480.h, camss-vfe-480.c, camss-csid-gen2.c). Status words keep rui's t970_camera[] layout so his notes
++ * apply: [0] stage (negative = failed there), [1] detail, [2] GDSCR, [3] CCI version, [4..6] ID per sensor (0 not tried, -1
++ * NACK, -2 timeout, -3 CCI error), [7] last CCI IRQ, [8] ms, [9..11] C2a, [12..27] C3a, [28..39] C4. Changes: C instead of
++ * IOKit (ml_io_map windows mapped once), any sensor's CSIPHY selectable, the crop is the default, the frame can be saved.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLib.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern uint64_t mach_absolute_time(void);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern unsigned pong_q6_ram_pages(uint64_t base, uint64_t size);   /* pong_slpi.c: pages XNU manages as RAM */
++
++int pong_camera_usb(char *reply, size_t cap, const char *args);
++
++#define CAM_GCC         0x00100000UL
++#define CAM_CAMCC       0x0ad00000UL
++#define CAM_TLMM_NORTH  0x0f900000UL
++#define CAM_TLMM_SOUTH  0x0f500000UL
++#define CAM_SMMU        0x15000000UL
++#define CAM_SMMU_BYTES  0x100000UL
++#define CAM_REFGEN      0x088e7000UL
++#define CAM_LITE0       0x0acd9000UL       /* IFE-lite0 at +0, CSID-lite0 at +0x200 */
++#define CAM_CSIPHY(n)   (0x0ac6a000UL + 0x2000UL * (n))
++#define CAM_CARVE       0x8e300000ULL      /* pil_cdsp_region (live DT 35008-35011) */
++#define CAM_CARVE_BYTES 0x1a00000ULL
++#define CAM_VIO         37u
++#define CAM_BLACK       16u                /* 10-bit pedestal 64 as an MSB byte */
++#define CAM_DCIM        "/private/var/mobile/Media/DCIM/pong-cam.ppm"
++
++struct cam_sensor {
++	const char *name;
++	uint8_t cci, master, addr, mclk, mclk_gpio, reset, vana, sda, scl, phy;
++	uint16_t assign;                   /* CSID DL0..3 input lane nibbles */
++};
++static const struct cam_sensor cam_sensors[3] = {
++	{ "front", 0, 1, 0x2d, 2, 96, 30, 38, 103, 104, 3, 0x3210 },
++	{ "rear",  0, 0, 0x2d, 0, 94, 73, 39, 101, 102, 0, 0x0123 },
++	{ "wide",  1, 0, 0x10, 1, 95, 78, 42, 105, 106, 2, 0x0010 },
++};
++
++enum { CAM_ID = 1, CAM_STREAM, CAM_RX, CAM_FRAME };
++struct cam_req {
++	int op;
++	unsigned bits;                     /* sensors: 1 front, 2 rear, 4 wide */
++	uint32_t lines, exp, gain, target, lanes, settle, pa;
++	bool ae;
++};
++
++static struct {
++	volatile uint32_t busy;
++	struct cam_req req;
++	int32_t st[40], ae[8];
++	uint8_t thumb[64 * 48];
++	char last[48];
++	/* the frame of the last C4 run, for `cam save` */
++	uint32_t f_width, f_lines, f_stride, f_bits;
++	uint64_t f_pa;
++} cam;
++
++static vm_offset_t g_gcc, g_camcc, g_cci[2], g_smmu, g_refgen, g_lite, g_phy[4], g_pin[128];
++static vm_offset_t g_frame;                 /* the buffer's device mapping (uncached: no cache maintenance needed) */
++static uint64_t g_frame_pa, g_frame_bytes;
++
++#define RD(va, off)     (*(const volatile uint32_t *)((va) + (off)))
++static void
++wr(vm_offset_t va, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(va + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++static bool
++fail(int s, int32_t detail)
++{
++	cam.st[0] = -s;
++	cam.st[1] = detail;
++	return false;
++}
++static void
++mark(const char *what, int v)
++{
++	char m[40];
++	int n = snprintf(m, sizeof(m), "[PONG_CAM] %s %d\n", what, v);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(m, n);
++	}
++}
++
++/* ---- TLMM: CFG [1:0] pull (0 none, 1 down, 3 up), [5:2] function, [8:6] drive (mA/2 - 1), [9] output; IN_OUT [1] out ---- */
++static vm_offset_t
++pin(unsigned g)
++{
++	if (g >= 128) {
++		return 0;
++	}
++	if (!g_pin[g]) {
++		const bool north = g == 30 || g == 78 || (g >= 94 && g <= 108);   /* pinctrl-sm8250.c tiles of the camera pins */
++
++		g_pin[g] = ml_io_map((north ? CAM_TLMM_NORTH : CAM_TLMM_SOUTH) + g * 0x1000UL, 0x1000);
++	}
++	return g_pin[g];
++}
++static bool
++output(unsigned g, bool level)
++{
++	vm_offset_t p = pin(g);
++
++	if (!p) {
++		return false;
++	}
++	wr(p, 4, level ? 2u : 0u);
++	wr(p, 0, 1u << 9);
++	return true;
++}
++static bool
++function(unsigned g, unsigned func, unsigned mA, unsigned pull)
++{
++	vm_offset_t p = pin(g);
++
++	if (!p) {
++		return false;
++	}
++	wr(p, 0, pull | func << 2 | (mA / 2 - 1) << 6);
++	return true;
++}
++static void park(unsigned g) { (void)output(g, false); }   /* the DT's suspend state of every camera pin */
++
++/* ---- clocks (camcc-sm8250.c) ---- */
++static bool
++branch_on(vm_offset_t b, uint32_t cbcr, int stage)
++{
++	wr(b, cbcr, RD(b, cbcr) | 1u);
++	for (unsigned i = 0; i < 200; i++) {
++		if (!(RD(b, cbcr) & (1u << 31))) {
++			return true;
++		}
++		IODelay(5);
++	}
++	return fail(stage, (int32_t)cbcr);
++}
++static void branch_off(vm_offset_t b, uint32_t cbcr) { wr(b, cbcr, RD(b, cbcr) & ~1u); }
++/* RCG2: CMD [0] update, CFG (+4) [4:0] divider (2 div - 1), [10:8] source (0 XO, 2 PLL0 even 600, 3 PLL0 odd 400) */
++static bool
++root_set(uint32_t cmd, uint32_t source, uint32_t hid, int stage)
++{
++	wr(g_camcc, cmd + 4, source << 8 | hid);
++	wr(g_camcc, cmd, RD(g_camcc, cmd) | 1u);
++	for (unsigned i = 0; i < 200; i++) {
++		if (!(RD(g_camcc, cmd) & 1u)) {
++			return true;
++		}
++		IODelay(5);
++	}
++	return stage > 0 ? fail(stage, (int32_t)cmd) : false;
++}
++static bool root_xo(uint32_t cmd, int stage) { return root_set(cmd, 0, 0, stage); }
++
++static bool
++clocks_on(void)
++{
++	bool on = false;
++	uint32_t g;
++
++	cam.st[0] = 1;
++	if (!g_gcc) {
++		g_gcc = ml_io_map(CAM_GCC, 0x10000);
++	}
++	if (!g_camcc) {
++		g_camcc = ml_io_map(CAM_CAMCC, 0x10000);
++	}
++	if (!g_gcc || !g_camcc) {
++		return fail(1, 0);
++	}
++	/* GCC_CAMERA_AHB (camcc's register clock), HF/SF AXI votes */
++	if (!branch_on(g_gcc, 0xb008, 1)) {
++		return false;
++	}
++	wr(g_gcc, 0xb02c, RD(g_gcc, 0xb02c) | 1u);
++	wr(g_gcc, 0xb030, RD(g_gcc, 0xb030) | 1u);
++
++	cam.st[0] = 2;                                        /* TITAN_TOP_GDSC: [0] SW_COLLAPSE, [31] PWR_ON, CFG [16] done */
++	g = RD(g_camcc, 0xc144);
++	if (g & 1u) {
++		wr(g_camcc, 0xc144, g & ~1u);
++	}
++	for (unsigned i = 0; i < 500 && !on; i++) {
++		on = (RD(g_camcc, 0xc144) & (1u << 31)) || (RD(g_camcc, 0xc148) & (1u << 16));
++		if (!on) {
++			IODelay(10);
++		}
++	}
++	cam.st[2] = (int32_t)RD(g_camcc, 0xc144);
++	if (!on) {
++		return fail(2, (int32_t)RD(g_camcc, 0xc148));
++	}
++
++	cam.st[0] = 3;                                        /* roots on XO: slow AHB, camnoc AXI, CCI0/1, MCLK0..2 */
++	if (!root_xo(0x7058, 3) || !root_xo(0xc0f8, 3) || !root_xo(0xc0bc, 3) || !root_xo(0xc0d8, 3)) {
++		return false;
++	}
++	for (unsigned n = 0; n < 3; n++) {
++		if (!root_xo(0x5000 + 0x1c * n, 3)) {
++			return false;
++		}
++	}
++	cam.st[0] = 4;                                        /* gdsc, core AHB, CPAS AHB, camnoc AXI, CCI0, CCI1 */
++	return branch_on(g_camcc, 0xc16c, 4) && branch_on(g_camcc, 0xc150, 4) && branch_on(g_camcc, 0xc0f4, 4) &&
++	       branch_on(g_camcc, 0xc114, 4) && branch_on(g_camcc, 0xc0d4, 4) && branch_on(g_camcc, 0xc0f0, 4);
++}
++static void
++clocks_off(void)
++{
++	if (!g_camcc) {
++		return;
++	}
++	for (unsigned n = 0; n < 3; n++) {
++		branch_off(g_camcc, 0x5018 + 0x1c * n);
++	}
++	branch_off(g_camcc, 0xc0d4);
++	branch_off(g_camcc, 0xc0f0);
++	/* GDSC, AHB and AXI stay on: cheap, nothing else in iPadOS uses the camera block (as rui) */
++}
++
++/* ---- CCI (i2c-qcom-cci.c), polled: the CCI interrupt is not routed to us ---- */
++#define CCI_RESET       0x004u
++#define CCI_QSTART      0x008u
++#define CCI_HALT        0x034u
++#define CCI_IRQ_GCLR    0xc00u
++#define CCI_IRQ_MASK    0xc04u
++#define CCI_IRQ_CLR     0xc08u
++#define CCI_IRQ_STATUS  0xc0cu
++#define SCL_CTL(m)      (0x100u + 0x100u * (m))
++#define READ_DATA(m)    (0x118u + 0x100u * (m))
++#define READ_LEVEL(m)   (0x11cu + 0x100u * (m))
++#define EXEC_CNT(m, q)  (0x300u + 0x200u * (m) + 0x100u * (q))
++#define CUR_CNT(m, q)   (0x304u + 0x200u * (m) + 0x100u * (q))
++#define LOAD_DATA(m, q) (0x310u + 0x200u * (m) + 0x100u * (q))
++#define CCI_SETPARAM    1u
++#define CCI_REPORT      8u
++#define CCI_WRITE       9u
++#define CCI_READ        10u
++#define CCI_REPORT_IRQ  (1u << 8)
++#define CCI_RST_DONE    (1u << 24)
++#define CCI_ERR_M0      0x18000ee6u
++#define CCI_ERR_M1      0x60ee6000u
++#define CCI_DONE(m)     ((m) ? (1u << 12 | 1u << 16 | 1u << 20) : (1u << 0 | 1u << 4 | 1u << 8))
++#define CCI_NACK(m)     ((m) ? (1u << 29 | 1u << 30) : (1u << 27 | 1u << 28))
++
++static uint32_t
++cci_wait(vm_offset_t c, uint32_t want, unsigned us)
++{
++	uint32_t seen = 0;
++
++	for (unsigned i = 0; i < us / 10; i++) {
++		const uint32_t s = RD(c, CCI_IRQ_STATUS);
++
++		if (s) {
++			wr(c, CCI_IRQ_CLR, s);
++			wr(c, CCI_IRQ_GCLR, 1);
++			seen |= s;
++		}
++		if (seen & want) {
++			break;
++		}
++		IODelay(10);
++	}
++	cam.st[7] = (int32_t)seen;
++	return seen;
++}
++static bool
++cci_init(vm_offset_t c, unsigned m)
++{
++	wr(c, CCI_IRQ_MASK, 0x07111111u | CCI_ERR_M0 | CCI_ERR_M1);
++	wr(c, CCI_RESET, 0x0f73f3f7);
++	if (!(cci_wait(c, CCI_RST_DONE, 100000) & CCI_RST_DONE)) {
++		return fail(5, cam.st[7]);
++	}
++	/* qcom-cci v1.5 standard mode at 19.2 MHz (~100 kHz) */
++	wr(c, SCL_CTL(m) + 0x0, 78u << 16 | 114u);
++	wr(c, SCL_CTL(m) + 0x4, 28u << 16 | 28u);
++	wr(c, SCL_CTL(m) + 0x8, 10u << 16 | 77u);
++	wr(c, SCL_CTL(m) + 0xc, 118u);
++	wr(c, SCL_CTL(m) + 0x10, 6u << 4 | 1u);
++	return true;
++}
++/* 0 ok, -1 NACK, -2 timeout, -3 other error */
++static int
++cci_run(vm_offset_t c, unsigned m, unsigned q)
++{
++	const uint32_t err = m ? CCI_ERR_M1 : CCI_ERR_M0;
++	uint32_t s;
++
++	wr(c, EXEC_CNT(m, q), RD(c, CUR_CNT(m, q)));
++	wr(c, CCI_QSTART, 1u << (m * 2 + q));
++	s = cci_wait(c, CCI_DONE(m) | err, 100000);
++	if (s & err) {
++		wr(c, CCI_HALT, 1u << m);
++		IODelay(1000);
++		wr(c, CCI_RESET, m ? 0x0003f001u : 0x000003f1u);
++		(void)cci_wait(c, CCI_RST_DONE, 20000);
++		return (s & CCI_NACK(m)) ? -1 : -3;
++	}
++	return (s & CCI_DONE(m)) ? 0 : -2;
++}
++/* 16-bit register address, then n (<= 11) bytes */
++static int
++cci_read(const struct cam_sensor *s, uint16_t reg, uint8_t *out, unsigned n)
++{
++	const vm_offset_t c = g_cci[s->cci];
++	const unsigned m = s->master;
++	unsigned words, got = 0;
++	bool first = true;              /* the low byte of the first word echoes the slave address */
++	int rc;
++
++	wr(c, LOAD_DATA(m, 0), CCI_SETPARAM | (s->addr & 0x7fu) << 4);
++	wr(c, LOAD_DATA(m, 0), CCI_WRITE | 2u << 4 | (uint32_t)(reg >> 8) << 8 | (uint32_t)(reg & 0xff) << 16);
++	wr(c, LOAD_DATA(m, 0), CCI_REPORT | CCI_REPORT_IRQ);
++	if ((rc = cci_run(c, m, 0))) {
++		return rc;
++	}
++	wr(c, LOAD_DATA(m, 1), CCI_SETPARAM | (s->addr & 0x7fu) << 4);
++	wr(c, LOAD_DATA(m, 1), CCI_READ | n << 4);
++	if ((rc = cci_run(c, m, 1))) {
++		return rc;
++	}
++	words = RD(c, READ_LEVEL(m));
++	if (words != n / 4 + 1) {
++		cam.st[1] = (int32_t)words;
++		return -3;
++	}
++	while (words--) {
++		const uint32_t v = RD(c, READ_DATA(m));
++
++		for (unsigned i = 0; i < 4 && got < n; i++) {
++			if (first) {
++				first = false;
++				continue;
++			}
++			out[got++] = (uint8_t)(v >> (8 * i));
++		}
++	}
++	return 0;
++}
++static int
++cci_write(const struct cam_sensor *s, uint16_t reg, uint8_t v)
++{
++	const vm_offset_t c = g_cci[s->cci];
++	const unsigned m = s->master;
++
++	wr(c, LOAD_DATA(m, 0), CCI_SETPARAM | (s->addr & 0x7fu) << 4);
++	wr(c, LOAD_DATA(m, 0), CCI_WRITE | 3u << 4 | (uint32_t)(reg >> 8) << 8 | (uint32_t)(reg & 0xff) << 16 | (uint32_t)v << 24);
++	wr(c, LOAD_DATA(m, 0), CCI_REPORT | CCI_REPORT_IRQ);
++	return cci_run(c, m, 0);
++}
++static int
++rd16(const struct cam_sensor *s, uint16_t reg, uint32_t *out)
++{
++	uint8_t b[2] = { 0, 0 };
++	const int rc = cci_read(s, reg, b, 2);
++
++	*out = (uint32_t)b[0] << 8 | b[1];
++	return rc;
++}
++static int
++wr16(const struct cam_sensor *s, uint16_t reg, uint32_t v)
++{
++	const int rc = cci_write(s, reg, (uint8_t)(v >> 8));
++
++	return rc ? rc : cci_write(s, (uint16_t)(reg + 1), (uint8_t)v);
++}
++
++/* C2a: stream on the defaults and watch SMIA frame_count 0x0005 */
++static int32_t
++stream_test(const struct cam_sensor *s)
++{
++	uint8_t a = 0, b = 0, mode = 0;
++	int rc = cci_write(s, 0x0100, 1), off;
++
++	if (!rc) {
++		IOSleep(100);
++		rc = cci_read(s, 0x0005, &a, 1);
++	}
++	if (!rc) {
++		IOSleep(300);
++		rc = cci_read(s, 0x0005, &b, 1);
++	}
++	if (!rc) {
++		rc = cci_read(s, 0x0100, &mode, 1);
++	}
++	off = cci_write(s, 0x0100, 0);
++	IOSleep(50);
++	if (!rc) {
++		rc = off;
++	}
++	return (int32_t)((uint32_t)a | (uint32_t)b << 8 | (uint32_t)mode << 16 | ((uint32_t)rc & 0xffu) << 24);
++}
++
++static void
++power_down(const struct cam_sensor *s)
++{
++	park(s->reset);
++	branch_off(g_camcc, 0x5018 + 0x1c * s->mclk);
++	park(s->mclk_gpio);
++	park(s->vana);
++	park(CAM_VIO);
++}
++
++/* ---- C3a: CSIPHY + CSID-lite0 ---- */
++#define C3 (cam.st[16])
++static bool c3fail(int s, int32_t d) { C3 = -s; cam.st[1] = d; return false; }
++
++/* camcc PLL0 (Lucid): 1200 MHz, even /2 600, odd /3 400; skipped when it already runs */
++static bool
++pll0_on(void)
++{
++	if (!((RD(g_camcc, 0x38) & 1u) && (RD(g_camcc, 0x0) & 1u))) {
++		bool locked = false;
++
++		wr(g_camcc, 0x04, 0x3e);
++		wr(g_camcc, 0x08, 0x44);
++		wr(g_camcc, 0x40, 0x8000);
++		wr(g_camcc, 0x18, 0x20485699);
++		wr(g_camcc, 0x1c, 0x00002261);
++		wr(g_camcc, 0x20, 0x329a699c);
++		wr(g_camcc, 0x0c, 0x00003100);
++		wr(g_camcc, 0x10, 0x00000805);
++		wr(g_camcc, 0x00, RD(g_camcc, 0x0) | 1u << 23);
++		wr(g_camcc, 0x00, RD(g_camcc, 0x0) & ~1u);
++		wr(g_camcc, 0x38, 0);
++		wr(g_camcc, 0x00, RD(g_camcc, 0x0) | 1u << 2);
++		wr(g_camcc, 0x38, 1);
++		for (unsigned i = 0; i < 2000 && !locked; i++) {
++			locked = (RD(g_camcc, 0x0) & (1u << 31)) != 0;
++			if (!locked) {
++				IODelay(5);
++			}
++		}
++		cam.st[17] = (int32_t)RD(g_camcc, 0x0);
++		if (!locked) {
++			return c3fail(2, (int32_t)RD(g_camcc, 0x0));
++		}
++		wr(g_camcc, 0x0c, RD(g_camcc, 0x0c) | 7u);
++		wr(g_camcc, 0x00, RD(g_camcc, 0x0) | 1u);
++	}
++	cam.st[17] = (int32_t)RD(g_camcc, 0x0);
++	return true;
++}
++static void
++pll0_off(void)
++{
++	wr(g_camcc, 0x00, RD(g_camcc, 0x0) & ~1u);
++	wr(g_camcc, 0x38, 0);
++}
++
++/* cphy_rx 0xa068 400, csiNphytimer 0x6000 + 0x20 N 300, ife_lite 0xc000 400, ife_lite_csid 0xc01c 400; branches csiphyN
++ * 0x601c + 0x20 N, csiNphytimer 0x6018 + 0x20 N, ife_lite_ahb 0xc040, ife_lite 0xc018, ife_lite_csid 0xc034, cphy_rx 0xc03c
++ * (rui's PHY 3 values: 0x6060 / 0x6078 / 0x607c). */
++static void
++c3_branches(unsigned phy, uint32_t b[6])
++{
++	b[0] = 0x601c + 0x20 * phy;
++	b[1] = 0x6018 + 0x20 * phy;
++	b[2] = 0xc040;
++	b[3] = 0xc018;
++	b[4] = 0xc034;
++	b[5] = 0xc03c;
++}
++static bool
++c3_clocks_on(unsigned phy)
++{
++	uint32_t b[6];
++
++	if (!root_set(0xa068, 3, 1, 3) || !root_set(0x6000 + 0x20 * phy, 2, 3, 3) || !root_set(0xc000, 3, 1, 3) ||
++	    !root_set(0xc01c, 3, 1, 3)) {
++		C3 = -3;
++		return false;
++	}
++	c3_branches(phy, b);
++	for (unsigned i = 0; i < 6; i++) {
++		if (!branch_on(g_camcc, b[i], 3)) {
++			C3 = -3;
++			return false;
++		}
++	}
++	return true;
++}
++static void
++c3_clocks_off(unsigned phy)
++{
++	uint32_t b[6];
++
++	c3_branches(phy, b);
++	for (unsigned i = 0; i < 6; i++) {
++		branch_off(g_camcc, b[i]);
++	}
++	(void)root_xo(0xa068, 0);
++	(void)root_xo(0x6000 + 0x20 * phy, 0);
++	(void)root_xo(0xc000, 0);
++	(void)root_xo(0xc01c, 0);
++}
++
++static void
++phy_lane(vm_offset_t p, uint32_t b, uint32_t aux, bool clock, uint32_t settle)
++{
++	wr(p, b + 0x30, 0x00);
++	wr(p, aux + 0x0, 0x05);
++	wr(p, aux + 0x8, 0x10);
++	wr(p, aux + 0x4, 0x00);
++	wr(p, aux + 0x4, 0x07);
++	wr(p, b + 0x04, 0x0c);
++	wr(p, b + 0x2c, 0x01);
++	wr(p, b + 0x34, 0x07);
++	wr(p, b + 0x10, 0x02);
++	wr(p, b + 0x1c, 0x08);
++	wr(p, b + 0x3c, 0xb8);
++	wr(p, b + 0x08, settle & 0xff);
++	if (clock) {
++		wr(p, b + 0x00, 0x80);
++		wr(p, b + 0x0c, 0xa5);
++		wr(p, b + 0x38, 0x1f);
++		wr(p, b + 0x14, 0x60);
++		wr(p, b + 0x28, 0x04);
++	} else {
++		wr(p, b + 0x00, 0x8d);
++		wr(p, b + 0x38, 0xfe);
++		wr(p, b + 0x14, 0x60);
++	}
++	wr(p, 0x800, 0x02);
++	wr(p, 0x884, 0x01);
++}
++static void
++phy_on(vm_offset_t p, unsigned lanes, uint32_t settle)
++{
++	static const uint32_t base[4] = { 0x000, 0x200, 0x400, 0x600 }, aux[4] = { 0x900, 0xa00, 0xb00, 0xc00 };
++	uint32_t enable = 0x80;
++
++	wr(p, 0x800, 1);
++	IOSleep(6);
++	wr(p, 0x800, 0);
++	for (unsigned i = 0; i < lanes; i++) {
++		enable |= 1u << (2 * i);
++	}
++	wr(p, 0x814, enable);
++	wr(p, 0x818, 1);
++	wr(p, 0x81c, 2);
++	wr(p, 0x800, 0);
++	for (unsigned i = 0; i < 4; i++) {
++		phy_lane(p, base[i], aux[i], false, settle);
++	}
++	phy_lane(p, 0x700, 0xc80, true, settle);
++	for (unsigned n = 11; n < 22; n++) {
++		wr(p, 0x800 + 4 * n, 0);
++	}
++}
++static void
++phy_off(vm_offset_t p)
++{
++	wr(p, 0x814, 0);
++	wr(p, 0x818, 0);
++}
++
++static void
++csid_irq_clear(vm_offset_t d)
++{
++	wr(d, 0x28, 0x0fffffff);
++	wr(d, 0x78, 1);
++	wr(d, 0x80, 1);
++}
++static bool
++csid_on(vm_offset_t d, unsigned lanes, uint32_t assign, unsigned phy, uint32_t dt)
++{
++	bool done = false;
++
++	cam.st[24] = (int32_t)RD(d, 0x0);
++	wr(d, 0x78, 1);
++	wr(d, 0x80, 1);
++	wr(d, 0x74, 1);
++	wr(d, 0x10, 0x1e);
++	for (unsigned i = 0; i < 1000 && !done; i++) {
++		done = (RD(d, 0x70) & 1u) != 0;
++		if (!done) {
++			IODelay(10);
++		}
++	}
++	wr(d, 0x78, 1);
++	wr(d, 0x80, 1);
++	if (!done) {
++		return c3fail(5, (int32_t)RD(d, 0x70));
++	}
++	wr(d, 0x24, 0x0fffffff);
++	wr(d, 0x100, (lanes - 1) | (assign & 0xffff) << 4 | (phy & 0xf) << 20);   /* D-PHY */
++	wr(d, 0x104, 1u | 1u << 6);
++	wr(d, 0x108, 1u | 1u << 1 | (dt & 0x3f) << 4);
++	csid_irq_clear(d);
++	return true;
++}
++static void
++csid_off(vm_offset_t d)
++{
++	wr(d, 0x108, 0);
++	wr(d, 0x100, 0);
++	wr(d, 0x24, 0);
++}
++
++/* ---- C4: SMMU route (as rui's routeStreams: S2CR bypass reads back as fault here, so a bypass-emulation bank) ---- */
++#define C4 (cam.st[28])
++static bool c4fail(int s, int32_t d) { C4 = -s; cam.st[1] = d; return false; }
++static const uint32_t cam_sids[4] = { 0x800, 0x801, 0x840, 0x841 };
++#define CAM_SID_MASK 0x400u
++static uint32_t sm_shift, sm_pages, sm_bank = 0xffff, sm_oldbank[3], sm_slot[4] = { 0xffff, 0xffff, 0xffff, 0xffff }, sm_olds2cr[4];
++static bool sm_newbank;
++
++static uint32_t sr(uint64_t off) { return RD(g_smmu, (uint32_t)off); }
++static void sw(uint64_t off, uint32_t v) { wr(g_smmu, (uint32_t)off, v); }
++static uint64_t cb_off(uint32_t i) { return ((uint64_t)sm_pages + i) << sm_shift; }
++static bool
++overlaps(uint32_t smr, uint32_t id, uint32_t mask)
++{
++	return ((id ^ (smr & 0x7fff)) & ~(((smr >> 16) & 0x7fff) | mask) & 0x7fff) == 0;
++}
++/* kind (2 shared bank, 3 new bank) | routed pairs << 4 (bit n + 4: only as the exact SID), or negative */
++static int
++route_streams(void)
++{
++	static bool used[128], free_slot[128];
++	uint32_t cr0, id0, id1, streams, banks, ns2, shared = 0xffff, nfree = 0, routed = 0, next = 0;
++
++	if (!g_smmu) {
++		g_smmu = ml_io_map(CAM_SMMU, CAM_SMMU_BYTES);
++	}
++	if (!g_smmu) {
++		return -1;
++	}
++	sm_bank = 0xffff;
++	sm_newbank = false;
++	cr0 = sr(0);
++	id0 = sr(0x20);
++	id1 = sr(0x24);
++	if (cr0 & (1u << 3)) {
++		return -2;
++	}
++	streams = id0 & 0xff;
++	banks = id1 & 0xff;
++	ns2 = (id1 >> 16) & 0xff;
++	sm_shift = (id1 >> 31) ? 16 : 12;
++	sm_pages = 2u << ((id1 >> 28) & 7);
++	if (!streams || streams > 128 || !banks || banks > 128 || cb_off(banks) > CAM_SMMU_BYTES) {
++		return -3;
++	}
++	bzero(used, sizeof(used));
++	bzero(free_slot, sizeof(free_slot));
++	for (uint32_t i = 0; i < streams; i++) {
++		const uint32_t smr = sr(0x800 + 4 * i), s2cr = sr(0xc00 + 4 * i);
++		bool translate;
++
++		if (!(smr & (1u << 31))) {
++			free_slot[i] = true;
++			nfree++;
++			continue;
++		}
++		translate = ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) < banks;
++		if (translate) {
++			used[s2cr & 0xff] = true;
++		}
++		for (unsigned k = 0; k < 4; k++) {
++			if (overlaps(smr, cam_sids[k], CAM_SID_MASK)) {
++				cam.st[1] = (int32_t)smr;
++				return -4;
++			}
++		}
++		if (translate && shared == 0xffff && sr((1ull << sm_shift) + 4 * (s2cr & 0xff)) == 0x10000 &&
++		    !(sr(cb_off(s2cr & 0xff)) & 1)) {
++			shared = s2cr & 0xff;
++		}
++	}
++	if (nfree < 4) {
++		return -5;
++	}
++	if (shared != 0xffff) {
++		sm_bank = shared;
++	} else {
++		for (uint32_t i = ns2; i < banks && sm_bank == 0xffff; i++) {
++			if (!used[i] && !(sr(cb_off(i)) & 1) && !(sr(cb_off(i) + 0x58) & 0xc00001feu)) {
++				sm_bank = i;
++			}
++		}
++		if (sm_bank == 0xffff) {
++			return -6;
++		}
++		sm_oldbank[0] = sr(cb_off(sm_bank));
++		sm_oldbank[1] = sr((1ull << sm_shift) + 0x800 + 4 * sm_bank);
++		sm_oldbank[2] = sr((1ull << sm_shift) + 4 * sm_bank);
++		sm_newbank = true;
++		sw(cb_off(sm_bank), 0);                                 /* SCTLR: translation off */
++		sw((1ull << sm_shift) + 0x800 + 4 * sm_bank, 1);        /* CBA2R: VA64 */
++		sw((1ull << sm_shift) + 4 * sm_bank, 0x10000);          /* CBAR: S1 off, S2 bypass */
++		if (sr(cb_off(sm_bank)) != 0 || sr((1ull << sm_shift) + 4 * sm_bank) != 0x10000) {
++			return -7;
++		}
++	}
++	for (uint32_t n = 0; n < 4; n++) {
++		uint32_t slot, masked, exact, back;
++
++		while (next < streams && !free_slot[next]) {
++			next++;
++		}
++		if (next >= streams) {
++			break;
++		}
++		slot = next++;
++		sm_slot[n] = slot;
++		sm_olds2cr[n] = sr(0xc00 + 4 * slot);
++		sw(0xc00 + 4 * slot, sm_bank);
++		if ((sr(0xc00 + 4 * slot) & 0x300ff) != sm_bank) {
++			sw(0xc00 + 4 * slot, sm_olds2cr[n]);
++			sm_slot[n] = 0xffff;
++			continue;
++		}
++		masked = 0x80000000u | CAM_SID_MASK << 16 | cam_sids[n];
++		exact = 0x80000000u | cam_sids[n];
++		sw(0x800 + 4 * slot, masked);
++		back = sr(0x800 + 4 * slot);
++		if (back == masked) {
++			routed |= 1u << n;
++			continue;
++		}
++		if (!cam.st[1]) {
++			cam.st[1] = (int32_t)(back ? back : 0x7fffffff);
++		}
++		sw(0x800 + 4 * slot, exact);
++		back = sr(0x800 + 4 * slot);
++		if (back == exact) {
++			routed |= 1u << n | 1u << (n + 4);
++			continue;
++		}
++		sw(0x800 + 4 * slot, 0);
++		sw(0xc00 + 4 * slot, sm_olds2cr[n]);
++		sm_slot[n] = 0xffff;
++	}
++	if (!routed) {
++		return -9;
++	}
++	return (int)((sm_newbank ? 3u : 2u) | routed << 4);
++}
++static void
++unroute_streams(void)
++{
++	if (!g_smmu) {
++		return;
++	}
++	if (sm_bank != 0xffff) {
++		cam.st[39] = (int32_t)sr(cb_off(sm_bank) + 0x58);
++	}
++	for (uint32_t n = 0; n < 4; n++) {
++		if (sm_slot[n] == 0xffff) {
++			continue;
++		}
++		sw(0x800 + 4 * sm_slot[n], 0);
++		sw(0xc00 + 4 * sm_slot[n], sm_olds2cr[n]);
++		sm_slot[n] = 0xffff;
++	}
++	if (sm_newbank) {
++		sw((1ull << sm_shift) + 4 * sm_bank, sm_oldbank[2]);
++		sw((1ull << sm_shift) + 0x800 + 4 * sm_bank, sm_oldbank[1]);
++		sw(cb_off(sm_bank), sm_oldbank[0]);
++	}
++	sm_newbank = false;
++}
++
++/* IFE-lite 480 (camss-vfe-480.c, lite offsets); RDI 0 uses WM 0 and composite group 0 (bus IRQ bit 0 RUP, bit 4 done) */
++#define BUS 0x1a00u
++#define WM0 (BUS + 0x200u)
++static bool
++ife_reset(vm_offset_t f)
++{
++	bool done = false;
++
++	cam.st[30] = (int32_t)RD(f, 0x0);
++	wr(f, 0x28, 1u << 17);
++	wr(f, 0x0c, 1u << 1);
++	for (unsigned i = 0; i < 1000 && !done; i++) {
++		done = (RD(f, 0x40) & (1u << 17)) != 0;
++		if (!done) {
++			IODelay(10);
++		}
++	}
++	wr(f, 0x34, RD(f, 0x40));
++	wr(f, 0x24, 1);
++	return done ? true : c4fail(3, (int32_t)RD(f, 0x40));
++}
++static void
++wm_arm(vm_offset_t f, uint32_t pa, uint32_t stride, uint32_t lines)
++{
++	wr(f, BUS + 0x08, 0x3ffffff);
++	wr(f, BUS + 0xdc, 0);
++	wr(f, WM0 + 0x08, stride * lines);
++	wr(f, WM0 + 0x64, 0xf);
++	wr(f, WM0 + 0x0c, 0xffff);
++	wr(f, WM0 + 0x14, stride);
++	wr(f, WM0 + 0x18, 0);
++	wr(f, WM0 + 0x38, 0);
++	wr(f, WM0 + 0x3c, 1);
++	wr(f, WM0 + 0x30, 0);
++	wr(f, WM0 + 0x34, 1);
++	wr(f, WM0 + 0x00, 1u | 1u << 16);                           /* enable, MIPI raw */
++	wr(f, WM0 + 0x04, pa);
++	wr(f, 0x28, 1u << 17 | 1u << 4);
++	wr(f, BUS + 0x18, 1u << 0 | 1u << 4);
++	wr(f, 0x20, 1u << 0);                                       /* reg update RDI0 */
++}
++static void
++wm_stop(vm_offset_t f)
++{
++	wr(f, WM0 + 0x00, 0);
++	wr(f, BUS + 0x18, 0);
++	wr(f, 0x28, 0);
++}
++/* CSID-lite RDI0: payload only, DT, VC 0, counters on, optional vertical crop (first | last << 16) */
++static void
++rdi_on(vm_offset_t d, uint32_t dt, bool crop, uint32_t first, uint32_t last)
++{
++	wr(d, 0x34, 0x7fff);
++	wr(d, 0x220, crop ? (first | last << 16) : 0);
++	wr(d, 0x200, 1u << 0 | 1u << 1 | 1u << 2 | (crop ? 1u << 6 : 0u) | 0xfu << 12 | (dt & 0x3f) << 16);
++	wr(d, 0x204, 2u);
++	wr(d, 0x210, 1);
++	wr(d, 0x20c, 0);
++	wr(d, 0x218, 1);
++	wr(d, 0x214, 0);
++	wr(d, 0x228, 1);
++	wr(d, 0x224, 0);
++	wr(d, 0x230, 1);
++	wr(d, 0x22c, 0);
++	wr(d, 0x208, 0);
++	wr(d, 0x208, 1);
++	wr(d, 0x200, RD(d, 0x200) | 1u << 31);
++}
++static void
++rdi_off(vm_offset_t d)
++{
++	wr(d, 0x208, 0);
++	wr(d, 0x200, 0);
++	wr(d, 0x34, 0);
++}
++
++/* packed RAW10: 4 pixels in 5 bytes, MSB of pixel x at (x / 4) * 5 + x % 4 (RAW8: x; RAW12 not handled: 3 bytes / 2 px) */
++static uint32_t
++msb_at(uint32_t x)
++{
++	return cam.f_bits == 8 ? x : (x / 4) * 5 + x % 4;
++}
++static uint8_t
++px(uint32_t y, uint32_t x)
++{
++	return *(const volatile uint8_t *)(g_frame + (uint64_t)y * cam.f_stride + msb_at(x));
++}
++
++static void
++measure(uint32_t line_bytes)
++{
++	uint64_t written = 0, sum = 0, n = 0;
++	uint32_t lo = 255, hi = 0;
++
++	for (uint32_t y = 0; y < cam.f_lines; y++) {
++		for (uint32_t i = (y * 7) % 64; i < line_bytes; i += 64) {
++			if (*(const volatile uint8_t *)(g_frame + (uint64_t)y * cam.f_stride + i) != 0xa5) {
++				written++;
++			}
++		}
++	}
++	for (uint32_t y = 0; y < cam.f_lines; y += 8) {
++		for (uint32_t x = 0; x < cam.f_width; x += 8) {
++			const uint32_t v = px(y, x);
++
++			sum += v;
++			n++;
++			lo = v < lo ? v : lo;
++			hi = v > hi ? v : hi;
++		}
++	}
++	cam.st[34] = (int32_t)(written * 64);
++	cam.st[35] = (int32_t)((n ? (uint32_t)(sum / n) : 0) | lo << 8 | hi << 16);
++	for (uint32_t ty = 0; ty < 48; ty++) {
++		const uint32_t y = (ty * cam.f_lines / 48) & ~1u;
++
++		for (uint32_t tx = 0; tx < 64; tx++) {
++			cam.thumb[ty * 64 + tx] = px(y, (tx * cam.f_width / 64) & ~1u);
++		}
++	}
++}
++
++/* ---- C4b: auto exposure (SMIA++: coarse 0x0202, analogue gain 0x0204, hold 0x0104, gain min/max 0x0084/0x0086, coarse min
++ * 0x1004 / margin 0x1006). ae[0] iterations | state << 8 (1 converged, 2 dark at max, 3 bright at min, 4 frame timeout, 5
++ * iteration limit, 6 manual only, 7 CCI error) | manual << 12; [1] defaults; [2] final; [3] gain min | max << 16; [4] coarse
++ * min | margin << 16; [5]/[6] mean per AE frame; [7] target | black << 8 | ms << 16 ---- */
++struct cam_ae { uint32_t coarse, gain, gmin, gmax, cmin, cmax; };
++
++static int
++set_exposure(const struct cam_sensor *s, uint32_t coarse, uint32_t gain)
++{
++	int rc = cci_write(s, 0x0104, 1), rc2;
++
++	if (!rc) {
++		rc = wr16(s, 0x0202, coarse);
++	}
++	if (!rc) {
++		rc = wr16(s, 0x0204, gain);
++	}
++	rc2 = cci_write(s, 0x0104, 0);
++	return rc ? rc : rc2;
++}
++static bool
++ae_limits(const struct cam_sensor *s, uint32_t fll, struct cam_ae *a)
++{
++	uint32_t margin = 0;
++
++	if (rd16(s, 0x0202, &a->coarse) || rd16(s, 0x0204, &a->gain) || rd16(s, 0x0084, &a->gmin) || rd16(s, 0x0086, &a->gmax) ||
++	    rd16(s, 0x1004, &a->cmin) || rd16(s, 0x1006, &margin)) {
++		return false;
++	}
++	cam.ae[1] = (int32_t)(a->coarse | a->gain << 16);
++	cam.ae[3] = (int32_t)(a->gmin | a->gmax << 16);
++	cam.ae[4] = (int32_t)(a->cmin | margin << 16);
++	if (!a->gmin || a->gmax <= a->gmin || a->gmax > 0x400) {
++		a->gmin = 0x20;
++		a->gmax = 0x200;
++	}
++	if (!a->cmin || a->cmin > 64) {
++		a->cmin = 1;
++	}
++	if (!margin || margin > 64) {
++		margin = 8;
++	}
++	a->cmax = fll > margin + a->cmin ? fll - margin : a->cmin;
++	return true;
++}
++static uint32_t
++frame_mean(uint32_t *clip)
++{
++	uint64_t sum = 0, n = 0, hot = 0;
++
++	for (uint32_t y = 0; y < cam.f_lines; y += 15) {
++		for (uint32_t x = 0; x < cam.f_width; x += 9) {
++			const uint32_t v = px(y, x);
++
++			sum += v;
++			n++;
++			hot += v >= 250;
++		}
++	}
++	*clip = n ? (uint32_t)(hot * 1000 / n) : 0;
++	return n ? (uint32_t)(sum / n) : 0;
++}
++static bool
++next_frame(vm_offset_t f, uint32_t pa)
++{
++	wr(f, BUS + 0x20, 0xffffffffu);
++	wr(f, BUS + 0x30, 1);
++	wm_arm(f, pa, cam.f_stride, cam.f_lines);
++	for (unsigned i = 0; i < 80; i++) {
++		uint32_t b;
++
++		IOSleep(5);
++		b = RD(f, BUS + 0x28);
++		if (b) {
++			wr(f, BUS + 0x20, b);
++			wr(f, BUS + 0x30, 1);
++		}
++		if (b & (1u << 4)) {
++			wm_stop(f);
++			return true;
++		}
++	}
++	wm_stop(f);
++	return false;
++}
++/* 0 within target +- 1/8, 1 new values written, 2 dark at max, 3 bright at min, 7 CCI error */
++static unsigned
++ae_step(const struct cam_sensor *s, struct cam_ae *a, uint32_t mean, uint32_t clip, uint32_t target)
++{
++	const uint32_t tol = target / 8 + 1;
++	const uint64_t e = (uint64_t)a->coarse * a->gain;
++	uint64_t want, g;
++	uint32_t coarse;
++
++	if (mean + tol >= target && mean <= target + tol) {
++		return 0;
++	}
++	if (mean >= 240 || clip > 200) {
++		want = e / 4;
++	} else {
++		want = e * (target - CAM_BLACK) / (mean > CAM_BLACK ? mean - CAM_BLACK : 1);
++		want = want > e * 8 ? e * 8 : want < e / 8 ? e / 8 : want;
++	}
++	coarse = (uint32_t)(want / a->gmin);
++	coarse = coarse > a->cmax ? a->cmax : coarse < a->cmin ? a->cmin : coarse;
++	g = want / coarse;
++	g = g > a->gmax ? a->gmax : g < a->gmin ? a->gmin : g;
++	if (coarse == a->coarse && g == a->gain) {
++		return mean < target ? 2 : 3;
++	}
++	a->coarse = coarse;
++	a->gain = (uint32_t)g;
++	return set_exposure(s, a->coarse, a->gain) ? 7 : 1;
++}
++static void
++auto_exposure(const struct cam_sensor *s, vm_offset_t f, uint32_t pa, struct cam_ae *a, uint32_t target)
++{
++	const uint64_t t0 = now_ms();
++	unsigned it = 0, state = 5;
++	uint32_t hist[8] = { 0 };
++
++	for (; it < 8; it++) {
++		uint32_t clip = 0, mean = frame_mean(&clip);
++		unsigned r;
++
++		hist[it] = mean > 255 ? 255 : mean;
++		r = ae_step(s, a, mean, clip, target);
++		if (r != 1) {
++			state = r == 0 ? 1 : r;
++			break;
++		}
++		IOSleep(90);                                  /* two frames at ~24 fps: the new values are in effect */
++		if (!next_frame(f, pa)) {
++			state = 4;
++			break;
++		}
++	}
++	cam.ae[5] = (int32_t)(hist[0] | hist[1] << 8 | hist[2] << 16 | hist[3] << 24);
++	cam.ae[6] = (int32_t)(hist[4] | hist[5] << 8 | hist[6] << 16 | hist[7] << 24);
++	cam.ae[0] = (int32_t)(((uint32_t)cam.ae[0] & 0xf000) | (it & 0xff) | state << 8);
++	cam.ae[7] = (int32_t)((target & 0xff) | CAM_BLACK << 8 | (uint32_t)(now_ms() - t0) << 16);
++}
++
++/*
++ * The frame buffer: pa= if given, else the carve-out, and only when none of its 26 MiB is XNU RAM. The write master does not
++ * know the frame height (it writes every line the CSID passes), so a crop the CSID ignores would write the whole 10.1 MB
++ * frame: the whole carve-out must be free, not just the cropped size. No RAM fallback for that reason (-2: the carve-out
++ * needs a reservation first, as the SLPI's did).
++ */
++static int
++frame_buffer(uint64_t want_pa, uint64_t bytes)
++{
++	extern void ml_io_unmap(vm_offset_t va, vm_size_t size);
++	uint64_t pa = want_pa ? want_pa : CAM_CARVE;
++
++	bytes = (bytes + 0xffffULL) & ~0xffffULL;
++	if (g_frame && g_frame_bytes >= bytes && pa == g_frame_pa) {
++		return 0;
++	}
++	if (g_frame) {
++		ml_io_unmap(g_frame, (vm_size_t)g_frame_bytes);
++		g_frame = 0;
++	}
++	if (!want_pa && (bytes > CAM_CARVE_BYTES || pong_q6_ram_pages(CAM_CARVE, CAM_CARVE_BYTES) != 0)) {
++		return -2;
++	}
++	if (pa & 0xfff || pa + bytes > (1ULL << 32)) {
++		return -1;
++	}
++	g_frame = ml_io_map((vm_offset_t)pa, (vm_size_t)bytes);
++	if (!g_frame) {
++		return -5;
++	}
++	g_frame_pa = pa;
++	g_frame_bytes = bytes;
++	return 0;
++}
++
++/* C3a receive (+ C4 frame, + C4b AE) on sensor s, which is powered and answered its ID */
++static void
++capture(const struct cam_sensor *s, const struct cam_req *r)
++{
++	int32_t *const x = cam.st;
++	const bool frame = r->op == CAM_FRAME;
++	uint32_t fmt = 0, xo = 0, yo = 0, llp = 0, fll = 0, rate = 0, out, dt, settle, lanes, line_bytes, stride, lines;
++	uint32_t seen = 0, top = 0, bus = 0, rdi = 0, target = r->target ? r->target : 72;
++	uint8_t lane_byte = 0;
++	vm_offset_t p, d, f;
++	bool armed = false;
++	struct cam_ae ae = { 0, 0, 0, 0, 0, 0 };
++	uint64_t t0;
++	int rc;
++
++	C3 = 1;
++	if (rd16(s, 0x0112, &fmt) || cci_read(s, 0x0114, &lane_byte, 1) || rd16(s, 0x034c, &xo) || rd16(s, 0x034e, &yo) ||
++	    rd16(s, 0x0342, &llp) || rd16(s, 0x0340, &fll) || rd16(s, 0x0820, &rate)) {
++		(void)c3fail(1, cam.st[7]);
++		return;
++	}
++	x[12] = (int32_t)(fmt | (uint32_t)lane_byte << 16);
++	x[13] = (int32_t)(xo | yo << 16);
++	x[14] = (int32_t)(llp | fll << 16);
++	x[15] = (int32_t)rate;
++	lanes = r->lanes >= 1 && r->lanes <= 4 ? r->lanes : (lane_byte & 3u) + 1;
++	/* csiphy_settle_cnt_calc: (85 ns + 6 UI) over the 300 MHz timer, minus 6 */
++	settle = r->settle ? r->settle : (85000 + 6 * (1000000 / (rate ? rate : 1000))) / 3333 - 6;
++	x[25] = (int32_t)(settle | lanes << 8 | (uint32_t)s->assign << 16);
++	out = fmt & 0xff;
++	dt = out == 8 ? 0x2a : out == 12 ? 0x2c : 0x2b;
++	if (out == 12) {
++		(void)c3fail(1, (int32_t)fmt);                 /* RAW12 packing is not handled by measure / save */
++		return;
++	}
++
++	if (!g_refgen) {
++		g_refgen = ml_io_map(CAM_REFGEN, 0x1000);
++	}
++	if (g_refgen) {
++		x[26] = (int32_t)((RD(g_refgen, 0x08) & 0xff) | (RD(g_refgen, 0x14) & 0xff) << 8);   /* shared with DSI: read only */
++	}
++	if (!pll0_on()) {
++		return;
++	}
++	C3 = 2;
++	if (!c3_clocks_on(s->phy)) {
++		return;
++	}
++	C3 = 3;
++	if (!g_phy[s->phy]) {
++		g_phy[s->phy] = ml_io_map(CAM_CSIPHY(s->phy), 0x2000);
++	}
++	if (!g_lite) {
++		g_lite = ml_io_map(CAM_LITE0, 0x2000);
++	}
++	if (!g_phy[s->phy] || !g_lite) {
++		(void)c3fail(4, -2);
++		c3_clocks_off(s->phy);
++		return;
++	}
++	p = g_phy[s->phy];
++	d = g_lite + 0x200;
++	f = g_lite;
++	phy_on(p, lanes, settle);
++	C3 = 4;
++	if (!csid_on(d, lanes, s->assign, s->phy, dt)) {
++		phy_off(p);
++		c3_clocks_off(s->phy);
++		return;
++	}
++	C3 = 5;
++	mark("c3", 5);
++
++	line_bytes = xo * (out == 8 ? 8 : 10) / 8;
++	stride = (line_bytes + 15) & ~15u;
++	lines = r->lines && r->lines < yo ? r->lines : yo;
++	if (frame) {
++		int fb;
++
++		C4 = 0;
++		x[38] = (int32_t)stride;
++		if (!line_bytes || (fb = frame_buffer(r->pa, (uint64_t)stride * lines)) != 0) {
++			(void)c4fail(1, line_bytes ? fb : 0);
++		} else {
++			int route;
++
++			x[37] = (int32_t)(g_frame_pa >> 12);
++			cam.f_width = xo;
++			cam.f_lines = lines;
++			cam.f_stride = stride;
++			cam.f_bits = out;
++			cam.f_pa = g_frame_pa;
++			for (uint64_t i = 0; i < (uint64_t)stride * lines; i += 4) {
++				*(volatile uint32_t *)(g_frame + i) = 0xa5a5a5a5u;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			C4 = 1;
++			route = route_streams();
++			x[29] = route < 0 ? route : (int32_t)((uint32_t)route | (sm_slot[0] & 0xff) << 12 | (sm_bank & 0xff) << 20);
++			if (route < 0) {
++				C4 = -2;
++				if (!cam.st[1]) {
++					cam.st[1] = route;
++				}
++			} else {
++				C4 = 2;
++				/* camnoc AXI to 400 MHz (PLL0 odd) for the write traffic, IFE-lite AXI branch on */
++				if (!root_set(0xc0f8, 3, 1, 3) || !branch_on(g_camcc, 0xc044, 3)) {
++					(void)c4fail(3, -1);
++				} else if (ife_reset(f)) {
++					const uint32_t first = (yo - lines) / 2;
++
++					C4 = 3;
++					wm_arm(f, (uint32_t)g_frame_pa, stride, lines);
++					rdi_on(d, dt, lines != yo, first, first + lines - 1);
++					C4 = 4;
++					armed = true;
++				}
++			}
++		}
++		mark("c4", C4);
++	}
++
++	if (armed && (r->ae || r->exp || r->gain)) {
++		if (target < CAM_BLACK + 8 || target > 230) {
++			target = 72;
++		}
++		if (!ae_limits(s, fll, &ae)) {
++			cam.ae[0] = 7 << 8;
++		} else {
++			if (r->exp || r->gain) {
++				if (r->exp) {
++					ae.coarse = r->exp < ae.cmin ? ae.cmin : r->exp > ae.cmax ? ae.cmax : r->exp;
++				}
++				if (r->gain) {
++					ae.gain = r->gain < ae.gmin ? ae.gmin : r->gain > ae.gmax ? ae.gmax : r->gain;
++				}
++				cam.ae[0] = (r->ae ? 0 : 6 << 8) | 1 << 12;
++				if (set_exposure(s, ae.coarse, ae.gain)) {
++					cam.ae[0] = 7 << 8 | 1 << 12;
++				}
++			}
++			ae.gain = ae.gain < ae.gmin ? ae.gmin : ae.gain;
++			ae.coarse = ae.coarse < ae.cmin ? ae.cmin : ae.coarse;
++		}
++	}
++
++	rc = cci_write(s, 0x0100, 1);
++	t0 = now_ms();
++	for (unsigned i = 0; !rc && i < (armed ? 100u : 30u); i++) {
++		uint32_t v;
++
++		IOSleep(10);
++		v = RD(d, 0x20);
++		if (v) {
++			seen |= v;
++			wr(d, 0x28, v);
++			wr(d, 0x80, 1);
++		}
++		if (armed) {
++			uint32_t q = RD(d, 0x30), t = RD(f, 0x40), b = RD(f, BUS + 0x28);
++
++			if (q) {
++				rdi |= q;
++				wr(d, 0x38, q);
++				wr(d, 0x80, 1);
++			}
++			if (t) {
++				top |= t;
++				wr(f, 0x34, t);
++				wr(f, 0x24, 1);
++			}
++			if (b) {
++				bus |= b;
++				wr(f, BUS + 0x20, b);
++				wr(f, BUS + 0x30, 1);
++			}
++			if (bus & (1u << 4)) {
++				wm_stop(f);
++				x[36] = (int32_t)(now_ms() - t0);
++				C4 = 5;
++				break;
++			}
++		}
++	}
++	if (armed) {
++		if (C4 != 5) {
++			wm_stop(f);
++		}
++		x[31] = (int32_t)((top & 0xffff) | bus << 16);
++		x[32] = (int32_t)rdi;
++		x[33] = (int32_t)RD(d, 0x278);
++		if (r->ae && C4 == 5 && ((uint32_t)cam.ae[0] & 0xf00) != (7u << 8)) {
++			auto_exposure(s, f, (uint32_t)g_frame_pa, &ae, target);
++		}
++		if (cam.ae[0] || r->ae) {
++			uint32_t co = 0, ga = 0;
++
++			if (!rd16(s, 0x0202, &co) && !rd16(s, 0x0204, &ga)) {
++				cam.ae[2] = (int32_t)(co | ga << 16);
++			}
++		}
++	}
++	x[18] = (int32_t)seen;
++	x[19] = (int32_t)RD(d, 0x160);
++	x[20] = (int32_t)RD(d, 0x164);
++	x[21] = (int32_t)RD(d, 0x168);
++	x[22] = (int32_t)RD(d, 0x130);
++	x[23] = (int32_t)RD(d, 0x128);
++	x[27] = (int32_t)((RD(p, 0x8b0) & 0xff) | (RD(p, 0x8b4) & 0xff) << 8 | (RD(p, 0x8b8) & 0xff) << 16 |
++	    (RD(p, 0x8bc) & 0xff) << 24);
++	(void)cci_write(s, 0x0100, 0);
++	IOSleep(50);
++	C3 = rc ? -6 : 6;
++	if (frame) {
++		if (armed) {
++			rdi_off(d);
++		}
++		unroute_streams();
++		(void)root_xo(0xc0f8, 0);
++		branch_off(g_camcc, 0xc044);
++		if (armed) {
++			measure(line_bytes);              /* even without a done: coverage tells whether anything was written */
++			if (C4 == 5) {
++				C4 = 7;
++			}
++		}
++	}
++	csid_off(d);
++	phy_off(p);
++	c3_clocks_off(s->phy);
++	pll0_off();
++	if (!rc) {
++		C3 = 7;
++	}
++}
++
++static int32_t
++probe(unsigned index, const struct cam_req *r, bool last)
++{
++	const struct cam_sensor *s = &cam_sensors[index];
++	uint8_t id[4] = { 0, 0, 0, 0 };
++	int rc;
++
++	cam.st[0] = 5;
++	if (!g_cci[s->cci]) {
++		g_cci[s->cci] = ml_io_map(s->cci ? 0x0ac50000UL : 0x0ac4f000UL, 0x1000);
++	}
++	if (!g_cci[s->cci]) {
++		(void)fail(5, -1);
++		return -3;
++	}
++	cam.st[3] = (int32_t)RD(g_cci[s->cci], 0);
++	if (!function(s->sda, 1, 2, 3) || !function(s->scl, 1, 2, 3)) {   /* cci_i2c, 2 mA, pull-up */
++		(void)fail(5, -2);
++		return -3;
++	}
++	if (!cci_init(g_cci[s->cci], s->master)) {
++		return -2;
++	}
++
++	cam.st[0] = 6;                                   /* VIO, VANA, 2 ms, MCLK, 2 ms, reset high, 10 ms */
++	park(s->reset);
++	(void)output(CAM_VIO, true);
++	(void)output(s->vana, true);
++	IOSleep(2);
++	(void)function(s->mclk_gpio, 1, 4, 0);
++	if (!branch_on(g_camcc, 0x5018 + 0x1c * s->mclk, 6)) {
++		power_down(s);
++		return -3;
++	}
++	IOSleep(2);
++	(void)output(s->reset, true);
++	IOSleep(10);
++
++	cam.st[0] = 7;
++	rc = cci_read(s, 0x0000, id, 4);
++	if (rc == -1) {
++		IOSleep(20);                                 /* some modules answer only after a longer reset release */
++		rc = cci_read(s, 0x0000, id, 4);
++	}
++	cam.st[4 + index] = rc ? rc : (int32_t)((uint32_t)id[0] << 24 | (uint32_t)id[1] << 16 | (uint32_t)id[2] << 8 | id[3]);
++	mark(s->name, cam.st[4 + index]);
++	if (!rc && last && (r->op == CAM_RX || r->op == CAM_FRAME)) {
++		capture(s, r);
++	}
++	if (!rc && last && r->op == CAM_STREAM) {
++		cam.st[9 + index] = stream_test(s);
++	}
++	power_down(s);
++	return cam.st[4 + index];
++}
++
++static void
++cam_thread(__unused void *arg, __unused wait_result_t w)
++{
++	const struct cam_req r = cam.req;
++	const uint64_t t0 = now_ms();
++	int last = -1;
++
++	bzero(cam.st, sizeof(cam.st));
++	bzero(cam.ae, sizeof(cam.ae));
++	mark("start", r.op);
++	if (clocks_on()) {
++		for (unsigned i = 0; i < 3; i++) {
++			if (r.bits & (1u << i)) {
++				last = (int)i;
++			}
++		}
++		for (unsigned i = 0; i < 3; i++) {
++			if (!(r.bits & (1u << i))) {
++				continue;
++			}
++			(void)probe(i, &r, (int)i == last);
++			if (cam.st[0] < 0) {
++				break;
++			}
++		}
++		if (cam.st[0] > 0) {
++			cam.st[0] = 8;
++		}
++		clocks_off();
++	}
++	cam.st[8] = (int32_t)(now_ms() - t0);
++	mark("done", cam.st[0]);
++	__atomic_store_n(&cam.busy, 0u, __ATOMIC_RELEASE);
++}
++
++/* ---- `cam save`: half-resolution colour PPM in DCIM ---- */
++static uint32_t
++isqrt(uint32_t v)
++{
++	uint32_t r = 0;
++
++	for (uint32_t b = 1u << 30; b; b >>= 2) {
++		if (v >= r + b) {
++			v -= r + b;
++			r = (r >> 1) + b;
++		} else {
++			r >>= 1;
++		}
++	}
++	return r;
++}
++static int
++cam_save(bool grbg, char *msg, size_t cap)
++{
++	const uint32_t w = cam.f_width / 2, h = cam.f_lines / 2;
++	uint64_t sum[3] = { 0, 0, 0 };
++	uint32_t gain[3];
++	uint8_t *row;
++	char hdr[32];
++	vfs_context_t ctx;
++	vnode_t vp = NULLVP;
++	int e, hl;
++	off_t off;
++
++	if (!g_frame || !w || !h || cam.f_pa != g_frame_pa) {
++		return snprintf(msg, cap, "cam: no frame (run `cam frame` first)\n");
++	}
++	/* channel at quad (y, x): GBRG = G B / R G, GRBG = G R / B G; c 0 R, 1 G, 2 B */
++	for (uint32_t y = 0; y < h; y += 4) {
++		for (uint32_t x = 0; x < w; x += 4) {
++			const uint32_t a = px(2 * y, 2 * x + 1), b = px(2 * y + 1, 2 * x);
++
++			sum[0] += grbg ? a : b;
++			sum[2] += grbg ? b : a;
++			sum[1] += ((uint32_t)px(2 * y, 2 * x) + px(2 * y + 1, 2 * x + 1)) / 2;
++		}
++	}
++	for (int c = 0; c < 3; c++) {   /* grey world on the black-subtracted means, x256 */
++		const uint64_t n = (uint64_t)((h + 3) / 4) * ((w + 3) / 4), m = n ? sum[c] / n : 0;
++
++		gain[c] = m > CAM_BLACK ? (uint32_t)(256ULL * (sum[1] / (n ? n : 1) - CAM_BLACK + 1) / (m - CAM_BLACK + 1)) : 256;
++		if (gain[c] > 2048) {
++			gain[c] = 2048;
++		}
++	}
++	row = kalloc_data((vm_size_t)w * 3, Z_WAITOK);
++	if (!row) {
++		return snprintf(msg, cap, "cam: no memory\n");
++	}
++	hl = snprintf(hdr, sizeof(hdr), "P6\n%u %u\n255\n", w, h);
++	ctx = vfs_context_create(NULL);
++	e = vnode_open(CAM_DCIM, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (!e) {
++		e = vn_rdwr(UIO_WRITE, vp, hdr, hl, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), NULL,
++		    current_proc());
++		off = hl;
++		for (uint32_t y = 0; !e && y < h; y++) {
++			for (uint32_t x = 0; x < w; x++) {
++				const uint32_t a = px(2 * y, 2 * x + 1), b = px(2 * y + 1, 2 * x);
++				uint32_t v[3];
++
++				v[0] = grbg ? a : b;
++				v[2] = grbg ? b : a;
++				v[1] = ((uint32_t)px(2 * y, 2 * x) + px(2 * y + 1, 2 * x + 1)) / 2;
++				for (int c = 0; c < 3; c++) {
++					uint32_t l = v[c] > CAM_BLACK ? (v[c] - CAM_BLACK) * gain[c] / 256 : 0;
++
++					l = l > 239 ? 239 : l;
++					row[3 * x + c] = (uint8_t)isqrt(l * 255 * 255 / 239);   /* gamma 2 */
++				}
++			}
++			e = vn_rdwr(UIO_WRITE, vp, (caddr_t)row, (int)(w * 3), off, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++			    vfs_context_ucred(ctx), NULL, current_proc());
++			off += w * 3;
++		}
++		(void)vnode_close(vp, FWRITE, ctx);
++	}
++	vfs_context_rele(ctx);
++	kfree_data(row, (vm_size_t)w * 3);
++	if (e) {
++		return snprintf(msg, cap, "cam: save %s failed (%d; ENOENT: create the folder with fsmkdir)\n", CAM_DCIM, e);
++	}
++	return snprintf(msg, cap, "cam: saved %s %ux%u %s gains %u/%u/%u\n", CAM_DCIM, w, h, grbg ? "GRBG" : "GBRG", gain[0],
++	           gain[1], gain[2]);
++}
++
++/* ---- USB ---- */
++static uint32_t
++arg_num(const char *a, const char *key)
++{
++	const char *p = strnstr(a, key, strlen(a));
++	uint32_t v = 0;
++
++	if (!p) {
++		return 0;
++	}
++	p += strlen(key);
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		for (p += 2; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'); p++) {
++			v = v * 16 + (uint32_t)(*p <= '9' ? *p - '0' : (*p | 0x20) - 'a' + 10);
++		}
++	} else {
++		for (; *p >= '0' && *p <= '9'; p++) {
++			v = v * 10 + (uint32_t)(*p - '0');
++		}
++	}
++	return v;
++}
++
++static int
++cam_status(char *reply, size_t cap)
++{
++	const int32_t *x = cam.st;
++
++	return snprintf(reply, cap,
++	           "cam: %s%s st %d det %x gdsc %x cci %x id %08x/%08x/%08x stream %x/%x/%x ms %d\n"
++	           "c3 %d fmt %x out %ux%u llp|fll %x rate %d settle|lanes|assign %x rx %x pkts %u ecc %x crc %u long %x short %x "
++	           "csid %x phy %x\n"
++	           "c4 %d route %x ife %x top|bus %x rdi %x measure %x written %d mean|min|max %x ms %d pa %x000 stride %d fault %x "
++	           "frame %ux%u\n"
++	           "ae %x def %x final %x gain %x coarse %x means %08x %08x tgt %x\n",
++	           cam.busy ? "running " : "", cam.last, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[9], x[10], x[11], x[8],
++	           x[16], x[12], (uint32_t)x[13] & 0xffff, (uint32_t)x[13] >> 16, x[14], x[15], x[25], x[18], x[19], x[20], x[21],
++	           x[22], x[23], x[24], x[27],
++	           x[28], x[29], x[30], x[31], x[32], x[33], x[34], x[35], x[36], x[37], x[38], x[39], cam.f_width, cam.f_lines,
++	           cam.ae[0], cam.ae[1], cam.ae[2], cam.ae[3], cam.ae[4], cam.ae[5], cam.ae[6], cam.ae[7]);
++}
++
++int
++pong_camera_usb(char *reply, size_t cap, const char *args)
++{
++	struct cam_req r = { 0, 1, 480, 0, 0, 0, 0, 0, 0, false };
++	thread_t th;
++
++	if (!reply || cap < 64) {
++		return -1;
++	}
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (!args || !*args) {
++		return cam_status(reply, cap);
++	}
++	if (!strncmp(args, "thumb", 5)) {
++		uint32_t row = arg_num(args, "thumb ");
++		int k = 0;
++
++		for (uint32_t y = row; y < row + 8 && y < 48 && k < (int)cap - 140; y++) {
++			k += snprintf(reply + k, cap - (size_t)k, "t%02u ", y);
++			for (uint32_t i = 0; i < 64; i++) {
++				k += snprintf(reply + k, cap - (size_t)k, "%02x", cam.thumb[y * 64 + i]);
++			}
++			k += snprintf(reply + k, cap - (size_t)k, "\n");
++		}
++		return k;
++	}
++	if (__atomic_load_n(&cam.busy, __ATOMIC_ACQUIRE)) {
++		return snprintf(reply, cap, "cam: busy (`cam` shows progress)\n");
++	}
++	if (!strncmp(args, "save", 4)) {
++		return cam_save(strnstr(args, "grbg", strlen(args)) != NULL, reply, cap);
++	}
++	if (!strncmp(args, "id", 2)) {
++		r.op = CAM_ID;
++	} else if (!strncmp(args, "stream", 6)) {
++		r.op = CAM_STREAM;
++	} else if (!strncmp(args, "rx", 2)) {
++		r.op = CAM_RX;
++	} else if (!strncmp(args, "frame", 5)) {
++		r.op = CAM_FRAME;
++	} else {
++		return snprintf(reply, cap, "cam: id|stream|rx|frame [front|rear|wide] [lines=N] [ae] [exp=N] [gain=N] [target=N] "
++		           "[lanes=N] [settle=N] [pa=0x..] | thumb [row] | save [grbg]\n");
++	}
++	r.bits = strnstr(args, "all", strlen(args)) && r.op == CAM_ID ? 7u : strnstr(args, "rear", strlen(args)) ? 2u : strnstr(args, "wide", strlen(args)) ? 4u : 1u;
++	if (strnstr(args, "lines=", strlen(args))) {
++		r.lines = arg_num(args, "lines=");
++	}
++	r.exp = arg_num(args, "exp=");
++	r.gain = arg_num(args, "gain=");
++	r.target = arg_num(args, "target=");
++	r.lanes = arg_num(args, "lanes=");
++	r.settle = arg_num(args, "settle=");
++	r.pa = arg_num(args, "pa=");
++	r.ae = strnstr(args, " ae", strlen(args)) != NULL;
++	if (__atomic_exchange_n(&cam.busy, 1u, __ATOMIC_ACQ_REL)) {
++		return snprintf(reply, cap, "cam: busy\n");
++	}
++	cam.req = r;
++	strlcpy(cam.last, args, sizeof(cam.last));
++	if (kernel_thread_start(cam_thread, NULL, &th) != KERN_SUCCESS) {
++		__atomic_store_n(&cam.busy, 0u, __ATOMIC_RELEASE);
++		return snprintf(reply, cap, "cam: thread start failed\n");
++	}
++	thread_deallocate(th);
++	return snprintf(reply, cap, "cam: started `%s`; `cam` for the result (a frame takes about 1 s, with ae 2 s)\n", args);
++}
++#endif /* PONG */
+diff --git a/bsd/dev/pong_gps.c b/bsd/dev/pong_gps.c
+new file mode 100644
+index 0000000..9dba5a8
+--- /dev/null
++++ b/bsd/dev/pong_gps.c
+@@ -0,0 +1,739 @@
++/*
++ * SM-T970 GNSS, kernel step G2 (work/gps_camera_scope/SCOPE.md §1.3): the Broadcom GNSS chip (DT "samsung,exynos54xx-bcm4753",
++ * model not confirmed) on QUP0 SE3, a 4-wire GENI UART. This file powers the chip, runs the UART and keeps every byte it
++ * sends; it knows nothing of the chip's protocol (Broadcom's is not public; NMEA would be counted if the chip sends it).
++ *
++ *   gps                         status: line state, bytes in / out, NMEA sentences ('$G'), wake bytes (0xfd), host-wake
++ *                               edges, the last 48 bytes received (hex and printable)
++ *   gps on [baud] [nocts] [enlow]  clock SE3 for baud (default 115200), FIFO mode 8N1, pins to qup3, read with RFR open,
++ *                               then GPS_EN (GPIO 91) low 20 ms -> high; a thread drains the RX FIFO every 2 ms
++ *                               (`enlow` leaves GPS_EN low: the line without the chip)
++ *   gps tx <hex bytes>          sends them (at most 256)
++ *   gps baud <baud>             changes the host rate, the chip stays powered
++ *   gps off                     engine stopped, GPS_EN low, pins back to gpio
++ * Boot argument pong_gps=<baud> (default 0 = off): `gps on <baud>` pong_gps_delay seconds after boot (default 30).
++ * /dev/pong_gps (root 0600, made at the first `gps on`): read = bytes received since the last read (blocks until one
++ * arrives, IO_NDELAY -> EWOULDBLOCK; a reader 16 KiB behind loses the oldest, counted as `lost`), write = bytes to send.
++ * A userland location provider reads it (work/gps_camera_scope/DESIGN.md).
++ *
++ * Hardware (live DT, ref/CakeAL-sm-t970/evidence/adb-2026-11-01/live-device-tree.dts): gps node 34297-34301 (GPIO 91 enable,
++ * GPIO 55 host wake), qup_uart@98c000 34303-34319 (qcom,wakeup-byte 0xfd), pins 17870-17940: CTS 119, RTS 120, TX 121,
++ * RX 122, function qup3 (ref/linux-sm8250/pinctrl-sm8250.c: north tile, function 1); idle: CTS no pull, RTS/RX pull-down,
++ * TX pull-up. GCC (ref/linux-sm8250/gcc-sm8250.c): wrap0 s3 RCG 0x173a0, branch 0x1739c, vote 0x52008 bit 13; 96 MHz =
++ * GPLL0 even M/N 8/25, 117.9648 MHz = 6144/15625 (exact 921600 / 460800 / 230400 / 115200 with 16x oversampling).
++ * GENI register values and order: bsd/dev/pong_bt.c steps 4-7 (SE6), which came from UniXNU/QcaBluetooth qbt_geni.c and
++ * rui's T970Bluetooth.cpp; duplicated here rather than shared so the Bluetooth driver stays untouched.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern uint64_t mach_absolute_time(void);
++
++int pong_gps_usb(char *reply, size_t cap, const char *args);
++void pong_gps_init(void);
++
++#define GPS_TLMM_NORTH  0x0f900000UL
++#define GPS_TLMM_SOUTH  0x0f500000UL
++#define GPS_GCC17       0x00117000UL           /* SE3 RCG 0x3a0.., branch 0x39c, m/s AHB 0x004/0x008 */
++#define GPS_GCC23       0x00123000UL           /* wrap0 core 0x000, core_2x 0x008 */
++#define GPS_GCC52       0x00152000UL           /* APCS vote 0x008 */
++#define GPS_SE3         0x0098c000UL
++#define GPS_QUP0        0x009c0000UL
++#define GPS_EN          91u
++#define GPS_WAKE        55u
++#define GPS_RING        16384u
++
++/* GENI (as pong_bt.c) */
++#define G_FORCE_DEFAULT 0x020u
++#define G_OUTPUT        0x024u
++#define G_CGC           0x028u
++#define G_STATUS        0x040u
++#define G_M_CLK         0x048u
++#define G_S_CLK         0x04cu
++#define G_IF_DISABLE    0x064u
++#define G_FW_REV        0x068u
++#define G_CLK_SEL       0x07cu
++#define G_LOOPBACK      0x22cu
++#define G_BYTE_GRAN     0x254u
++#define G_DMA_MODE      0x258u
++#define G_TX_CFG        0x25cu
++#define G_TX_PACK0      0x260u
++#define G_TX_PACK1      0x264u
++#define G_TX_WORD       0x268u
++#define G_TX_STOP       0x26cu
++#define G_TX_LEN        0x270u
++#define G_RX_CFG        0x280u
++#define G_RX_PACK0      0x284u
++#define G_RX_PACK1      0x288u
++#define G_RX_WORD       0x28cu
++#define G_RX_STALE      0x294u
++#define G_TX_PARITY     0x2a4u
++#define G_RX_PARITY     0x2a8u
++#define G_MANUAL_RFR    0x2acu
++#define G_M_CMD         0x600u
++#define G_M_CTRL        0x604u
++#define G_M_IRQ_EN      0x614u
++#define G_M_CLEAR       0x618u
++#define G_S_CMD         0x630u
++#define G_S_CTRL        0x634u
++#define G_S_IRQ_EN      0x644u
++#define G_S_CLEAR       0x648u
++#define G_TX_FIFO       0x700u
++#define G_RX_FIFO       0x780u
++#define G_TX_FIFO_STAT  0x800u
++#define G_RX_FIFO_STAT  0x804u
++#define G_RX_RFR_WM     0x814u
++#define G_GSI_EVENT     0xe18u
++#define G_IRQ_EN        0xe1cu
++#define G_HW_PARAM0     0xe24u
++#define G_HW_PARAM1     0xe28u
++#define G_DMA_CFG       0xe30u
++#define G_RFR_OFF       0x80000002u
++
++static vm_offset_t g_pin[4], g_en, g_wake, g_gcc17, g_gcc23, g_gcc52, g_se, g_qup;
++static LCK_GRP_DECLARE(gps_group, "pong-gps");
++static LCK_MTX_DECLARE(gps_lock, &gps_group);   /* on / off / baud / tx; the RX thread only reads the FIFO */
++static volatile int gps_state;                   /* 0 off, 1 on, 2 stopping */
++static bool gps_cts = true;
++static uint32_t gps_baud, gps_sample = 16, gps_depth_tx;
++static uint8_t gps_ring[GPS_RING];
++static uint64_t gps_head;                        /* bytes received ever (atomic); ring index = head % GPS_RING */
++static uint64_t gps_tail;                        /* the /dev reader's position */
++static struct { uint64_t tx, nmea, wakebytes, edges, lost, txfail; int last_err; } gps_n;
++static int gps_major = -1;
++static bool gps_node, gps_open;
++static uint8_t gps_prev;                         /* previous byte, for '$' 'G' */
++
++#define RD(va, off)     (*(const volatile uint32_t *)((va) + (off)))
++static void
++wr(vm_offset_t va, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(va + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++static uint64_t
++now_us(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++static void
++spin_us(uint32_t us)
++{
++	const uint64_t end = now_us() + us;
++
++	while (now_us() < end) {
++	}
++}
++static void ms(uint32_t n) { delay_for_interval(n, NSEC_PER_MSEC); }
++static void
++mark(const char *what, int v)
++{
++	char m[40];
++	int n = snprintf(m, sizeof(m), "[PONG_GPS] %s %d\n", what, v);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(m, n);
++	}
++}
++
++/* pins: CFG [1:0] pull (1 down, 3 up), [5:2] function, [8:6] drive, [9] output; IN_OUT [0] in, [1] out */
++static const uint8_t gps_uart_pin[4] = { 119, 120, 121, 122 };      /* CTS RTS TX RX */
++static const uint8_t gps_idle_pull[4] = { 0, 1, 3, 1 };
++static const uint8_t gps_act_pull[4] = { 0, 1, 3, 0 };
++
++static bool
++gps_map(void)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		if (!g_pin[i]) {
++			g_pin[i] = ml_io_map(GPS_TLMM_NORTH + gps_uart_pin[i] * 0x1000UL, 0x1000);
++		}
++	}
++	if (!g_en) {
++		g_en = ml_io_map(GPS_TLMM_SOUTH + GPS_EN * 0x1000UL, 0x1000);
++	}
++	if (!g_wake) {
++		g_wake = ml_io_map(GPS_TLMM_SOUTH + GPS_WAKE * 0x1000UL, 0x1000);
++	}
++	if (!g_gcc17) {
++		g_gcc17 = ml_io_map(GPS_GCC17, 0x1000);
++	}
++	if (!g_gcc23) {
++		g_gcc23 = ml_io_map(GPS_GCC23, 0x1000);
++	}
++	if (!g_gcc52) {
++		g_gcc52 = ml_io_map(GPS_GCC52, 0x1000);
++	}
++	if (!g_se) {
++		g_se = ml_io_map(GPS_SE3, 0x4000);
++	}
++	if (!g_qup) {
++		g_qup = ml_io_map(GPS_QUP0, 0x1000);
++	}
++	return g_pin[0] && g_pin[1] && g_pin[2] && g_pin[3] && g_en && g_wake && g_gcc17 && g_gcc23 && g_gcc52 && g_se && g_qup;
++}
++
++static void
++gps_pins(bool active)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		wr(g_pin[i], 0, active ? (1u << 2 | gps_act_pull[i]) : gps_idle_pull[i]);
++	}
++}
++static void
++gps_en(bool on)
++{
++	wr(g_en, 4, on ? 2u : 0u);
++	wr(g_en, 0, 1u << 9 | 1u);               /* gpio, 2 mA, output, pull-down (DT gps_en_default) */
++}
++
++static bool
++engine_stop(void)
++{
++	unsigned i = 0;
++
++	if (RD(g_se, G_STATUS) & 0x1001u) {
++		wr(g_se, G_M_CTRL, 2);
++		wr(g_se, G_S_CTRL, 2);
++		for (; i < 1000 && (RD(g_se, G_STATUS) & 0x1001u); i++) {
++			spin_us(1);
++		}
++	}
++	wr(g_se, G_M_CLEAR, UINT32_MAX);
++	wr(g_se, G_S_CLEAR, UINT32_MAX);
++	return i < 1000;
++}
++
++/* SE3 source: 96 MHz (M/N 8/25) or 117.9648 MHz (6144/15625), whichever divides baud x oversampling better (< 1 %) */
++static int
++gps_clock(uint32_t baud, uint32_t sample, uint32_t *div_out)
++{
++	static const struct { uint32_t hz, m, n; } src[2] = { { 96000000u, 8, 25 }, { 117964800u, 6144, 15625 } };
++	uint32_t best = 2, best_div = 0, best_err = UINT32_MAX;
++	uint32_t i, off = 0;
++	static const uint32_t halt[5] = { 0x39c, 0x004, 0x008, 0x000, 0x008 };   /* se3 m_ahb s_ahb | core core_2x */
++
++	for (uint32_t s = 0; s < 2; s++) {
++		const uint64_t unit = (uint64_t)baud * sample;
++		const uint32_t div = (uint32_t)((src[s].hz + unit / 2) / unit);
++		uint64_t got, err;
++
++		if (div == 0 || div > 4095) {
++			continue;
++		}
++		got = src[s].hz / ((uint64_t)div * sample);
++		err = (got > baud ? got - baud : baud - got) * 10000 / baud;
++		if (err < best_err) {
++			best_err = (uint32_t)err;
++			best = s;
++			best_div = div;
++		}
++	}
++	if (best == 2 || best_err > 100) {
++		return -1;
++	}
++	wr(g_gcc17, 0x3a8, (RD(g_gcc17, 0x3a8) & ~0xffffu) | src[best].m);
++	wr(g_gcc17, 0x3ac, (RD(g_gcc17, 0x3ac) & ~0xffffu) | (~(src[best].n - src[best].m) & 0xffffu));
++	wr(g_gcc17, 0x3b0, (RD(g_gcc17, 0x3b0) & ~0xffffu) | (~src[best].n & 0xffffu));
++	wr(g_gcc17, 0x3a4, (RD(g_gcc17, 0x3a4) & ~0x371fu) | 6u << 8 | 2u << 12 | 1u);   /* GPLL0 even, dual edge, /1 */
++	wr(g_gcc17, 0x3a0, RD(g_gcc17, 0x3a0) | 1u);
++	for (i = 0; i < 1000 && (RD(g_gcc17, 0x3a0) & 1u); i++) {
++		spin_us(1);
++	}
++	if (i == 1000) {
++		return -2;
++	}
++	wr(g_gcc52, 0x008, RD(g_gcc52, 0x008) | 1u << 13 | 1u << 6 | 1u << 7 | 1u << 8 | 1u << 9);
++	for (i = 0; i < 1000; i++) {
++		off = 0;
++		for (unsigned h = 0; h < 5; h++) {
++			const uint32_t r = RD(h < 3 ? g_gcc17 : g_gcc23, halt[h]);
++
++			if ((r & (1u << 31)) && !(r & 2u)) {
++				off |= 1u << h;
++			}
++		}
++		if (!off) {
++			break;
++		}
++		spin_us(1);
++	}
++	if (off) {
++		return -3;
++	}
++	*div_out = best_div;
++	return (int)best;
++}
++
++/* RX: drain the FIFO into the ring (the only writer); counts NMEA starts and wake bytes */
++static void
++rx_poll(void)
++{
++	const uint32_t st = RD(g_se, G_RX_FIFO_STAT), wc = st & 0x1ffffffu;
++	uint64_t h = gps_head;
++
++	for (uint32_t w = 0; w < wc; w++) {
++		const uint32_t v = RD(g_se, G_RX_FIFO);
++		uint32_t nb = 4;
++
++		if (w + 1 == wc && (st & (1u << 31)) && ((st >> 28) & 7u)) {
++			nb = (st >> 28) & 7u;
++		}
++		for (uint32_t j = 0; j < nb; j++) {
++			const uint8_t b = (uint8_t)(v >> (8 * j));
++
++			gps_ring[h++ % GPS_RING] = b;
++			gps_n.wakebytes += b == 0xfd;
++			gps_n.nmea += gps_prev == '$' && b == 'G';
++			gps_prev = b;
++		}
++	}
++	if (h != gps_head) {
++		__atomic_store_n(&gps_head, h, __ATOMIC_RELEASE);
++		wakeup(&gps_head);
++	}
++}
++
++static void
++rx_thread(__unused void *arg, __unused wait_result_t w)
++{
++	uint32_t level = RD(g_wake, 4) & 1u;
++
++	while (__atomic_load_n(&gps_state, __ATOMIC_ACQUIRE) == 1) {
++		uint32_t now;
++
++		lck_mtx_lock(&gps_lock);
++		if (gps_state == 1) {
++			rx_poll();
++		}
++		lck_mtx_unlock(&gps_lock);
++		now = RD(g_wake, 4) & 1u;
++		gps_n.edges += now != level;
++		level = now;
++		ms(2);
++	}
++	__atomic_store_n(&gps_state, 0, __ATOMIC_RELEASE);
++	wakeup(&gps_head);
++}
++
++static int
++tx_raw(const uint8_t *p, unsigned n)       /* gps_lock held */
++{
++	const uint64_t end = now_us() + 200000 + 100ull * n;
++
++	if (!n || n > 4096 || gps_depth_tx < 4) {
++		return EINVAL;
++	}
++	wr(g_se, G_TX_LEN, n);
++	wr(g_se, G_M_CMD, 1u << 27);
++	for (unsigned i = 0; i < n; i += 4) {
++		uint32_t word = 0;
++
++		while ((RD(g_se, G_TX_FIFO_STAT) & 0x0fffffffu) >= gps_depth_tx) {
++			if (now_us() >= end) {
++				goto stuck;
++			}
++			spin_us(50);
++		}
++		for (unsigned j = 0; j < 4 && i + j < n; j++) {
++			word |= (uint32_t)p[i + j] << (8 * j);
++		}
++		wr(g_se, G_TX_FIFO, word);
++	}
++	while ((RD(g_se, G_STATUS) & 1u) || (RD(g_se, G_TX_FIFO_STAT) & 0x0fffffffu)) {
++		if (now_us() >= end) {
++			goto stuck;
++		}
++		spin_us(50);
++	}
++	gps_n.tx += n;
++	return 0;
++stuck:
++	wr(g_se, G_M_CTRL, 2);
++	spin_us(1000);
++	wr(g_se, G_M_CLEAR, UINT32_MAX);
++	gps_n.txfail++;
++	return EIO;                              /* CTS held off (or the line is dead): try `gps on ... nocts` */
++}
++
++/* both directions at baud; the read is (re)started with RFR open. gps_lock held. */
++static int
++set_rate(uint32_t baud)
++{
++	uint32_t div = 0;
++	const int s = gps_clock(baud, gps_sample, &div);
++
++	if (s < 0) {
++		return s - 10;
++	}
++	if (!engine_stop()) {
++		return -14;
++	}
++	wr(g_se, G_M_CLK, div << 4 | 1u);
++	wr(g_se, G_S_CLK, div << 4 | 1u);
++	wr(g_se, G_M_CLEAR, UINT32_MAX);
++	wr(g_se, G_S_CLEAR, UINT32_MAX);
++	wr(g_se, G_S_CMD, 1u << 27 | 1u << 7);
++	wr(g_se, G_MANUAL_RFR, 0);
++	gps_baud = baud;
++	return 0;
++}
++
++static void
++gps_down(void)                             /* gps_lock held */
++{
++	(void)engine_stop();
++	wr(g_se, G_MANUAL_RFR, G_RFR_OFF);
++	gps_en(false);
++	gps_pins(false);
++}
++
++/* ---- /dev/pong_gps ---- */
++static int
++gps_dopen(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	int e = 0;
++
++	lck_mtx_lock(&gps_lock);
++	if (gps_open) {
++		e = EBUSY;
++	} else {
++		gps_open = true;
++		gps_tail = gps_head;
++	}
++	lck_mtx_unlock(&gps_lock);
++	return e;
++}
++static int
++gps_dclose(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	lck_mtx_lock(&gps_lock);
++	gps_open = false;
++	lck_mtx_unlock(&gps_lock);
++	return 0;
++}
++static int
++gps_dread(__unused dev_t dev, struct uio *uio, int flags)
++{
++	uint64_t h;
++	int e = 0;
++
++	lck_mtx_lock(&gps_lock);
++	while ((h = __atomic_load_n(&gps_head, __ATOMIC_ACQUIRE)) == gps_tail) {
++		if (gps_state != 1) {
++			e = ENXIO;
++			break;
++		}
++		if (flags & IO_NDELAY) {
++			e = EWOULDBLOCK;
++			break;
++		}
++		e = msleep(&gps_head, &gps_lock, PZERO | PCATCH, "pong-gps", NULL);
++		if (e) {
++			break;
++		}
++	}
++	if (!e) {
++		if (h - gps_tail > GPS_RING) {
++			gps_n.lost += h - gps_tail - GPS_RING;
++			gps_tail = h - GPS_RING;
++		}
++		while (!e && gps_tail < h && uio_resid(uio) > 0) {
++			const uint32_t at = (uint32_t)(gps_tail % GPS_RING);
++			uint64_t n = h - gps_tail;
++
++			n = n > GPS_RING - at ? GPS_RING - at : n;
++			n = n > (uint64_t)uio_resid(uio) ? (uint64_t)uio_resid(uio) : n;
++			e = uiomove((caddr_t)&gps_ring[at], (int)n, uio);
++			gps_tail += n;
++		}
++	}
++	lck_mtx_unlock(&gps_lock);
++	return e;
++}
++static int
++gps_dwrite(__unused dev_t dev, struct uio *uio, __unused int flags)
++{
++	uint8_t buf[256];
++	int e = 0;
++
++	while (!e && uio_resid(uio) > 0) {
++		const int n = uio_resid(uio) > (user_ssize_t)sizeof(buf) ? (int)sizeof(buf) : (int)uio_resid(uio);
++
++		e = uiomove((caddr_t)buf, n, uio);
++		if (!e) {
++			lck_mtx_lock(&gps_lock);
++			e = gps_state == 1 ? tx_raw(buf, (unsigned)n) : ENXIO;
++			lck_mtx_unlock(&gps_lock);
++		}
++	}
++	return e;
++}
++static const struct cdevsw gps_cdevsw = {
++	.d_open = gps_dopen, .d_close = gps_dclose, .d_read = gps_dread, .d_write = gps_dwrite,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0,
++};
++
++/* ---- on / off ---- */
++static int
++gps_on(uint32_t baud, bool cts, bool en)
++{
++	uint32_t qup, fw, txd, rxd;
++	thread_t th;
++	int e;
++
++	if (gps_state != 0) {
++		return -1;                             /* already on (or stopping) */
++	}
++	if (!gps_map()) {
++		return -2;
++	}
++	mark("on", (int)baud);
++	gps_en(false);
++	gps_pins(false);
++	qup = RD(g_qup, 4);
++	gps_sample = qup >= 0x20050000u ? 16u : 32u;
++	{
++		uint32_t div = 0;
++		const int s = gps_clock(baud, gps_sample, &div);
++
++		if (s < 0) {
++			return s - 10;                     /* -11 no source fits the rate, -12 RCG stuck, -13 a branch stayed off */
++		}
++	}
++	fw = RD(g_se, G_FW_REV);
++	txd = (RD(g_se, G_HW_PARAM0) >> 16) & 0x3fu;
++	rxd = (RD(g_se, G_HW_PARAM1) >> 16) & 0x3fu;
++	mark("fw", (int)fw);
++	if (((fw >> 8) & 0xffu) != 2 || (RD(g_se, G_IF_DISABLE) & 1u) || txd < 4 || rxd < 4) {
++		gps_n.last_err = (int)fw;
++		return -3;                             /* SE3 is not loaded with UART microcode, or its FIFO is off */
++	}
++	gps_depth_tx = txd;
++	if (!engine_stop()) {
++		return -4;
++	}
++	wr(g_se, G_IRQ_EN, 0);
++	wr(g_se, G_GSI_EVENT, 0);
++	wr(g_se, G_M_IRQ_EN, 0);
++	wr(g_se, G_S_IRQ_EN, 0);
++	wr(g_se, G_CGC, RD(g_se, G_CGC) | 0x7fu);
++	wr(g_se, G_DMA_CFG, RD(g_se, G_DMA_CFG) | 0x0fu);
++	wr(g_se, G_OUTPUT, 0x7f);
++	wr(g_se, G_FORCE_DEFAULT, 1);
++	wr(g_se, G_DMA_MODE, 0);
++	wr(g_se, G_TX_PACK0, 0x4380e);
++	wr(g_se, G_TX_PACK1, 0xc3e0e);
++	wr(g_se, G_RX_PACK0, 0x4380e);
++	wr(g_se, G_RX_PACK1, 0xc3e0e);
++	wr(g_se, G_BYTE_GRAN, 0);
++	wr(g_se, G_TX_WORD, 8);
++	wr(g_se, G_RX_WORD, 8);
++	wr(g_se, G_TX_STOP, 0);
++	wr(g_se, G_TX_PARITY, 0);
++	wr(g_se, G_RX_PARITY, 0);
++	wr(g_se, G_TX_CFG, cts ? 0u : 2u);
++	wr(g_se, G_RX_CFG, 0);
++	wr(g_se, G_LOOPBACK, 0);
++	wr(g_se, G_RX_STALE, 160);
++	wr(g_se, G_RX_RFR_WM, rxd - 2);
++	wr(g_se, G_MANUAL_RFR, G_RFR_OFF);
++	wr(g_se, G_CLK_SEL, 0);
++	gps_cts = cts;
++	gps_pins(true);
++	if ((e = set_rate(baud)) != 0) {
++		gps_down();
++		return e;
++	}
++	gps_prev = 0;
++	gps_state = 1;
++	if (kernel_thread_start(rx_thread, NULL, &th) != KERN_SUCCESS) {
++		gps_state = 0;
++		gps_down();
++		return -5;
++	}
++	thread_deallocate(th);
++	if (en) {
++		ms(20);
++		gps_en(true);                          /* the chip boots now; anything it says lands in the ring */
++	}
++	if (!gps_node) {
++		if (gps_major < 0) {
++			gps_major = cdevsw_add(-1, &gps_cdevsw);
++		}
++		gps_node = gps_major >= 0 &&
++		    devfs_make_node(makedev(gps_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "pong_gps") != NULL;
++	}
++	mark("up", (int)gps_baud);
++	return 0;
++}
++
++static void
++gps_off(void)
++{
++	if (gps_state != 1) {
++		return;
++	}
++	__atomic_store_n(&gps_state, 2, __ATOMIC_RELEASE);
++	lck_mtx_lock(&gps_lock);
++	gps_down();
++	lck_mtx_unlock(&gps_lock);
++	for (int i = 0; i < 100 && __atomic_load_n(&gps_state, __ATOMIC_ACQUIRE) == 2; i++) {
++		ms(5);
++	}
++	mark("off", 0);
++}
++
++/* ---- USB ---- */
++static uint32_t
++num(const char *p)
++{
++	uint32_t v = 0;
++
++	while (*p == ' ') {
++		p++;
++	}
++	for (; *p >= '0' && *p <= '9'; p++) {
++		v = v * 10 + (uint32_t)(*p - '0');
++	}
++	return v;
++}
++static int
++hexval(char c)
++{
++	return c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (c | 0x20) - 'a' + 10 : -1;
++}
++
++static int
++gps_status(char *reply, size_t cap, int rc)
++{
++	const uint64_t h = __atomic_load_n(&gps_head, __ATOMIC_ACQUIRE), n = h < 48 ? h : 48;
++	int k;
++
++	k = snprintf(reply, cap, "gps: %s rc %d baud %u os %u cts %d en %u wake %u rx %llu tx %llu txfail %llu nmea %llu "
++	        "fd %llu edges %llu lost %llu dev %s fw %x\nlast:",
++	        gps_state == 1 ? "on" : "off", rc, gps_baud, gps_sample, gps_cts, g_en ? (RD(g_en, 4) >> 1) & 1u : 0,
++	        g_wake ? RD(g_wake, 4) & 1u : 0, (unsigned long long)h, (unsigned long long)gps_n.tx,
++	        (unsigned long long)gps_n.txfail, (unsigned long long)gps_n.nmea, (unsigned long long)gps_n.wakebytes,
++	        (unsigned long long)gps_n.edges, (unsigned long long)gps_n.lost,
++	        gps_node ? "/dev/pong_gps" : "-", (unsigned)gps_n.last_err);
++	if (k < 0 || k > (int)cap - 16) {
++		return k;
++	}
++	for (uint64_t i = h - n; i < h && k < (int)cap - 8; i++) {
++		k += snprintf(reply + k, cap - (size_t)k, " %02x", gps_ring[i % GPS_RING]);
++	}
++	k += snprintf(reply + k, cap - (size_t)k, "\ntext: ");
++	for (uint64_t i = h - n; i < h && k < (int)cap - 4; i++) {
++		const uint8_t b = gps_ring[i % GPS_RING];
++
++		reply[k++] = b >= 0x20 && b < 0x7f ? (char)b : '.';
++	}
++	if (k < (int)cap - 1) {
++		reply[k++] = '\n';
++	}
++	reply[k < (int)cap ? k : (int)cap - 1] = '\0';
++	return k;
++}
++
++int
++pong_gps_usb(char *reply, size_t cap, const char *args)
++{
++	int rc = 0;
++
++	if (!reply || cap < 160) {
++		return -1;
++	}
++	while (args && *args == ' ') {
++		args++;
++	}
++	if (args && !strncmp(args, "on", 2)) {
++		uint32_t b = num(args + 2);
++
++		lck_mtx_lock(&gps_lock);
++		rc = gps_on(b ? b : 115200u, !strnstr(args, "nocts", strlen(args)), !strnstr(args, "enlow", strlen(args)));
++		lck_mtx_unlock(&gps_lock);
++	} else if (args && !strncmp(args, "off", 3)) {
++		gps_off();
++	} else if (args && !strncmp(args, "baud", 4)) {
++		lck_mtx_lock(&gps_lock);
++		rc = gps_state == 1 ? set_rate(num(args + 4)) : -1;
++		lck_mtx_unlock(&gps_lock);
++	} else if (args && !strncmp(args, "tx", 2)) {
++		uint8_t b[256];
++		unsigned n = 0;
++		int hi = -1;
++
++		for (const char *p = args + 2; *p && n < sizeof(b); p++) {
++			const int v = hexval(*p);
++
++			if (v < 0) {
++				continue;
++			}
++			if (hi < 0) {
++				hi = v;
++			} else {
++				b[n++] = (uint8_t)(hi << 4 | v);
++				hi = -1;
++			}
++		}
++		lck_mtx_lock(&gps_lock);
++		rc = gps_state != 1 ? -1 : n ? tx_raw(b, n) : -2;
++		lck_mtx_unlock(&gps_lock);
++		if (!rc) {
++			ms(200);                           /* let an answer arrive before the status below */
++		}
++	} else if (args && *args) {
++		return snprintf(reply, cap, "gps: on [baud] [nocts] [enlow] | off | baud <b> | tx <hex> | (status)\n");
++	}
++	return gps_status(reply, cap, rc);
++}
++
++static void
++gps_boot(void *arg, __unused wait_result_t w)
++{
++	uint32_t delay = 30;
++
++	(void)PE_parse_boot_argn("pong_gps_delay", &delay, sizeof(delay));
++	ms((delay > 600 ? 600 : delay) * 1000);
++	lck_mtx_lock(&gps_lock);
++	gps_n.last_err = gps_on((uint32_t)(uintptr_t)arg, true, true);
++	lck_mtx_unlock(&gps_lock);
++	mark("boot", gps_n.last_err);
++}
++
++void
++pong_gps_init(void)
++{
++	uint32_t baud = 0;
++	thread_t th;
++
++	if (!PE_parse_boot_argn("pong_gps", &baud, sizeof(baud)) || !baud) {
++		return;
++	}
++	if (kernel_thread_start(gps_boot, (void *)(uintptr_t)baud, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++#endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 9b82bbc..7b4aa6c 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2866,6 +2866,22 @@ dispatch_command(const char *cmd)
+ 		bs_reply[0] = '\0';
+ 		(void)pong_bt_stat_usb(bs_reply, sizeof(bs_reply));
+ 		send_str(bs_reply[0] ? bs_reply : "btstat: no reply\n");
++	} else if (strcmp(cmd, "cam") == 0 || strncmp(cmd, "cam ", 4) == 0) {
++		/* cameras K1: `cam id|stream|rx|frame|thumb|save`, `cam` = last result (bsd/dev/pong_camera.c) */
++		extern int pong_camera_usb(char *reply, size_t cap, const char *args);
++		static char cam_reply[1400];
++
++		cam_reply[0] = '\0';
++		(void)pong_camera_usb(cam_reply, sizeof(cam_reply), cmd + 3);
++		send_str(cam_reply[0] ? cam_reply : "cam: no reply\n");
++	} else if (strcmp(cmd, "gps") == 0 || strncmp(cmd, "gps ", 4) == 0) {
++		/* GNSS G2: `gps on [baud]|off|baud|tx <hex>`, `gps` = state + last bytes (bsd/dev/pong_gps.c) */
++		extern int pong_gps_usb(char *reply, size_t cap, const char *args);
++		static char gps_reply[700];
++
++		gps_reply[0] = '\0';
++		(void)pong_gps_usb(gps_reply, sizeof(gps_reply), cmd + 3);
++		send_str(gps_reply[0] ? gps_reply : "gps: no reply\n");
+ 	} else if (strcmp(cmd, "wifistack") == 0 || strcmp(cmd, "wifistack nwifi") == 0 || strcmp(cmd, "wifistat") == 0 ||
+ 	    strncmp(cmd, "wifilog", 7) == 0) {
+ 		/* the ath11k stack's worker: start it once per boot, or say where it is (bsd/dev/pong_wifi_stack.c) */
+@@ -3708,6 +3724,11 @@ pong_usb_ctl_init(void)
+ 
+ 		pong_bt_init();             /* the Bluetooth UART.SK worker: only with boot argument pong_bt bit 0 (pong_bt.c) */
+ 	}
++	{
++		extern void pong_gps_init(void);
++
++		pong_gps_init();            /* GNSS UART: nothing unless boot argument pong_gps=<baud> (pong_gps.c) */
++	}
+ 	{
+ 		extern void pong_adsp_init(void);
+ 
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 1a3003a..be41e7d 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -269,6 +269,9 @@ fw_save(char *reply, size_t cap)
+  * Optional, off by default, not yet tried on the device: boot argument pong_lp_extra bit 0 also disables
+  *   com.apple.spaceattributiond  restarted every 10 s on 11-14; StorageUI (Settings > General > iPad Storage) links its
+  *                                framework, so that screen is the likeliest to freeze the same way.
++ *   com.apple.locationd     back in the root image for GPS / location (work/gps_camera_scope/DESIGN.md); kept disabled
++ *                           unless boot argument pong_loc bit 0 (then dev.unixnu.pong.locd feeds it), so images without
++ *                           pong_loc behave as before from their second boot on.
+  * launchd reads the file when it starts, so this takes effect from the next boot. Boot argument pong_launch_policy=0 writes an
+  * empty policy instead (everything enabled again on the boot after). ref/rui-gts7xlwifi package/BootWatchdogPolicy.c does the same.
+  */
+@@ -280,6 +283,7 @@ static const char lp_jobs[] = "<key>com.apple.fairplayd.A2</key><true/>";
+ /* left out with boot argument pong_bt bit 0: bsd/dev/pong_bt.c then serves UART.SK (z101, not tried on the device) */
+ static const char lp_bt[] = "<key>com.apple.bluetoothd</key><true/>";
+ static const char lp_storage[] = "<key>com.apple.spaceattributiond</key><true/>";   /* pong_lp_extra bit 0 */
++static const char lp_loc[] = "<key>com.apple.locationd</key><true/>";              /* left out with pong_loc bit 0 */
+ static const char lp_tail[] = "</dict></plist>\n";
+ 
+ static uint32_t
+@@ -299,6 +303,14 @@ lp_bt_served(void)
+ 	return PE_parse_boot_argn("pong_bt", &v, sizeof(v)) && (v & 1u) ? 1 : 0;
+ }
+ 
++static int
++lp_loc_on(void)
++{
++	uint32_t v = 0;
++
++	return PE_parse_boot_argn("pong_loc", &v, sizeof(v)) && (v & 1u) ? 1 : 0;
++}
++
+ static int
+ lp_put(const char *path, const char *data, size_t len, int trunc)
+ {
+@@ -329,8 +341,8 @@ static int
+ lp_write(int disable)
+ {
+ 	char body[512];
+-	int n = snprintf(body, sizeof(body), "%s%s%s%s%s", lp_head, disable ? lp_jobs : "", disable && !lp_bt_served() ? lp_bt : "",
+-	    disable && (lp_extra() & 1) ? lp_storage : "", lp_tail);
++	int n = snprintf(body, sizeof(body), "%s%s%s%s%s%s", lp_head, disable ? lp_jobs : "", disable && !lp_bt_served() ? lp_bt : "",
++	    disable && (lp_extra() & 1) ? lp_storage : "", disable && !lp_loc_on() ? lp_loc : "", lp_tail);
+ 	int e;
+ 
+ 	if (n <= 0 || n >= (int)sizeof(body)) {
