@@ -76,6 +76,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/prepare-pong-mesa.py --repository "$RUNNER_TEMP/mesa-src" --out "$RUNNER_TEMP/mesa"
+          # A6xx (SM-T970 A650): GMEM store/load keeps the image's own swap; the A7xx-only WZYX forcing swapped red/blue
+          python3 scripts/patch_mesa_a6xx_gmem_swap.py "$RUNNER_TEMP/mesa"
           python3 scripts/prepare-pong-metal-parity.py --repository "$RUNNER_TEMP/m2v-src" --out "$RUNNER_TEMP/m2v"
 
       - name: Turnip
