@@ -572,7 +572,7 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
     objcopy = pong_paths.tool('llvm-objcopy', 'PONG_LLVM_OBJCOPY', ('/opt/local/bin/llvm-objcopy-mp-18',))
     undefined = subprocess.check_output([nm, '-u', '-j', str(linked)], text=True).splitlines()
     (out / 'undefined-symbols.txt').write_text('\n'.join(undefined) + '\n')
-    allowed = {'_PongWifiRandom','_bzero','_memcmp','_memcpy','_memmove','_memset','_snprintf','_strchr','_strcmp','_strlen','_strncmp','_strncpy','_strtoul','_vsnprintf'}
+    allowed = {'_PE_parse_boot_argn','_PongWifiRandom','_bzero','_memcmp','_memcpy','_memmove','_memset','_snprintf','_strchr','_strcmp','_strlen','_strncmp','_strncpy','_strtoul','_vsnprintf'}
     if set(undefined) - allowed: raise RuntimeError('unimplemented ath11k imports: ' + repr(set(undefined) - allowed))
     # Export only the documented board/station boundary. Linux shims have the
     # same C names as XNU helpers, so namespace every other defined symbol.
