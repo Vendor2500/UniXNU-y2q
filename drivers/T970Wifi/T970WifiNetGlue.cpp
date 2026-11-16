@@ -12,6 +12,7 @@
 // once; t970_usbnet_publish() then makes en1's entries by class name.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IORegistryEntry.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSBoolean.h>
