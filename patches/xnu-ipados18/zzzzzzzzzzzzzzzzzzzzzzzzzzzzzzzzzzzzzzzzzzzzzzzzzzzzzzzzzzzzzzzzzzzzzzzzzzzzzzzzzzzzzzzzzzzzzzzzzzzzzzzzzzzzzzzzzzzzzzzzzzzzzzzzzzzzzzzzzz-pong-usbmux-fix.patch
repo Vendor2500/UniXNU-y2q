@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/pong_usbmux.c b/bsd/dev/pong_usbmux.c
+index 2387f94..88f6860 100644
+--- a/bsd/dev/pong_usbmux.c
++++ b/bsd/dev/pong_usbmux.c
+@@ -60,7 +60,7 @@ struct mux_conn {
+ static struct mux_conn conns[MUX_CONNS];
+ static uint8_t *in_buf, *out_buf, *scratch;
+ static unsigned in_len, out_at, out_len;
+-static unsigned version, linked;
++static unsigned mux_ver, linked;
+ static uint16_t txseq, rxseq = 0xffff;
+ static int init_rc = 1, publish_rc = 1;
+ static unsigned activity;
+@@ -87,7 +87,7 @@ static void put32(uint8_t *p, uint32_t v) { put16(p, (uint16_t)(v >> 16)); put16
+ static bool
+ wire(unsigned proto, const void *a, unsigned alen, const void *b, unsigned blen)
+ {
+-	unsigned hdr = (proto != P_VERSION && version >= 2) ? 16 : 8;
++	unsigned hdr = (proto != P_VERSION && mux_ver >= 2) ? 16 : 8;
+ 	unsigned n = hdr + alen + blen;
+ 	uint8_t *p;
+ 
+@@ -162,7 +162,7 @@ reset_streams(void)
+ 		conn_close(&conns[i], false);
+ 	}
+ 	out_at = out_len = 0;
+-	version = 0;
++	mux_ver = 0;
+ 	txseq = 0;
+ 	rxseq = 0xffff;
+ }
+@@ -338,7 +338,7 @@ frame(unsigned proto, const uint8_t *p, unsigned size, bool v2hdr, uint16_t host
+ 		memset(answer, 0, sizeof(answer));
+ 		put32(answer, major);
+ 		(void)wire(P_VERSION, answer, sizeof(answer), NULL, 0);
+-		version = major;
++		mux_ver = major;
+ 		st.versions++;
+ 	} else if (proto == P_SETUP) {
+ 		/* libimobiledevice sends 7, macOS 5 (Pong); both mean the basic v2 transport. */
+@@ -346,7 +346,7 @@ frame(unsigned proto, const uint8_t *p, unsigned size, bool v2hdr, uint16_t host
+ 		txseq = 0;
+ 		rxseq = v2hdr ? host_seq : 0xffff;
+ 	} else if (proto == P_TCP) {
+-		if (version) {
++		if (mux_ver) {
+ 			tcp_input(p, size);
+ 		} else {
+ 			st.bad_frame++;
+@@ -586,7 +586,7 @@ pong_usbmux_stat(char *out, size_t cap)
+ 	n = snprintf(out, cap, "mux: init %d publish %d link %u ver %u conns %u [%s] | rx %u B frames %u tx_frames %u "
+ 	    "versions %u setups %u controls %u | syn %u refused %u opened %u closed %u rst_in %u dup %u overrun %u "
+ 	    "bad_frame %u bad_ack %u out_full %u last_port %u last_err %u\n",
+-	    init_rc, publish_rc, linked, version, open, portlist, st.rx_bytes, st.frames, st.tx_frames, st.versions,
++	    init_rc, publish_rc, linked, mux_ver, open, portlist, st.rx_bytes, st.frames, st.tx_frames, st.versions,
+ 	    st.setups, st.controls, st.syn, st.refused, st.opened, st.closed, st.rsts_in, st.dup, st.overrun,
+ 	    st.bad_frame, st.bad_ack, st.out_full, st.last_port, st.last_err);
+ 	return n;
