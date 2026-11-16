@@ -1,0 +1,495 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index fc9afca..d30af97 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -670,11 +670,18 @@ extern void t970_audio_start(void);
+ void
+ pong_adsp_init(void)
+ {
+-	uint32_t audio = 0, autoboot = 0;
++	uint32_t audio = 0, autoboot = 0, audio2 = 0;
+ 	thread_t th;
+ 
+ 	(void)PE_parse_boot_argn("t970-audio", &audio, sizeof(audio));
+ 	(void)PE_parse_boot_argn("pong_adsp_auto", &autoboot, sizeof(autoboot));
++	/* pong_audio2=1: a silent native output device (IOAudio2Device) whose clock runs, for media playback without speakers;
++	 * 2: the same device on the speakers (needs t970-audio device mode). iokit/Kernel/T970IOAudio2.cpp */
++	if (PE_parse_boot_argn("pong_audio2", &audio2, sizeof(audio2)) && (audio2 == 1 || audio2 == 2)) {
++		extern void t970_audio2_start(unsigned mode);
++
++		t970_audio2_start(audio2);
++	}
+ 	if (audio) {
+ 		t970_audio_start();             /* checks its own run bits */
+ 	}
+@@ -755,9 +762,18 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 			/* capture (T970Audio.cpp t970_audio_mic): stage, error, frames, peak, the ldoc5 vote; plug-in reads, silent reads */
+ 			extern volatile int32_t t970_audio_mic[20], t970_audio_micp[4];
+ 
+-			AD_ADD(" mic=%d/%d frames=%d peak=%d bias=%d reads=%d/%d\n", t970_audio_mic[0], t970_audio_mic[1], t970_audio_mic[7],
++			AD_ADD(" mic=%d/%d frames=%d peak=%d bias=%d reads=%d/%d", t970_audio_mic[0], t970_audio_mic[1], t970_audio_mic[7],
+ 			    t970_audio_mic[8], t970_audio_mic[16], t970_audio_micp[0], t970_audio_micp[1]);
+ 		}
++		{
++			/* IOAudio2Device (T970IOAudio2.cpp): mode, published, clients, StartIO ok/refused, frames passed, resyncs,
++			 * dropped, StopIO, volume step << 8 | mute */
++			extern volatile uint32_t t970_audio2[10];
++
++			AD_ADD(" io2=%u/%#x clients=%u start=%u/%u frames=%u resync=%u drop=%u stop=%u vol=%#x\n", t970_audio2[0], t970_audio2[1],
++			    t970_audio2[2], t970_audio2[3], t970_audio2[4], t970_audio2[5], t970_audio2[6], t970_audio2[7], t970_audio2[8],
++			    t970_audio2[9]);
++		}
+ 		return 0;
+ 	}
+ 	if (args && *args) {
+diff --git a/iokit/Kernel/T970IOAudio2.cpp b/iokit/Kernel/T970IOAudio2.cpp
+new file mode 100644
+index 0000000..1836302
+--- /dev/null
++++ b/iokit/Kernel/T970IOAudio2.cpp
+@@ -0,0 +1,433 @@
++// iOSPort: the native output device 22H374's audio server starts IO on. Its ASPL plug-in path (userland/T970AudioPlugIn.c) is opened
++// but never started (half85s: adsp audio svc=1/1 periods=0), as upstream Pong found on the same OS (services99-126 ASPL, StartIO
++// never; services127 a kernel IOAudio2Device, first StartIO). This is upstream's PongIOAudio2.h (Chengdong-Yu/UniXNU-pong,
++// drivers/PongPower, BSD-2-Clause-Patent) on the T970 service instead of Pong's DSP worker:
++//   pong_audio2=1  silent clock: StartIO succeeds at once and the zero time stamps run in real time; the committed samples are dropped.
++//                  No ADSP, no amplifier: the audio server's and AVSampleBufferRenderSynchronizer's clocks run (video playback).
++//   pong_audio2=2  the speakers: needs t970-audio device mode (bit 32). Published once T970Audio serves; StartIO asks it to run, and a
++//                  10 ms worker copies the committed samples into its playback ring lead_frames ahead of the period it takes next;
++//                  volume and mute go to the amplifiers' digital volume (out_volume_mdb).
++// Default off. Use without the ASPL plug-in (pong_audio_hal unset): one PCM device. Not tested on the device (11-17).
++// Copyright (c) 2026, UniXNU-pong contributors (IOAudio2 adapter). SPDX-License-Identifier: BSD-2-Clause-Patent
++#include <pexpert/arm64/board_config.h>
++#if defined(PONG)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMessage.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <string.h>
++#include "../../bsd/dev/qcom/T970AudioAbi.h"
++
++extern "C" IOBufferMemoryDescriptor *t970_audio_memory(uint32_t type);   // T970Audio.cpp: retained, null until it serves
++extern "C" int t970_audio_request(uint32_t selector);
++// [0] mode, [1] published, [2] clients opened, [3] StartIO, [4] StartIO refused, [5] frames passed to T970Audio, [6] write resyncs,
++// [7] frames dropped (ring full), [8] StopIO, [9] last volume step << 8 | mute
++extern "C" {volatile uint32_t t970_audio2[10];}
++
++namespace {
++constexpr unsigned Audio2Frames = 16384, Audio2Rate = 48000, Audio2FrameBytes = 4;
++// Upstream's volume map: 17 steps, dB in 32.32 fixed point (step 0 silent).
++constexpr int64_t Audio2Db[] = {-412316860416LL, -77574839190LL, -58181129392LL, -46836536411LL, -38787419595LL, -32544039547LL,
++    -27442826613LL, -23129812533LL, -19393709797LL, -16098233632LL, -13150329750LL, -10483626314LL, -8049116816LL, -5809585173LL,
++    -3736102736LL, -1805736768LL, 0LL};
++struct Audio2Status {volatile uint64_t frames, host, seed; volatile uint64_t clientInputEnd, clientOutputEnd;};
++struct Audio2Transition {
++    IOLock *lock;
++    explicit Audio2Transition(IOLock *value) : lock(value) {IOLockLock(lock);}
++    ~Audio2Transition() {IOLockUnlock(lock);}
++};
++unsigned gMode;
++IOBufferMemoryDescriptor *gT970Control, *gT970Ring;   // retained for the boot (mode 2)
++void audio2num(OSDictionary *d, const char *key, uint64_t value, unsigned bits = 32) {
++    auto n = OSNumber::withNumber(value, bits);
++    if (n) {d->setObject(key, n); n->release();}
++}
++OSDictionary *audio2format(bool range) {
++    auto d = OSDictionary::withCapacity(11);
++    if (!d) return nullptr;
++    if (range) {audio2num(d, "min sample rate", uint64_t(Audio2Rate) << 32, 64); audio2num(d, "max sample rate", uint64_t(Audio2Rate) << 32, 64);}
++    else audio2num(d, "sample rate", uint64_t(Audio2Rate) << 32, 64);
++    audio2num(d, "format ID", 'lpcm'); audio2num(d, "format flags", 12);
++    audio2num(d, "bytes per packet", Audio2FrameBytes); audio2num(d, "frames per packet", 1);
++    audio2num(d, "bytes per frame", Audio2FrameBytes); audio2num(d, "channels per frame", 2); audio2num(d, "bits per channel", 16);
++    return d;
++}
++T970AudioControl *t970Control() {return gT970Control ? static_cast<T970AudioControl *>(gT970Control->getBytesNoCopy()) : nullptr;}
++}  // namespace
++
++class IOAudio2Device : public IOService {
++    OSDeclareDefaultStructors(IOAudio2Device)
++public:
++    IOBufferMemoryDescriptor *status = nullptr, *ring = nullptr;
++    IOLock *gate = nullptr, *controlGate = nullptr, *ioGate = nullptr;
++    bool running = false, clockRunning = false, starting = false, streamEnabled = true, draining = false;
++    unsigned users = 0;
++    uint64_t origin = 0, seed = 0, readAt = 0, drainEnd = 0, writeAt = 0;
++    bool readValid = false;
++    unsigned volume = 13, muted = 0;
++    bool start(IOService *) override;
++    void free() override;
++    IOReturn setProperties(OSObject *) override;
++    IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) override;
++    IOReturn startOutput(bool retained = false);
++    IOReturn resumeOutput() {return startOutput(true);}
++    void stopOutput();
++    void clockLoop();
++    void controls();
++    IOReturn control(unsigned, unsigned, uint64_t *);
++    IOReturn setStreamActive(bool);
++    void pump();
++    void applyVolume();
++};
++OSDefineMetaClassAndStructors(IOAudio2Device, IOService)
++
++class IOAudio2DeviceUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(IOAudio2DeviceUserClient)
++    IOAudio2Device *audio = nullptr;
++    bool active = false;
++    IOLock *requestGate = nullptr;
++public:
++    bool start(IOService *p) override {
++        auto d = OSDynamicCast(IOAudio2Device, p);
++        if (!d || !IOUserClient::start(p)) return false;
++        requestGate = IOLockAlloc();
++        if (!requestGate) return false;
++        d->retain(); audio = d;
++        t970_audio2[2] = t970_audio2[2] + 1;
++        return true;
++    }
++    void stopClient() {
++        if (!requestGate) return;
++        Audio2Transition transition(requestGate);
++        if (__atomic_exchange_n(&active, false, __ATOMIC_ACQ_REL)) audio->stopOutput();
++    }
++    void free() override {if (audio) {stopClient(); audio->release(); audio = nullptr;} if (requestGate) IOLockFree(requestGate); IOUserClient::free();}
++    IOReturn clientClose() override {stopClient(); terminate(); return kIOReturnSuccess;}
++    IOReturn setProperties(OSObject *p) override {return audio ? audio->setProperties(p) : kIOReturnNotReady;}
++    IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override {
++        if (!audio || !options || !memory) return kIOReturnBadArgument;
++        auto m = type == 0 ? audio->status : (type == 1 || type == 0x10000001) ? audio->ring : nullptr;
++        if (!m) return kIOReturnUnsupported;
++        // 22H374 HALS_IOA2Engine2 writes the client positions at status +0x18/+0x20: a shared read-write page (upstream SIGBUS lesson).
++        m->retain(); *options = 0; *memory = m;
++        return kIOReturnSuccess;
++    }
++    IOReturn registerNotificationPort(mach_port_t, UInt32 type, io_user_reference_t) override {return type == 0 ? kIOReturnSuccess : kIOReturnUnsupported;}
++    IOReturn externalMethod(uint32_t s, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *, void *) override;
++    IOExternalTrap *getTargetAndTrapForIndex(IOService **target, UInt32 index) override {
++        static IOExternalTrap trap = {nullptr, static_cast<IOTrap>(&IOAudio2DeviceUserClient::doIO)};
++        if (index || !target) return nullptr;
++        *target = this;
++        return &trap;
++    }
++    IOReturn doIO(void *, void *, void *, void *, void *, void *) {
++        __asm__ volatile("dmb ish" ::: "memory");
++        return __atomic_load_n(&active, __ATOMIC_ACQUIRE) ? kIOReturnSuccess : kIOReturnNotReady;
++    }
++};
++OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient)
++
++static IOAudio2Device *gAudio2;
++
++void IOAudio2Device::controls() {
++    auto list = OSArray::withCapacity(2);
++    if (!list) return;
++    for (unsigned id = 1; id <= 2; id++) {
++        auto d = OSDictionary::withCapacity(10);
++        if (!d) continue;
++        audio2num(d, "control ID", id); audio2num(d, "class", id == 1 ? 'vlme' : 'mute');
++        audio2num(d, "base class", id == 1 ? 'levl' : 'togl'); audio2num(d, "scope", 'outp');
++        audio2num(d, "element", 0); audio2num(d, "value", id == 1 ? volume : muted);
++        d->setObject("read only", kOSBooleanFalse);
++        if (id == 1) {
++            auto ranges = OSArray::withCapacity(16);
++            if (ranges) {
++                for (unsigned i = 0; i < 16; i++) {
++                    auto range = OSDictionary::withCapacity(4);
++                    if (!range) continue;
++                    audio2num(range, "start int value", i); audio2num(range, "start db value", uint64_t(Audio2Db[i]), 64);
++                    audio2num(range, "integer steps", 1); audio2num(range, "db per step", uint64_t(Audio2Db[i + 1] - Audio2Db[i]), 64);
++                    ranges->setObject(range); range->release();
++                }
++                d->setObject("range map", ranges); audio2num(d, "transfer function", 0); ranges->release();
++            }
++        }
++        list->setObject(d); d->release();
++    }
++    setProperty("controls", list);
++    list->release();
++}
++bool IOAudio2Device::start(IOService *p) {
++    if (!IOService::start(p)) return false;
++    gate = IOLockAlloc(); controlGate = IOLockAlloc(); ioGate = IOLockAlloc();
++    const auto opts = IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryKernelUserShared);
++    status = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, opts, 4096, 4096);
++    ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, opts, Audio2Frames * Audio2FrameBytes, 4096);
++    auto stream = OSDictionary::withCapacity(6); auto current = audio2format(false); auto available = audio2format(true);
++    auto formats = OSArray::withCapacity(1); auto outputs = OSArray::withCapacity(1); auto inputs = OSArray::withCapacity(1);
++    const bool ok = gate && controlGate && ioGate && status && ring && stream && current && available && formats && outputs && inputs;
++    if (ok) {
++        bzero(status->getBytesNoCopy(), 4096); bzero(ring->getBytesNoCopy(), Audio2Frames * Audio2FrameBytes);
++        audio2num(stream, "stream ID", 1); audio2num(stream, "starting channel", 1); audio2num(stream, "terminal type", 'spkr');
++        formats->setObject(available); stream->setObject("current format", current); stream->setObject("available formats", formats);
++        outputs->setObject(stream);
++        // Built in, the native Speaker UID 22H374's transducer lookup takes (upstream); output only.
++        setProperty("device UID", "Speaker"); setProperty("device name", "Speaker"); setProperty("device manufacturer", "Samsung");
++        setProperty("transport type", uint64_t('bltn'), 32); setProperty("sample rate", uint64_t(Audio2Rate) << 32, 64);
++        setProperty("io buffer frame size", uint64_t(Audio2Frames), 32); setProperty("clock domain", uint64_t('t970'), 32);
++        setProperty("output latency", uint64_t(480), 32); setProperty("output safety offset", uint64_t(960), 32);
++        setProperty("input latency", uint64_t(0), 32); setProperty("input safety offset", uint64_t(0), 32);
++        setProperty("output streams", outputs); setProperty("input streams", inputs);
++        setProperty("NativeSandboxGrantProcess", "audiomxd,mediaserverd");
++        controls();
++    }
++    OSSafeReleaseNULL(stream); OSSafeReleaseNULL(current); OSSafeReleaseNULL(available);
++    OSSafeReleaseNULL(formats); OSSafeReleaseNULL(outputs); OSSafeReleaseNULL(inputs);
++    return ok;
++}
++void IOAudio2Device::free() {
++    OSSafeReleaseNULL(status); OSSafeReleaseNULL(ring);
++    if (gate) IOLockFree(gate);
++    if (controlGate) IOLockFree(controlGate);
++    if (ioGate) IOLockFree(ioGate);
++    IOService::free();
++}
++IOReturn IOAudio2Device::setProperties(OSObject *p) {
++    // CoreAudio takes hog mode before activating the device; nothing else may be replaced from user space.
++    auto d = OSDynamicCast(OSDictionary, p);
++    if (!d) return kIOReturnBadArgument;
++    auto owner = OSDynamicCast(OSNumber, d->getObject("exclusive access owner"));
++    if (!owner || d->getCount() != 1) return kIOReturnUnsupported;
++    setProperty("exclusive access owner", owner);
++    return kIOReturnSuccess;
++}
++IOReturn IOAudio2Device::newUserClient(task_t t, void *s, UInt32 type, OSDictionary *props, IOUserClient **out) {
++    if (type || !out) return kIOReturnBadArgument;
++    auto c = OSTypeAlloc(IOAudio2DeviceUserClient);
++    if (!c) return kIOReturnNoMemory;
++    if (!c->initWithTask(t, s, type, props) || !c->attach(this) || !c->start(this)) {c->detach(this); c->release(); return kIOReturnError;}
++    *out = c;
++    return kIOReturnSuccess;
++}
++static void audio2clock(void *p, wait_result_t) {static_cast<IOAudio2Device *>(p)->clockLoop();}
++
++// Mode 2: T970Audio runs its path (AFE, ADM, ASM, amplifiers: hundreds of ms) and reports it in its control page's state.
++static bool t970Start() {
++    T970AudioControl *c = t970Control();
++    if (!c || t970_audio_request(T970AudioStartOutput)) return false;
++    for (unsigned i = 0; i < 500 && !(__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) & T970AudioOutputRunning); i++) IOSleep(10);
++    if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) & T970AudioOutputRunning) return true;
++    t970_audio_request(T970AudioStopOutput);
++    return false;
++}
++IOReturn IOAudio2Device::startOutput(bool retained) {
++    Audio2Transition transition(ioGate);
++    IOLockLock(gate);
++    if (running) {
++        if (!streamEnabled) {streamEnabled = true; readValid = false;}
++        if (!retained) users++;
++        IOLockUnlock(gate);
++        return kIOReturnSuccess;
++    }
++    uint64_t until = 0;
++    clock_interval_to_deadline(100, kMillisecondScale, &until);
++    while (clockRunning) {
++        if (IOLockSleepDeadline(gate, &clockRunning, until, THREAD_UNINT) != THREAD_AWAKENED && clockRunning) {IOLockUnlock(gate); return kIOReturnTimeout;}
++    }
++    if (starting) {IOLockUnlock(gate); return kIOReturnBusy;}
++    starting = true;
++    IOLockUnlock(gate);
++    if (gMode == 2 && !t970Start()) {
++        IOLockLock(gate); starting = false; IOLockUnlock(gate);
++        t970_audio2[4] = t970_audio2[4] + 1;
++        return kIOReturnNotReady;
++    }
++    if (gMode == 2) applyVolume();
++    IOLockLock(gate);
++    starting = false;
++    bzero(ring->getBytesNoCopy(), Audio2Frames * Audio2FrameBytes);
++    origin = mach_absolute_time(); seed++; readAt = 0; readValid = false; writeAt = 0; streamEnabled = true;
++    auto st = static_cast<Audio2Status *>(status->getBytesNoCopy());
++    st->host = origin; st->frames = 0;
++    __atomic_store_n(&st->clientInputEnd, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&st->clientOutputEnd, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&st->seed, seed, __ATOMIC_RELEASE);
++    running = clockRunning = true; users = 1; retain();
++    thread_t t = nullptr;
++    const auto r = kernel_thread_start(audio2clock, this, &t);
++    if (r != KERN_SUCCESS) {running = clockRunning = false; users = 0; release(); if (gMode == 2) t970_audio_request(T970AudioStopOutput);}
++    else thread_deallocate(t);
++    IOLockUnlock(gate);
++    if (r == KERN_SUCCESS) t970_audio2[3] = t970_audio2[3] + 1; else t970_audio2[4] = t970_audio2[4] + 1;
++    return r == KERN_SUCCESS ? kIOReturnSuccess : kIOReturnNoResources;
++}
++void IOAudio2Device::stopOutput() {
++    Audio2Transition transition(ioGate);
++    IOLockLock(gate);
++    if (!users || --users) {IOLockUnlock(gate); return;}
++    auto st = static_cast<Audio2Status *>(status->getBytesNoCopy());
++    drainEnd = __atomic_load_n(&st->clientOutputEnd, __ATOMIC_ACQUIRE);
++    draining = gMode == 2 && running && readValid && drainEnd > readAt;
++    IOLockUnlock(gate);
++    if (draining) {   // the committed tail (a short sound's last periods) still goes out, at most one ring
++        uint64_t deadline = 0;
++        clock_interval_to_deadline(400, kMillisecondScale, &deadline);
++        while (mach_absolute_time() < deadline) {
++            IOLockLock(gate); const bool done = !running || readAt >= drainEnd; IOLockUnlock(gate);
++            if (done) break;
++            IOSleep(5);
++        }
++    }
++    IOLockLock(gate);
++    draining = false; running = false;
++    IOLockUnlock(gate);
++    if (gMode == 2) t970_audio_request(T970AudioStopOutput);
++    t970_audio2[8] = t970_audio2[8] + 1;
++}
++// Mode 2, under gate: the committed samples [readAt, end) into T970Audio's ring at writeAt on its timeline, at least lead_frames ahead
++// of the period it takes next (out_taken). One producer: the ring is written, not mixed.
++void IOAudio2Device::pump() {
++    T970AudioControl *c = t970Control();
++    int16_t *dst = gT970Ring ? static_cast<int16_t *>(gT970Ring->getBytesNoCopy()) : nullptr;
++    auto st = static_cast<Audio2Status *>(status->getBytesNoCopy());
++    const uint64_t end = draining ? drainEnd : __atomic_load_n(&st->clientOutputEnd, __ATOMIC_ACQUIRE);
++    if (!c || !dst || !end || (!streamEnabled && !draining)) return;
++    if (!readValid || end < readAt) {readAt = end > Audio2Frames ? end - Audio2Frames : 0; readValid = true; writeAt = 0;}
++    if (end > Audio2Frames && readAt < end - Audio2Frames) readAt = end - Audio2Frames;
++    const unsigned count = unsigned(end - readAt < Audio2Frames ? end - readAt : Audio2Frames);
++    if (!count) return;
++    const uint64_t taken = __atomic_load_n(&c->out_taken, __ATOMIC_ACQUIRE), ringFrames = c->ring_frames ? c->ring_frames : T970_AUDIO_RING_FRAMES;
++    if (writeAt < taken) {writeAt = taken + c->lead_frames; t970_audio2[6] = t970_audio2[6] + 1;}
++    if (writeAt + count - taken > ringFrames / 2) {readAt += count; t970_audio2[7] = t970_audio2[7] + count; return;}
++    const int16_t *src = static_cast<const int16_t *>(ring->getBytesNoCopy());
++    for (unsigned i = 0; i < count; i++) {
++        const uint64_t from = (readAt + i) % Audio2Frames, to = (writeAt + i) % ringFrames;
++        dst[2 * to] = src[2 * from];
++        dst[2 * to + 1] = src[2 * from + 1];
++    }
++    __asm__ volatile("dmb ish" ::: "memory");
++    writeAt += count; readAt += count;
++    c->out_written = writeAt;
++    c->out_written_host = mach_absolute_time();
++    t970_audio2[5] = t970_audio2[5] + count;
++}
++void IOAudio2Device::clockLoop() {
++    for (;;) {
++        IOSleep(10);
++        IOLockLock(gate);
++        if (!running) {clockRunning = false; IOLockWakeup(gate, &clockRunning, false); IOLockUnlock(gate); break;}
++        uint64_t ns = 0, ticks = 0;
++        absolutetime_to_nanoseconds(mach_absolute_time() - origin, &ns);
++        const uint64_t frames = (ns / 1000000000 * 48000 + (ns % 1000000000) * 48000 / 1000000000) / Audio2Frames * Audio2Frames;
++        nanoseconds_to_absolutetime(frames * 62500 / 3, &ticks);
++        auto st = static_cast<Audio2Status *>(status->getBytesNoCopy());
++        st->frames = frames; st->host = origin + ticks;
++        __atomic_store_n(&st->seed, seed, __ATOMIC_RELEASE);
++        if (gMode == 2) pump();
++        else {readAt = __atomic_load_n(&st->clientOutputEnd, __ATOMIC_ACQUIRE); readValid = true;}   // the silent clock drops them
++        IOLockUnlock(gate);
++    }
++    release();
++}
++// The volume step and mute as the amplifiers' digital volume (T970AudioControl out_volume_mdb, applied by T970Audio on each new seq).
++void IOAudio2Device::applyVolume() {
++    T970AudioControl *c = t970Control();
++    if (!c) return;
++    c->out_volume_mdb = muted || !volume ? T970_AUDIO_MUTE_MDB : int32_t((Audio2Db[volume] * 1000) / 4294967296LL);
++    __atomic_add_fetch(&c->out_volume_seq, 1u, __ATOMIC_ACQ_REL);
++}
++IOReturn IOAudio2Device::control(unsigned id, unsigned value, uint64_t *result) {
++    if ((id == 1 && value > 16) || (id == 2 && value > 1) || (id != 1 && id != 2)) return kIOReturnBadArgument;
++    IOLockLock(controlGate);
++    IOLockLock(gate);
++    if (id == 1) volume = value; else muted = value;
++    if (result) *result = value;
++    IOLockUnlock(gate);
++    if (gMode == 2) applyVolume();
++    controls();
++    IOLockUnlock(controlGate);
++    t970_audio2[9] = volume << 8 | muted;
++    messageClients(kIOMessageServicePropertyChange);
++    return kIOReturnSuccess;
++}
++IOReturn IOAudio2Device::setStreamActive(bool enabled) {
++    IOLockLock(gate);
++    const bool changed = streamEnabled != enabled;
++    streamEnabled = enabled;
++    if (changed) readValid = false;
++    IOLockUnlock(gate);
++    return kIOReturnSuccess;
++}
++IOReturn IOAudio2DeviceUserClient::externalMethod(uint32_t s, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *, void *) {
++    if (!audio || !a) return kIOReturnBadArgument;
++    if (a->structureInputDescriptor || a->structureOutputDescriptor) return kIOReturnUnsupported;
++    if (s == 0 || s == 10) {   // StartIO
++        if (a->scalarInputCount != (s == 0 ? 0u : 1u) || a->structureInputSize || a->structureOutputSize) return kIOReturnBadArgument;
++        Audio2Transition transition(requestGate);
++        const auto r = __atomic_load_n(&active, __ATOMIC_ACQUIRE) ? audio->resumeOutput() : audio->startOutput();
++        if (!r) __atomic_store_n(&active, true, __ATOMIC_RELEASE);
++        if (a->scalarOutputCount) a->scalarOutput[0] = 0;
++        return r;
++    }
++    if (s == 1 || s == 11) {   // StopIO
++        if (a->scalarInputCount != (s == 1 ? 0u : 1u) || a->structureInputSize || a->structureOutputSize) return kIOReturnBadArgument;
++        stopClient();
++        if (a->scalarOutputCount) a->scalarOutput[0] = 0;
++        return kIOReturnSuccess;
++    }
++    if (s == 2) {   // control value
++        if (a->scalarInputCount != 2 || a->structureInputSize || a->structureOutputSize || a->scalarOutputCount != 1) return kIOReturnBadArgument;
++        return audio->control(unsigned(a->scalarInput[0]), unsigned(a->scalarInput[1]), a->scalarOutput);
++    }
++    if (s == 6) {   // stream active
++        if (a->scalarInputCount != 2 || a->scalarInput[0] != 1 || a->scalarInput[1] > 1 || a->structureInputSize || a->scalarOutputCount ||
++            a->structureOutputSize) return kIOReturnBadArgument;
++        return audio->setStreamActive(a->scalarInput[1] != 0);
++    }
++    if (s == 5) {   // format check: 48 kHz S16 stereo only
++        if (a->scalarInputCount != 1 || a->scalarInput[0] != 1 || a->structureInputSize != 40 || !a->structureInput) return kIOReturnBadArgument;
++        const uint64_t rate = 0x40e7700000000000ULL;
++        const uint32_t format[] = {uint32_t('lpcm'), 12, 4, 1, 4, 2, 16, 0};
++        return !memcmp(a->structureInput, &rate, 8) && !memcmp(static_cast<const uint8_t *>(a->structureInput) + 8, format, 32) ?
++            kIOReturnSuccess : kIOReturnUnsupported;
++    }
++    return kIOReturnUnsupported;
++}
++
++static bool audio2Publish() {
++    auto provider = IOService::getPlatform();
++    auto d = OSTypeAlloc(IOAudio2Device);
++    if (!provider || !d) return false;
++    if (!d->init() || !d->attach(provider) || !d->start(provider)) {d->detach(provider); d->release(); return false;}
++    gAudio2 = d;
++    d->registerService();
++    t970_audio2[1] = 1;
++    IOLog("T970Audio2: IOAudio2Device published, mode %u\n", gMode);
++    return true;
++}
++// Mode 2: publish once T970Audio serves (its control page and ring exist), so the audio server's first StartIO can run the path.
++static void audio2Wait(void *, wait_result_t) {
++    for (unsigned i = 0; i < 600 && !gT970Control; i++) {
++        gT970Control = t970_audio_memory(T970AudioMemoryControl);
++        if (!gT970Control) IOSleep(1000);
++    }
++    gT970Ring = gT970Control ? t970_audio_memory(T970AudioMemoryOutput) : nullptr;
++    if (!gT970Ring) {t970_audio2[1] = 0xdead; IOLog("T970Audio2: T970Audio never served, no device\n"); return;}
++    (void)audio2Publish();
++}
++// From pong_adsp_init (bsd/dev/pong_adsp.c): boot argument pong_audio2 = 1 silent clock, 2 the speakers; anything else nothing.
++extern "C" void t970_audio2_start(unsigned mode) {
++    if ((mode != 1 && mode != 2) || gMode) return;
++    gMode = mode;
++    t970_audio2[0] = mode;
++    if (mode == 1) {(void)audio2Publish(); return;}
++    thread_t t = nullptr;
++    if (kernel_thread_start(audio2Wait, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
++}
++#endif /* PONG */
+diff --git a/iokit/conf/files b/iokit/conf/files
+index 7c4355e..972173e 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -87,6 +87,7 @@ iokit/Kernel/PongBareAccel.cpp			optional iokitcpp
+ iokit/Kernel/PongUsbMuxService.cpp		optional iokitcpp
+ iokit/Kernel/T970Audio.cpp			optional iokitcpp
+ iokit/Kernel/T970AudioService.cpp		optional iokitcpp
++iokit/Kernel/T970IOAudio2.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+ iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
+ 
