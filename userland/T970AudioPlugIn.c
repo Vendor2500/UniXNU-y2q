@@ -826,7 +826,8 @@ static HRESULT QueryInterface(void *self, REFIID uuid, LPVOID *out) {
     return r;
 }
 
-__attribute__((visibility("default"))) void *T970Audio_Create(CFAllocatorRef allocator, CFUUIDRef type) {
+// 22H374: the factory function the PongAudio.driver Info.plist names (build-ipados18.py CFPlugInFactories)
+__attribute__((visibility("default"))) void *PongAudio_Create(CFAllocatorRef allocator, CFUUIDRef type) {
     (void)allocator;
     if (!CFEqual(type, kAudioServerPlugInTypeUUID)) return NULL;
     if (!gHostTicksPerFrame) {
