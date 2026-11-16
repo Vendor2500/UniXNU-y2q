@@ -227,6 +227,87 @@ def t970_edits(gen, mhi, shared, out):
         ('    if (p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n',
          '    if (!nw_wifi_t970_noba && p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n'),
     ])
+    # 13. (11-16) Receive losses inside ath11k, counted only (no behaviour change). The link came up, multicast arrived by
+    #     thousands and unicast almost never ("this station" 0-7), so no DHCP offer. Counted in dp_rx.c: REO exception ring
+    #     entries by REO error code (nw_wifi_t970_reo_exc, all dropped except single-MSDU fragments); WBM release ring errors
+    #     by source (REO / RXDMA) and code (nw_wifi_t970_wbm_err); nw_wifi_t970_rxp = [0] REO destination entries, [1] of
+    #     them dropped for the push reason, [2] unknown buffer, [3]/[4] MSDUs dropped by ath11k_dp_rx_process_msdu (-EIO /
+    #     other), [5]/[6] unicast / multicast MPDUs reaching ath11k_dp_rx_h_mpdu (first MSDU, attention bit), unicast ones
+    #     with [7] FCS, [8] TKIP MIC, [9] other error bits (their OR in nw_wifi_t970_rx_errbits), [10] not decrypted with a
+    #     cipher set, [11] no peer; [12] WBM entries without an error push reason (dropped), WBM errors [13] dropped, [14]
+    #     of them unicast, [15] passed on. nw_wifi_t970_rx_stats(b, n, 3|4) gives the two lines; until the board asks for
+    #     them, line 2's call logs them itself (just before the "tx tqm" line).
+    edit(gen / 'dp_rx.c', [
+        ('static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,\n',
+         '/* SM-T970: receive losses by reason (build-pong-ath11k.py edit 13) */\n'
+         'unsigned nw_wifi_t970_reo_exc[16], nw_wifi_t970_wbm_err[2][16], nw_wifi_t970_rxp[16], nw_wifi_t970_rx_errbits;\n'
+         'static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,\n'),
+        ('\tif (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)\n\t\tis_decrypted = ath11k_dp_rx_h_attn_is_decrypted(rx_attention);\n',
+         '\tif (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)\n\t\tis_decrypted = ath11k_dp_rx_h_attn_is_decrypted(rx_attention);\n'
+         '\tif (rxcb->is_first_msdu) {\n'
+         '\t\tnw_wifi_t970_rxp[rxcb->is_mcbc ? 6 : 5]++;\n'
+         '\t\tif (!rxcb->is_mcbc) {\n'
+         '\t\t\tnw_wifi_t970_rx_errbits |= err_bitmap;\n'
+         '\t\t\tif (err_bitmap & DP_RX_MPDU_ERR_FCS)\n\t\t\t\tnw_wifi_t970_rxp[7]++;\n'
+         '\t\t\tif (err_bitmap & DP_RX_MPDU_ERR_TKIP_MIC)\n\t\t\t\tnw_wifi_t970_rxp[8]++;\n'
+         '\t\t\tif (err_bitmap & ~(u32)(DP_RX_MPDU_ERR_FCS | DP_RX_MPDU_ERR_TKIP_MIC))\n\t\t\t\tnw_wifi_t970_rxp[9]++;\n'
+         '\t\t\tif (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap && !is_decrypted)\n\t\t\t\tnw_wifi_t970_rxp[10]++;\n'
+         '\t\t\tif (!peer)\n\t\t\t\tnw_wifi_t970_rxp[11]++;\n'
+         '\t\t}\n'
+         '\t}\n'),
+        ('\t\tnum_buffs_reaped[mac_id]++;\n\n\t\tpush_reason = FIELD_GET(HAL_REO_DEST_RING_INFO0_PUSH_REASON,\n',
+         '\t\tnum_buffs_reaped[mac_id]++;\n\t\tnw_wifi_t970_rxp[0]++;\n\n\t\tpush_reason = FIELD_GET(HAL_REO_DEST_RING_INFO0_PUSH_REASON,\n'),
+        ('\t\t\tab->soc_stats.hal_reo_error[ring_id]++;\n',
+         '\t\t\tab->soc_stats.hal_reo_error[ring_id]++;\n\t\t\tnw_wifi_t970_rxp[1]++;\n'),
+        ('\t\t\tath11k_warn(ab, "frame rx with invalid buf_id %d\\n",\n\t\t\t\t    buf_id);\n',
+         '\t\t\tath11k_warn(ab, "frame rx with invalid buf_id %d\\n",\n\t\t\t\t    buf_id);\n\t\t\tnw_wifi_t970_rxp[2]++;\n'),
+        ('\t\t\t\t   "Unable to process msdu %d", ret);\n',
+         '\t\t\t\t   "Unable to process msdu %d", ret);\n\t\t\tnw_wifi_t970_rxp[ret == -EIO ? 3 : 4]++;\n'),
+        ('\t\tab->soc_stats.err_ring_pkts++;\n',
+         '\t\tab->soc_stats.err_ring_pkts++;\n'
+         '\t\t{ u32 t970e = FIELD_GET(HAL_REO_DEST_RING_INFO0_ERROR_CODE, reo_desc->info0);\n'
+         '\t\t  nw_wifi_t970_reo_exc[t970e < 15 ? t970e : 15]++; }\n'),
+        ('\tar->ab->soc_stats.reo_error[rxcb->err_code]++;\n',
+         '\tar->ab->soc_stats.reo_error[rxcb->err_code]++;\n'
+         '\tnw_wifi_t970_wbm_err[0][rxcb->err_code < 15 ? rxcb->err_code : 15]++;\n'),
+        ('\tar->ab->soc_stats.rxdma_error[rxcb->err_code]++;\n',
+         '\tar->ab->soc_stats.rxdma_error[rxcb->err_code]++;\n'
+         '\tnw_wifi_t970_wbm_err[1][rxcb->err_code < 15 ? rxcb->err_code : 15]++;\n'),
+        ('\tif (drop) {\n\t\tdev_kfree_skb_any(msdu);\n\t\treturn;\n\t}\n\n\tath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);\n',
+         '\tif (drop) {\n'
+         '\t\tnw_wifi_t970_rxp[13]++;\n'
+         '\t\tif (!FIELD_GET(RX_ATTENTION_INFO1_MCAST_BCAST,\n'
+         '\t\t\t       __le32_to_cpu(ath11k_dp_rx_get_attention(ar->ab, rxcb->rx_desc)->info1)))\n'
+         '\t\t\tnw_wifi_t970_rxp[14]++;\n'
+         '\t\tdev_kfree_skb_any(msdu);\n\t\treturn;\n\t}\n'
+         '\tnw_wifi_t970_rxp[15]++;\n\n\tath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);\n'),
+        ('\t\tif (err_info.push_reason !=\n\t\t    HAL_REO_DEST_RING_PUSH_REASON_ERR_DETECTED) {\n\t\t\tdev_kfree_skb_any(msdu);\n',
+         '\t\tif (err_info.push_reason !=\n\t\t    HAL_REO_DEST_RING_PUSH_REASON_ERR_DETECTED) {\n\t\t\tnw_wifi_t970_rxp[12]++;\n'
+         '\t\t\tdev_kfree_skb_any(msdu);\n'),
+    ])
+    edit(out / 'nw_sta_pong.c', [
+        ('void nw_wifi_t970_rx_stats(char *b, int n, int which) {\n',
+         'extern unsigned nw_wifi_t970_reo_exc[16], nw_wifi_t970_wbm_err[2][16], nw_wifi_t970_rxp[16], nw_wifi_t970_rx_errbits;   /* dp_rx.c, edit 13 */\n'
+         'static int t970_rxerr_polled;   /* the board asks for lines 3 and 4 itself: line 2 no longer logs them */\n'
+         'static int t970_codes(char *b, int n, int k, const char *name, const unsigned *c) {   /* nonzero ones as code:count */\n'
+         '  if (k < n) k += snprintf(b + k, n - k, " %s", name);\n'
+         '  for (int i = 0; i < 16 && k < n; i++) if (c[i]) k += snprintf(b + k, n - k, " %d:%u", i, c[i]);\n'
+         '  return k; }\n'
+         'static void t970_rx_err_line(char *b, int n, int which) {\n'
+         '  const unsigned *p = nw_wifi_t970_rxp;\n'
+         '  if (which == 3) { int k = snprintf(b, n, "rx err"); k = t970_codes(b, n, k, "reo-exc", nw_wifi_t970_reo_exc);\n'
+         '    k = t970_codes(b, n, k, "wbm-reo", nw_wifi_t970_wbm_err[0]); t970_codes(b, n, k, "wbm-rxdma", nw_wifi_t970_wbm_err[1]); }\n'
+         '  else snprintf(b, n, "rx mpdu uc %u mc %u; uc fcs %u mic %u oth %u bits %x undec %u nopeer %u; reo %u push %u badbuf %u msdu %u/%u; "\n'
+         '    "wbm noerr %u drop %u uc %u pass %u", p[5], p[6], p[7], p[8], p[9], nw_wifi_t970_rx_errbits, p[10], p[11], p[0], p[1], p[2],\n'
+         '    p[3], p[4], p[12], p[13], p[14], p[15]); }\n'
+         'void nw_wifi_t970_rx_stats(char *b, int n, int which) {\n'),
+        ('    nw_wifi_t970_htt[2], nw_wifi_t970_htt[3], nw_wifi_t970_htt[4]);\n  else snprintf(b, n, "tx ack/nack/free small',
+         '    nw_wifi_t970_htt[2], nw_wifi_t970_htt[3], nw_wifi_t970_htt[4]);\n'
+         '  if (which == 2 && !t970_rxerr_polled) { static char t[256];\n'
+         '    t970_rx_err_line(t, sizeof t, 3); lx_log(6, "%s", t); t970_rx_err_line(t, sizeof t, 4); lx_log(6, "%s", t); }\n'
+         '  if (which == 3 || which == 4) { t970_rxerr_polled = 1; t970_rx_err_line(b, n, which); }\n'
+         '  else if (which == 1) snprintf(b, n, "tx ack/nack/free small'),
+    ])
     return qrtr
 
 
