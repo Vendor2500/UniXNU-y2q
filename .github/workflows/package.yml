@@ -554,7 +554,7 @@ jobs:
           ccache -s -v || true
           ccache --print-stats || true
       - name: save ccache
-        if: always() && !inputs.no_cache
+        if: ${{ !cancelled() && !inputs.no_cache }}   # a cancelled run saved an empty cache and the next run compiled everything
         uses: actions/cache/save@v4
         with:
           path: .ccache
