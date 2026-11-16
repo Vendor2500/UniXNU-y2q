@@ -317,7 +317,11 @@ def t970_edits(gen, mhi, shared, out):
         ('volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n',
          'volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n'
          'extern int PE_parse_boot_argn(const char *, void *, int);\n'
-         'unsigned nw_wifi_t970_rxnwifi, nw_wifi_t970_dhcpb;   /* boot arguments pong_wifi_rxnwifi, pong_wifi_dhcpb (edit 14) */\n'),
+         '/* 11-16 device result: with the Ethernet RX decap offload no broadcast frame ever reached the host (DHCP offers sent\n'
+         ' * by broadcast were lost; it only worked where the server unicast them); with native wifi frames broadcast arrives\n'
+         ' * and DHCP completes (half84w: broadcast 237, dhcp in 26, 192.168.1.3). So native wifi is the default now;\n'
+         ' * pong_wifi_rxnwifi=0 brings the Ethernet decap back. */\n'
+         'unsigned nw_wifi_t970_rxnwifi = 1, nw_wifi_t970_dhcpb;   /* boot arguments pong_wifi_rxnwifi, pong_wifi_dhcpb (edit 14) */\n'),
         ('  g_vif->offload_flags = IEEE80211_OFFLOAD_ENCAP_ENABLED | IEEE80211_OFFLOAD_DECAP_ENABLED;',
          '  PE_parse_boot_argn("pong_wifi_rxnwifi", &nw_wifi_t970_rxnwifi, sizeof nw_wifi_t970_rxnwifi);\n'
          '  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n'
