@@ -1,0 +1,125 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 63d5a67..f4b0e76 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -1514,6 +1514,64 @@ cmd_handle_temp(void)
+ 	send_str(reply);
+ }
+ 
++/*
++ * usbrole (z106): where USB-C host mode would start from, read only (work/usbhost_scope/PLAN.md step 1).
++ * Line 1: DWC3 globals. GCTL[13:12] PRTCAPDIR (1 host, 2 device), GSTS[1:0] CURMOD (0 device, 1 host),
++ * GHWPARAMS0[2:0] mode (2 = dual role), DSTS[2:0] connect speed. QSCRATCH (Qualcomm glue): GENERAL_CFG 0x08,
++ * HS_PHY_CTRL 0x10 (UTMI_OTG_VBUS_VALID bit 20, SW_SESSVLD_SEL bit 28), SS_PHY_CTRL 0x30, PWR_EVNT_IRQ_STAT 0x58.
++ * Charger: cached CHG_CNFG_00 (0xb7, mode nibble; OTG boost = bits 1 and 3) and CHG_CNFG_02 (0xb9, OTG_ILIM [7:6]).
++ * Line 2: the MAX77705 USBC registers, read by the battery worker on its next tick (10 s) once asked, never from
++ * this thread (both bit-bang the same pins, no lock). Meanings: ref/gts7xl-mainline docs/usbc-dp-research.md
++ * (origin) "MAX77705 CCIC protocol". `usbrole off` stops those reads. `usbrole xhci` adds the xHCI capability
++ * registers at core + 0: never read in device mode on this board, so opt-in.
++ */
++extern uint8_t pong_ccic_regs[13];
++extern volatile uint32_t pong_ccic_want;
++extern uint64_t pong_ccic_stamp;
++
++static void
++cmd_handle_usbrole(const char *args)
++{
++	char reply[400];
++	uint64_t age_ns = 0;
++	const uint8_t *c = pong_ccic_regs;
++
++	if (strcmp(args, " off") == 0) {
++		pong_ccic_want = 0;
++		send_str("usbrole: ccic reads off\n");
++		return;
++	}
++	if (!core_base || !qscratch_base) {
++		send_str("usbrole: dwc3 not mapped\n");
++		return;
++	}
++	pong_ccic_want = 1;
++	uint32_t gctl = core_r(DWC3_GCTL), gsts = core_r(0xC118), hw0 = core_r(0xC140), dsts = core_r(0xC70C);
++	snprintf(reply, sizeof(reply),
++	    "usbrole: id %08x gctl %08x prtcap %u gsts %08x curmod %u hw0 %08x mode %u hw1 %08x hw3 %08x u2phy %08x "
++	    "u3pipe %08x dcfg %08x dsts %08x spd %u | qs cfg %08x hs %08x ss %08x pwr %08x | chg cnfg00 %02x 02 %02x %s\n",
++	    core_r(0xC120), gctl, (gctl >> 12) & 3, gsts, gsts & 3, hw0, hw0 & 7, core_r(0xC144), core_r(0xC14C),
++	    core_r(DWC3_GUSB2PHYCFG(0)), core_r(0xC2C0), core_r(0xC700), dsts, dsts & 7, qs_r(0x08), qs_r(0x10), qs_r(0x30),
++	    qs_r(0x58), pong_charger_cnfg[0], pong_charger_cnfg[2], pong_charger_cnfg[13] ? "ok" : "none");
++	send_str(reply);
++	if (strcmp(args, " xhci") == 0) {
++		snprintf(reply, sizeof(reply), "usbrole xhci: cap %08x hcs1 %08x hcs2 %08x hcs3 %08x hcc1 %08x dboff %08x rtsoff %08x\n",
++		    core_r(0x00), core_r(0x04), core_r(0x08), core_r(0x0C), core_r(0x10), core_r(0x14), core_r(0x18));
++		send_str(reply);
++	}
++	if (!pong_ccic_stamp) {
++		send_str("usbrole ccic: none yet (battery worker reads within 10 s; ask again)\n");
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - pong_ccic_stamp, &age_ns);
++	snprintf(reply, sizeof(reply),
++	    "usbrole ccic: age %llus hw %02x fw %02x st1 %02x vbadc %u st2 %02x bc %02x chgtyp %u cc0 %02x ccstat %u ccpin %u "
++	    "cci %u cc1 %02x pd0 %02x pd1 %02x dfp %u masks %02x %02x %02x %02x\n",
++	    age_ns / NSEC_PER_SEC, c[0], c[1], c[2], c[2] >> 4, c[3], c[4], c[4] & 3, c[5], c[5] & 7, c[5] >> 6, (c[5] >> 4) & 3,
++	    c[6], c[7], c[8], c[8] >> 7, c[9], c[10], c[11], c[12]);
++	send_str(reply);
++}
++
+ /* tgprefer NAME N: the thread group of every process called NAME prefers cluster N (0 Silver, 1 Gold, 2 Prime). */
+ struct tgprefer_state {
+ 	char name[24];
+@@ -2037,6 +2095,8 @@ dispatch_command(const char *cmd)
+ 		hp_reply[0] = '\0';
+ 		(void)pong_haptic_usb(hp_reply, sizeof(hp_reply), cmd + 4);
+ 		send_str(hp_reply[0] ? hp_reply : "buzz: no reply\n");
++	} else if (strcmp(cmd, "usbrole") == 0 || strncmp(cmd, "usbrole ", 8) == 0) {
++		cmd_handle_usbrole(cmd + 7);
+ 	} else if (strcmp(cmd, "temp") == 0) {
+ 		cmd_handle_temp();
+ 	} else if (strcmp(cmd, "bl") == 0) {
+diff --git a/iokit/Kernel/IOPMPowerSource.cpp b/iokit/Kernel/IOPMPowerSource.cpp
+index 2724c8e..7474bd0 100644
+--- a/iokit/Kernel/IOPMPowerSource.cpp
++++ b/iokit/Kernel/IOPMPowerSource.cpp
+@@ -606,6 +606,10 @@ extern "C" { extern int pong_battery_last_permille; int pong_battery_last_permil
+ /* the gauge's last current in mA (negative = discharging), for USB `temp`: standby drain is read off this */
+ extern "C" { extern int pong_battery_last_ma; int pong_battery_last_ma = -32768; }
+ extern "C" { extern uint8_t pong_charger_cnfg[14]; uint8_t pong_charger_cnfg[14]; }   /* USB `temp`; [13] = valid */
++/* USB `usbrole` (z106): MAX77705 USBC registers, see readCcic() */
++extern "C" { extern uint8_t pong_ccic_regs[13]; uint8_t pong_ccic_regs[13]; }
++extern "C" { extern volatile uint32_t pong_ccic_want; volatile uint32_t pong_ccic_want; }
++extern "C" { extern uint64_t pong_ccic_stamp; uint64_t pong_ccic_stamp; }   /* mach time of the last full read; 0 = none */
+ namespace {
+ constexpr vm_offset_t kT970TlmmNorth = 0x0f900000;
+ constexpr vm_size_t kT970TlmmBytes = 0x100000;
+@@ -734,6 +738,21 @@ static int readReg(uint8_t address, uint8_t reg, uint8_t *out, unsigned count) {
+ 	busStop();
+ 	return 0;
+ }
++/*
++ * USB `usbrole` (z106): the MAX77705 USBC status registers at 0x25, read only and only while asked (pong_ccic_want).
++ * 0x02-0x05 are clear-on-read interrupt flags and are skipped. Read here, not from the USB thread, because both
++ * bit-bang the same two pins with no lock between them. Order: 00 HW_REV, 01 FW_REV, 06 USBC_STATUS1, 07 USBC_STATUS2,
++ * 08 BC_STATUS, 0a CC_STATUS0, 0b CC_STATUS1, 0c PD_STATUS0, 0d PD_STATUS1, 0e-11 the four interrupt masks.
++ */
++static const uint8_t kCcicRegs[13] = { 0x00, 0x01, 0x06, 0x07, 0x08, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11 };
++static void readCcic(void) {
++	uint8_t v[13] = {};
++	for (unsigned i = 0; i < 13; ++i) {
++		if (readReg(0x25, kCcicRegs[i], &v[i], 1)) return;
++	}
++	for (unsigned i = 0; i < 13; ++i) pong_ccic_regs[i] = v[i];
++	pong_ccic_stamp = mach_absolute_time();
++}
+ /*
+  * The one write. Samsung's charger driver arms the MAX77705 charger watchdog (CHG_CNFG_00 0xb7 bit 4 WDTEN)
+  * and kicks it (max77705_chg_set_wdtmr_kick: CHG_CNFG_06 0xbd bits 1:0 = 01). Under iPadOS nobody did, and the
+@@ -971,6 +990,9 @@ static void batteryWorker(void *arg, wait_result_t) {
+ 				lastCc0 = lastBc = 0xff;
+ 			}
+ 		}
++		if (pong_ccic_want) {
++			readCcic();
++		}
+ 		if (tick++ % sampleTicks) {
+ 			IOSleep(10000);
+ 			continue;
