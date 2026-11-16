@@ -1,0 +1,101 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index a0dbf7e..6585d89 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -108,6 +108,7 @@ extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_
+ extern int pong_metal_diag_usb(char *out, size_t cap);   /* `metaldiag` (NativeAdrenoPublish.cpp, T970 patch) */
+ extern int pong_gpu_diag_usb(char *reply, size_t cap);   /* `gpudiag` (bsd/kern/kern_exit.c, z93) */
+ extern int pong_wifi_join_usb(char *reply, size_t cap, const char *cmd);   /* `wifijoin` (pong_wifi_tools.c, z92) */
++extern int pong_iobusy_usb(char *reply, size_t cap);   /* `iobusy` (IOService.cpp, z119) */
+ extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+@@ -2208,6 +2209,11 @@ dispatch_command(const char *cmd)
+ 
+ 		(void)pong_wifi_join_usb(wj_reply, sizeof(wj_reply), cmd);
+ 		send_str(wj_reply);
++	} else if (strcmp(cmd, "iobusy") == 0) {
++		static char ib_reply[1500];
++
++		(void)pong_iobusy_usb(ib_reply, sizeof(ib_reply));
++		send_str(ib_reply);
+ 	} else if (strcmp(cmd, "metaldiag") == 0) {
+ 		static char md_reply[700];
+ 
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 0311016..d90975e 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -5843,6 +5843,72 @@ IOService::waitQuietWithOptions( uint64_t timeout, IOOptionBits options )
+ 	return ret;
+ }
+ 
++/*
++ * z119, SM-T970: USB `iobusy` lists what IOKitWaitQuiet waits for: the busy leaves of the service plane (the walk
++ * waitQuietWithOptions makes when it times out). configd's InterfaceNamer waits for IOKit to go quiet before it names
++ * interfaces, and SCNetworkInterfaceCopyAll waits for InterfaceNamer, so while something stays busy wifid stalls in it and
++ * SpringBoard (Control Center, Wi-Fi long press) and Settings stall behind wifid (work/freeze_1116_141521.txt). Read only.
++ */
++extern "C" int pong_iobusy_usb(char *reply, size_t cap);
++extern "C" int
++pong_iobusy_usb(char *reply, size_t cap)
++{
++	IOService *          root = IOService::getServiceRoot();
++	IORegistryIterator * iter = NULL;
++	OSOrderedSet *       set = NULL;
++	OSOrderedSet *       leaves = NULL;
++	IOService *          next;
++	size_t               n = 0;
++	int                  count = 0, l;
++
++	if (!reply || cap < 96) {
++		return 0;
++	}
++	reply[0] = '\0';
++	if (!root) {
++		return snprintf(reply, cap, "iobusy: no service root\n");
++	}
++	l = snprintf(reply, cap, "iobusy: root busy %u |", root->getBusyState());
++	n = l > 0 ? (size_t)l : 0;
++	iter = IORegistryIterator::iterateOver(root, gIOServicePlane, kIORegistryIterateRecursively);
++	if (iter) {
++		set = iter->iterateAll();
++	}
++	leaves = OSOrderedSet::withCapacity(4);
++	if (set && leaves) {
++		set->setObject(root);
++		while ((next = (IOService *) set->getLastObject())) {
++			if (next->getBusyState()) {
++				IOService * parent = next;
++
++				leaves->setObject(next);
++				while ((parent = parent->getProvider())) {
++					set->removeObject(parent);
++					leaves->removeObject(parent);
++				}
++			}
++			set->removeObject(next);
++		}
++		while ((next = (IOService *) leaves->getLastObject())) {
++			if (n + 1 < cap) {
++				l = snprintf(reply + n, cap - n, " '%s' %s state %x busy %u;", next->getName(),
++				    next->getMetaClass()->getClassName(), (uint32_t)next->getState(), next->getBusyState());
++				n += l > 0 ? (size_t)l : 0;
++			}
++			count++;
++			leaves->removeObject(next);
++		}
++	}
++	OSSafeReleaseNULL(leaves);
++	OSSafeReleaseNULL(set);
++	OSSafeReleaseNULL(iter);
++	if (n + 1 >= cap) {
++		n = cap - 24;
++	}
++	l = snprintf(reply + n, cap - n, " %d busy leaves\n", count);
++	return (int)(n + (l > 0 ? (size_t)l : 0));
++}
++
+ IOReturn
+ IOService::waitQuiet( uint64_t timeout )
+ {
