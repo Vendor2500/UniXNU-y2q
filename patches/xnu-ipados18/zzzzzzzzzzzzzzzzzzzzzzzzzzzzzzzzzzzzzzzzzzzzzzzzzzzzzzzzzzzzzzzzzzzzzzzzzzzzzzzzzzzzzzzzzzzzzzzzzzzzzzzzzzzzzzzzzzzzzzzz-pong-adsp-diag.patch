@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index 8e9929f..d71a2be 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -733,8 +733,28 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 		    apr && apr->glink && apr->glink->up ? 1u : 0u, ad.apr_rx, ad.apr_op, ad_nch, ad.note[0] ? ad.note : "-");
+ 		return 0;
+ 	}
++	if (args && strcmp(args, "audio") == 0) {
++		/* iokit/Kernel/T970Audio.cpp's diagnostics (rui's arrays; their meaning is in that file's comments) */
++		extern volatile int32_t t970_audio_stats[16], t970_audio_cmd[16], t970_audio_service[8];
++		extern volatile uint32_t t970_audio_dma[8], t970_audio_amp[4][4], t970_audio_i2c[3], t970_audio_halt;
++
++		AD_ADD("adsp audio: stage=%d err=%d answers=%d sent=%d op=%#x core=%d fwk=%#x copp=%d periods=%d/%d/%d cmd",
++		    t970_audio_stats[0], t970_audio_stats[1], t970_audio_stats[2], t970_audio_stats[3], (unsigned)t970_audio_stats[4],
++		    t970_audio_stats[5], (unsigned)t970_audio_stats[6], t970_audio_stats[10], t970_audio_stats[12], t970_audio_stats[13],
++		    t970_audio_stats[14]);
++		for (unsigned i = 0; i < 16; i++) {
++			AD_ADD("%c%d", i ? ',' : '=', t970_audio_cmd[i]);
++		}
++		AD_ADD(" dma=%#x/%#x amp", t970_audio_dma[0], t970_audio_dma[6]);
++		for (unsigned i = 0; i < 4; i++) {
++			AD_ADD("%c%#x:%#x", i ? ',' : '=', t970_audio_amp[i][0], t970_audio_amp[i][1]);
++		}
++		AD_ADD(" i2c=%u/%u/%u svc=%d/%d halt=%#x\n", t970_audio_i2c[0], t970_audio_i2c[1], t970_audio_i2c[2],
++		    t970_audio_service[0], t970_audio_service[1], t970_audio_halt);
++		return 0;
++	}
+ 	if (args && *args) {
+-		snprintf(reply, cap, "adsp: usage adsp | adsp boot | adsp stat\n");
++		snprintf(reply, cap, "adsp: usage adsp | adsp boot | adsp stat | adsp audio\n");
+ 		return -1;
+ 	}
+ 
+@@ -764,8 +784,17 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 		if (!ad_started) {
+ 			fe = pong_q6_fw_check(AD_FW, &ad_img, &fsize);
+ 		}
+-		AD_ADD("adsp: check slave=%#x pas1=%lld/%llu region_ram_pages=%u fw=%s e=%d size=%llu", slave, (long long)pas,
+-		    (unsigned long long)r1, pong_q6_ram_pages(AD_REGION, AD_REGION_SIZE), AD_FW, fe, (unsigned long long)fsize);
++		AD_ADD("adsp: check slave=%#x pas1=%lld/%llu", slave, (long long)pas, (unsigned long long)r1);
++		/* the same query for PAS 12 (SLPI) and 13 (GPU zap, which authenticates on this board): if 13 answers 0/0 too, the
++		 * query says nothing here and pas1=0/0 is no reason to hold `adsp boot` back (11-16 half79n: pas1=0/0) */
++		for (unsigned id = 12; id <= 13; id++) {
++			const int64_t p = pong_q6_scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), id, 0, 0, &r1);
++
++			AD_ADD(" pas%u=%lld/%llu", id, (long long)p, (unsigned long long)r1);
++		}
++		/* the DMA buffer of t970-audio (pil_cvp_region, first 512 KiB) must not be XNU RAM either */
++		AD_ADD(" region_ram_pages=%u cvp_ram_pages=%u fw=%s e=%d size=%llu", pong_q6_ram_pages(AD_REGION, AD_REGION_SIZE),
++		    pong_q6_ram_pages(0x8de00000ULL, 0x80000ULL), AD_FW, fe, (unsigned long long)fsize);
+ 		if (fe == 0) {
+ 			AD_ADD(" elf64=%u segs=%u span=%#llx/%#llx reloc=%u", ad_img.elf64, ad_img.count,
+ 			    (unsigned long long)qcom_mdt_span(&ad_img), (unsigned long long)AD_REGION_SIZE, ad_img.relocatable);
