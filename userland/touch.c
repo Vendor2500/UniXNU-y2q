@@ -54,6 +54,8 @@ static IOHIDEventRef (*IOHIDEventCreateKeyboardEvent)(CFAllocatorRef allocator, 
     uint32_t usage_page,uint32_t usage,Boolean down,uint32_t options);
 static IOHIDEventRef (*IOHIDEventCreateMouseEvent)(CFAllocatorRef allocator, uint64_t time,
     double x, double y, double z, uint32_t buttonMask, uint32_t options);
+static IOHIDEventRef (*IOHIDEventCreateScrollEvent)(CFAllocatorRef allocator, uint64_t time,
+    double x, double y, double z, uint32_t options);
 static void (*IOHIDEventAppendEvent)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
 static void (*IOHIDEventSetIntegerValue)(IOHIDEventRef event, uint32_t field, CFIndex value);
 
@@ -109,7 +111,29 @@ struct service {
 	CFMutableDictionaryRef properties;
 	bool opened;
 	bool display;
+	bool trackpad;                  /* the pogo trackpad (Generic Desktop / Mouse) */
 };
+
+/*
+ * Pogo trackpad haptics experiment, boot argument pong_pogo_mt=<bits> (off by default, not tried on the device yet):
+ *   1  the trackpad says it has an actuator (MultitouchSupport property names: ActuationSupported, SupportsSilentClick)
+ *   2  log what the event server sets on it and the output events it sends (first 48)
+ *   4  an output event, or a property whose name mentions Actuat/Haptic/Click, pulses the motor (kern.pong_haptic,
+ *      which needs the boot argument pong_haptic=1)
+ * Whether backboardd sends a virtual service anything for a haptic request is what the device has to show first.
+ */
+static int pogo_mt;
+static int pogo_mt_logged;
+
+static void
+pogo_haptic_request(const char *what)
+{
+	int ms = 15;
+
+	if (!(pogo_mt & 4)) return;
+	if (sysctlbyname("kern.pong_haptic", NULL, NULL, &ms, sizeof(ms)) != 0)
+		say("Pong touch HID: pogo haptic (%s) refused: %s\n", what, strerror(errno));
+}
 
 /* The properties of a service of ours; the event server asks for them one at a time. */
 static CFTypeRef
@@ -135,6 +159,20 @@ static Boolean
 service_set_property(__attribute__((unused)) void *target, void *refcon, __attribute__((unused)) IOHIDServiceClientRef service, CFStringRef key,
     CFTypeRef value)
 {
+	if (((struct service *)refcon)->trackpad && key != NULL) {
+		if ((pogo_mt & 2) && pogo_mt_logged < 48) {
+			char name[96] = "?";
+
+			pogo_mt_logged++;
+			CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
+			say("Pong touch HID: pogo trackpad set %s\n", name);
+		}
+		CFRange none = {kCFNotFound, 0};
+		if (CFStringFind(key, CFSTR("Actuat"), 0).location != none.location ||
+		    CFStringFind(key, CFSTR("Haptic"), 0).location != none.location ||
+		    CFStringFind(key, CFSTR("Click"), 0).location != none.location)
+			pogo_haptic_request("property");
+	}
 	/* the last thing the event server does when it opens a service; see make_service() */
 	if (key != NULL && value != NULL && CFEqual(key, CFSTR("DeviceOpenedByEventSystem")) &&
 	    CFGetTypeID(value) == CFBooleanGetTypeID()) {
@@ -159,9 +197,23 @@ service_notification(__attribute__((unused)) void *target, __attribute__((unused
 {
 }
 
+/* Output events: only the pogo trackpad takes them (the haptics experiment); the others answer unsupported, as before. */
+static int
+service_set_output_event(__attribute__((unused)) void *target, void *refcon, __attribute__((unused)) IOHIDServiceClientRef service,
+    __attribute__((unused)) IOHIDEventRef event)
+{
+	if (!((struct service *)refcon)->trackpad || !pogo_mt) return (int)0xe00002c7;  /* kIOReturnUnsupported */
+	if ((pogo_mt & 2) && pogo_mt_logged < 48) {
+		pogo_mt_logged++;
+		say("Pong touch HID: pogo trackpad output event\n");
+	}
+	pogo_haptic_request("output event");
+	return 0;
+}
+
 static const struct virtual_service_callbacks service_callbacks = {
 	.version = 2, .notification = service_notification, .setProperty = service_set_property,
-	.copyProperty = service_copy_property,
+	.copyProperty = service_copy_property, .setOutputEvent = service_set_output_event,
 };
 
 /*
@@ -206,6 +258,11 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	CFDictionarySetValue(properties, CFSTR("ProductID"), zero);
 	if (display) {
 		CFDictionarySetValue(properties, CFSTR("DisplayIntegrated"), kCFBooleanTrue);
+	}
+	made->trackpad = page == HID_PAGE_GENERIC_DESKTOP && usage == HID_USAGE_MOUSE;
+	if (made->trackpad && (pogo_mt & 1)) {
+		CFDictionarySetValue(properties, CFSTR("ActuationSupported"), kCFBooleanTrue);
+		CFDictionarySetValue(properties, CFSTR("SupportsSilentClick"), kCFBooleanTrue);
 	}
 	/* the dictionary stays: it is what service_copy_property() answers from */
 	made->properties = properties;
@@ -306,17 +363,26 @@ release_contacts(IOHIDServiceClientRef screen,uint64_t time)
     }
 }
 
-static int tp_rot = 0; /* bit 0: invert X, bit 1: invert Y, bit 2: swap XY */
+/* pong_pogo_rot: bit 0 invert X, bit 1 invert Y, bit 2 swap XY, bit 3 invert scrolling.
+ * pong_pogo_scroll: raw trackpad units per scroll step (default 8). pong_pogo_mt: see pogo_mt. */
+static int tp_rot = 0;
+static int tp_scroll_div = 8;
+static int
+boot_number(const char *args, const char *key, int fallback)
+{
+    const char *p = strstr(args, key);
+    return p ? atoi(p + strlen(key)) : fallback;
+}
 static void init_tp_rot(void)
 {
-    char bootargs[512] = {0};
+    char bootargs[1100] = {0};
     size_t len = sizeof(bootargs) - 1;
     if (sysctlbyname("kern.bootargs", bootargs, &len, NULL, 0) == 0) {
-        char *p = strstr(bootargs, "pong_pogo_rot=");
-        if (p) {
-            tp_rot = atoi(p + 14);
-            say("Pong touch HID: pogo trackpad rotation flag=%d\n", tp_rot);
-        }
+        tp_rot = boot_number(bootargs, "pong_pogo_rot=", 0);
+        tp_scroll_div = boot_number(bootargs, "pong_pogo_scroll=", 8);
+        if (tp_scroll_div < 1) tp_scroll_div = 1;
+        pogo_mt = boot_number(bootargs, "pong_pogo_mt=", 0);
+        if (tp_rot || pogo_mt) say("Pong touch HID: pogo rot=%d scroll=%d mt=%d\n", tp_rot, tp_scroll_div, pogo_mt);
     }
 }
 
@@ -353,13 +419,13 @@ input_thread(void *unused)
     while ((length=read(device,&sample,sizeof(sample)))>0 || (length<0 && errno==EINTR)) {
         if (length<0) continue;
         if (length!=(ssize_t)sizeof(sample)) continue;
-        if (sample.type<PONG_TOUCH_DOWN || sample.type>PONG_CONN_CHANGE) continue;
+        if (sample.type<PONG_TOUCH_DOWN || sample.type>PONG_POINTER_SCROLL) continue;
 
         if (sample.type == PONG_CONN_CHANGE) {
             if (sample.x) {
                 say("Pong touch HID: Pogo connected; opening keyboard & trackpad\n");
                 if (!pogo_keyboard && IOHIDEventCreateKeyboardEvent)
-                    pogo_keyboard = make_service(client, "Pong Pogo Keyboard", HID_PAGE_KEYBOARD, HID_USAGE_KEYBOARD_OR_KEYPAD, false);
+                    pogo_keyboard = make_service(client, "Pong Pogo Keyboard", HID_PAGE_GENERIC_DESKTOP, HID_USAGE_KEYBOARD_OR_KEYPAD, false);
                 if (!pogo_trackpad && IOHIDEventCreateMouseEvent)
                     pogo_trackpad = make_service(client, "Pong Pogo Trackpad", HID_PAGE_GENERIC_DESKTOP, HID_USAGE_MOUSE, false);
             } else {
@@ -397,14 +463,28 @@ input_thread(void *unused)
             if (pogo_trackpad && IOHIDEventCreateMouseEvent) {
                 int32_t raw_dx = (int32_t)sample.x;
                 int32_t raw_dy = (int32_t)sample.y;
-                /* Report §1.6 orientation: X_screen = 1600 - 1 - Y_raw, Y_screen = X_raw */
-                int32_t dx = -raw_dy;
-                int32_t dy = raw_dx;
+                /* The cover's raw x/y already match the pointer directions (JeyKul gts7xl-mainline 0046) */
+                int32_t dx = raw_dx;
+                int32_t dy = raw_dy;
                 if (tp_rot & 1) dx = -dx;
                 if (tp_rot & 2) dy = -dy;
                 if (tp_rot & 4) { int32_t tmp = dx; dx = dy; dy = tmp; }
                 uint32_t btn_mask = (sample.finger != 0 || trackpad_button_down) ? 1 : 0;
                 IOHIDEventRef event = IOHIDEventCreateMouseEvent(NULL, sample.time, (double)dx, (double)dy, 0.0, btn_mask, 0);
+                if (event) {
+                    IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+                    IOHIDVirtualServiceClientDispatchEvent(pogo_trackpad, event);
+                    CFRelease(event);
+                }
+            }
+            continue;
+        }
+
+        if (sample.type == PONG_POINTER_SCROLL) {
+            if (pogo_trackpad && IOHIDEventCreateScrollEvent) {
+                double sx = (double)(int32_t)sample.x / tp_scroll_div, sy = (double)(int32_t)sample.y / tp_scroll_div;
+                if (tp_rot & 8) { sx = -sx; sy = -sy; }
+                IOHIDEventRef event = IOHIDEventCreateScrollEvent(NULL, sample.time, sx, sy, 0.0, 0);
                 if (event) {
                     IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
                     IOHIDVirtualServiceClientDispatchEvent(pogo_trackpad, event);
@@ -550,6 +630,7 @@ pong_touch_start(void)
     /* Physical touches remain available if this optional wake API is absent. */
     IOHIDEventCreateKeyboardEvent=(__typeof__(IOHIDEventCreateKeyboardEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateKeyboardEvent");
     IOHIDEventCreateMouseEvent=(__typeof__(IOHIDEventCreateMouseEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateMouseEvent");
+    IOHIDEventCreateScrollEvent=(__typeof__(IOHIDEventCreateScrollEvent))dlsym(RTLD_DEFAULT,"IOHIDEventCreateScrollEvent");
     IOHIDUserDeviceCreate=(__typeof__(IOHIDUserDeviceCreate))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceCreate");
     IOHIDUserDeviceHandleReportWithTimeStamp=(__typeof__(IOHIDUserDeviceHandleReportWithTimeStamp))dlsym(RTLD_DEFAULT,"IOHIDUserDeviceHandleReportWithTimeStamp");
     RESOLVE(IOHIDEventAppendEvent);

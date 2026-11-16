@@ -1,0 +1,229 @@
+diff --git a/bsd/dev/pong_haptic.c b/bsd/dev/pong_haptic.c
+index 76dbb3f..b727896 100644
+--- a/bsd/dev/pong_haptic.c
++++ b/bsd/dev/pong_haptic.c
+@@ -19,6 +19,9 @@
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc_internal.h>
++#include <sys/sysctl.h>
+ #include "qcom/QcomRpmh.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -237,6 +240,28 @@ pong_haptic_pulse(uint32_t ms)
+ 	return busy ? EBUSY : 0;
+ }
+ 
++/* kern.pong_haptic: read = pulses done; write N = one N ms pulse (0 or EINVAL/EBUSY). Off unless the boot argument
++ * pong_haptic=1, and only from backboardd, where userland/touch.c turns HID haptic requests into pulses (z112, not tried
++ * on the device yet). */
++static int
++hp_sysctl SYSCTL_HANDLER_ARGS
++{
++	int value = (int)hs.done, on = 0;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || !req->newptr) {
++		return error;
++	}
++	proc_t process = current_proc();
++	if (!PE_parse_boot_argn("pong_haptic", &on, sizeof(on)) || on != 1 || !process ||
++	    strcmp(process->p_comm, "backboardd") != 0) {
++		return EPERM;
++	}
++	return value > 0 ? pong_haptic_pulse((uint32_t)value) : EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, pong_haptic, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, hp_sysctl, "I", "Pong vibration motor: write a pulse in ms");
++
+ /* USB `buzz` (status), `buzz N` (one N ms pulse, then status of the previous ones). */
+ int
+ pong_haptic_usb(char *reply, size_t cap, const char *args)
+diff --git a/bsd/dev/pong_input.c b/bsd/dev/pong_input.c
+index bc99929..9d23de0 100644
+--- a/bsd/dev/pong_input.c
++++ b/bsd/dev/pong_input.c
+@@ -29,7 +29,7 @@ static int input_major=-1;
+ void
+ pong_touch_post(uint32_t type,uint32_t finger,uint32_t x,uint32_t y)
+ {
+-    if (type<PONG_TOUCH_DOWN || type>PONG_CONN_CHANGE) return;
++    if (type<PONG_TOUCH_DOWN || type>PONG_POINTER_SCROLL) return;
+     if (type==PONG_BUTTON_DOWN || type==PONG_BUTTON_UP) {
+         if (finger>=3u) return;
+     } else if (type<=PONG_TOUCH_UP) {
+diff --git a/bsd/dev/pong_pogo.c b/bsd/dev/pong_pogo.c
+index b28199d..b52bd80 100644
+--- a/bsd/dev/pong_pogo.c
++++ b/bsd/dev/pong_pogo.c
+@@ -70,6 +70,14 @@ static vm_offset_t pin_va[P_COUNT];
+ 
+ static uint32_t pogo_i2c_delay_us = 4; /* ~100 kHz */
+ static volatile int pogo_run;           /* 1 = read the cover; 0 = power it off and idle */
++/* Options, off by default (boot argument pong_pogo_opt=<bits>, USB `pogo opt N`), not tried on the device yet (z112):
++ *   1  two fingers on the trackpad scroll (PONG_POINTER_SCROLL, raw deltas; scale and direction are userland's)
++ *   2  a trackpad click pulses the vibration motor for pong_pogo_buzz ms (default 20; the cover clicks physically too) */
++#define POGO_OPT_SCROLL         1u
++#define POGO_OPT_CLICK_BUZZ     2u
++static volatile uint32_t pogo_opt;
++static uint32_t pogo_buzz_ms = 20;
++extern int pong_haptic_pulse(uint32_t ms);
+ static int pogo_thread_started;
+ 
+ /* What USB `pogo` reports; written by the pogo thread only. */
+@@ -83,6 +91,8 @@ static struct {
+ 		uint16_t mapped;
+ 	} keys[8];
+ 	uint32_t key_count;
++	uint32_t tp_fingers, scrolls;
++	int buzz_rc;
+ } st;
+ 
+ static inline uint32_t
+@@ -359,6 +369,8 @@ static uint32_t tp_prev_x = 0;
+ static uint32_t tp_prev_y = 0;
+ static bool tp_prev_down = false;
+ static bool tp_prev_btn = false;
++static bool tp_prev_scroll = false;
++static uint32_t tp_prev_slot = 3;     /* the finger slot the pointer follows; a new slot restarts the deltas */
+ 
+ static void
+ pogo_release_trackpad(void)
+@@ -368,6 +380,7 @@ pogo_release_trackpad(void)
+ 		tp_prev_btn = false;
+ 	}
+ 	tp_prev_down = false;
++	tp_prev_scroll = false;
+ }
+ 
+ static void
+@@ -409,30 +422,51 @@ pogo_process_touchpad(const uint8_t *data, uint32_t len)
+ 	uint16_t status = data[0] | (data[1] << 8);
+ 	bool btn_left = ((status & POGO_TP_ICON_EVENT) != 0) && ((data[3] & POGO_TP_ICON_DOWN) != 0);
+ 
+-	/* Finger 0 only for now; raw x/y already match the pointer directions on this cover (0046). */
+-	const uint8_t *c = data + 4;
+-	bool down = (c[5] & POGO_TP_FINGER_EXIST) != 0;
+-	uint32_t raw_x = c[0] | (c[1] << 8);
+-	uint32_t raw_y = c[2] | (c[3] << 8);
+-
+-	if (down && raw_x < POGO_TP_MAX_X && raw_y < POGO_TP_MAX_Y) {
+-		if (tp_prev_down) {
+-			int32_t dx = (int32_t)raw_x - (int32_t)tp_prev_x;
+-			int32_t dy = (int32_t)raw_y - (int32_t)tp_prev_y;
+-			if (dx != 0 || dy != 0) {
++	/* Raw x/y already match the pointer directions on this cover (0046). */
++	uint32_t fx[3], fy[3], slot0 = 3, fingers = 0;
++	for (unsigned i = 0; i < 3; i++) {
++		const uint8_t *f = data + 4 + i * 6;
++		uint32_t x = f[0] | (f[1] << 8), y = f[2] | (f[3] << 8);
++		if ((f[5] & POGO_TP_FINGER_EXIST) && x < POGO_TP_MAX_X && y < POGO_TP_MAX_Y) {
++			if (!fingers) {
++				slot0 = i;
++			}
++			fx[fingers] = x;
++			fy[fingers] = y;
++			fingers++;
++		}
++	}
++	st.tp_fingers = fingers;
++
++	/* Two fingers (option 1) scroll by their midpoint's movement; otherwise the first finger moves the pointer.
++	 * A change between the two modes restarts the deltas, so the pointer does not jump. */
++	bool scroll = (pogo_opt & POGO_OPT_SCROLL) && fingers == 2;
++	if (fingers && (scroll ? tp_prev_scroll : tp_prev_down && slot0 == tp_prev_slot)) {
++		uint32_t px = scroll ? (fx[0] + fx[1]) / 2 : fx[0], py = scroll ? (fy[0] + fy[1]) / 2 : fy[0];
++		int32_t dx = (int32_t)px - (int32_t)tp_prev_x, dy = (int32_t)py - (int32_t)tp_prev_y;
++		if (dx != 0 || dy != 0) {
++			if (scroll) {
++				pong_touch_post(PONG_POINTER_SCROLL, 0, (uint32_t)dx, (uint32_t)dy);
++				st.scrolls++;
++			} else {
+ 				pong_touch_post(PONG_POINTER_MOVE, btn_left ? 1 : 0, (uint32_t)dx, (uint32_t)dy);
+ 			}
+ 		}
+-		tp_prev_x = raw_x;
+-		tp_prev_y = raw_y;
+-		tp_prev_down = true;
+-	} else {
+-		tp_prev_down = false;
+ 	}
++	if (fingers) {
++		tp_prev_x = scroll ? (fx[0] + fx[1]) / 2 : fx[0];
++		tp_prev_y = scroll ? (fy[0] + fy[1]) / 2 : fy[0];
++	}
++	tp_prev_scroll = scroll;
++	tp_prev_down = fingers && !scroll;
++	tp_prev_slot = slot0;
+ 
+ 	if (btn_left != tp_prev_btn) {
+ 		pong_touch_post(PONG_POINTER_BUTTON, 0, btn_left ? 1 : 0, 0);
+ 		tp_prev_btn = btn_left;
++		if (btn_left && (pogo_opt & POGO_OPT_CLICK_BUZZ)) {
++			st.buzz_rc = pong_haptic_pulse(pogo_buzz_ms);
++		}
+ 	}
+ }
+ 
+@@ -649,13 +683,21 @@ void
+ pong_pogo_init(void)
+ {
+ 	int en = 0;
++	uint32_t v;
++	if (PE_parse_boot_argn("pong_pogo_opt", &v, sizeof(v))) {
++		pogo_opt = v;
++	}
++	if (PE_parse_boot_argn("pong_pogo_buzz", &v, sizeof(v)) && v >= 10 && v <= 1000) {
++		pogo_buzz_ms = v;
++	}
+ 	if (PE_parse_boot_argn("pong_pogo", &en, sizeof(en)) && en > 0) {
+ 		printf("Pong Pogo: driver enabled via pong_pogo=%d\n", en);
+ 		pogo_start();
+ 	}
+ }
+ 
+-/* USB `pogo` (status), `pogo on` (start or resume), `pogo off` (power the cover off, stop reading). */
++/* USB `pogo` (status), `pogo on` (start or resume), `pogo off` (power the cover off, stop reading),
++ * `pogo opt N` (option bits, see pogo_opt), `pogo buzz N` (click pulse ms, 10..1000). */
+ int
+ pong_pogo_usb(char *reply, size_t cap, const char *args)
+ {
+@@ -668,8 +710,15 @@ pong_pogo_usb(char *reply, size_t cap, const char *args)
+ 		pogo_start();
+ 	} else if (args && strcmp(args, "off") == 0) {
+ 		pogo_run = 0;
++	} else if (args && strncmp(args, "opt ", 4) == 0) {
++		pogo_opt = (uint32_t)strtoul(args + 4, NULL, 0);
++	} else if (args && strncmp(args, "buzz ", 5) == 0) {
++		uint32_t ms = (uint32_t)strtoul(args + 5, NULL, 0);
++		if (ms >= 10 && ms <= 1000) {
++			pogo_buzz_ms = ms;
++		}
+ 	} else if (args && *args) {
+-		OUT("pogo: usage: pogo [on|off]\n");
++		OUT("pogo: usage: pogo [on|off|opt N|buzz MS]\n");
+ 		return -1;
+ 	}
+ 	if (!pogo_thread_started || !pin_va[P_INT]) {
+@@ -692,6 +741,7 @@ pong_pogo_usb(char *reply, size_t cap, const char *args)
+ 		}
+ 		OUT("\n");
+ 	}
++	OUT("opt=%u buzz=%ums rc=%d fingers=%u scrolls=%u\n", pogo_opt, pogo_buzz_ms, st.buzz_rc, st.tp_fingers, st.scrolls);
+ 	OUT("keys=%u", st.key_count);
+ 	uint32_t shown = st.key_count < 8 ? st.key_count : 8;
+ 	for (uint32_t i = st.key_count - shown; i < st.key_count; i++) {
+diff --git a/bsd/sys/pong_input.h b/bsd/sys/pong_input.h
+index ea1b7f5..8921192 100644
+--- a/bsd/sys/pong_input.h
++++ b/bsd/sys/pong_input.h
+@@ -12,6 +12,7 @@
+ #define PONG_POINTER_MOVE 8
+ #define PONG_POINTER_BUTTON 9
+ #define PONG_CONN_CHANGE 10
++#define PONG_POINTER_SCROLL 11 /* pogo trackpad two-finger scroll: x, y = signed deltas (z112) */
+ #define PONG_BUTTON_POWER 0
+ #define PONG_BUTTON_VOLUME_UP 1
+ #define PONG_BUTTON_VOLUME_DOWN 2
