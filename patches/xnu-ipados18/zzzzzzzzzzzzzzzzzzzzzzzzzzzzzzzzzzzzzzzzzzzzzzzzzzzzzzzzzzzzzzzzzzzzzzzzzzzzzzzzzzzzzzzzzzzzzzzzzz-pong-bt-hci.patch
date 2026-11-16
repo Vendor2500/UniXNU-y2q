@@ -1,0 +1,583 @@
+diff --git a/bsd/dev/pong_bt.c b/bsd/dev/pong_bt.c
+index d8bc3dd..1fa4463 100644
+--- a/bsd/dev/pong_bt.c
++++ b/bsd/dev/pong_bt.c
+@@ -12,6 +12,18 @@
+  *
+  * Addresses and bit meanings from UniXNU-gts7xlwifi (https://github.com/rui12366B/UniXNU-gts7xlwifi, c2aa790,
+  * BSD-2-Clause-Patent) package/T970Bluetooth.cpp:5-11, 77-82, 156-161.
++ *
++ * Second: `bthci [N] [nocts]` (z98, plan work/bt_scope/PLAN.md step 1) powers the BT side, sends HCI_Reset and
++ * Read_Local_Version to the controller's ROM at 115200 and powers it off again. The engine runs in GENI FIFO mode,
++ * polled: no DMA, so no SMMU stream and no interrupt line. Steps (each marked "[PONG_BT] H<n>" in pmsg first):
++ *   1 map  2 rails (pong_wcn_rails, the Wi-Fi votes)  3 BT_EN low, UART pins as gpio, 100 ms  4 SE6 clock 96 MHz +
++ *   branch votes  5 read FW_REV/QUP/HW_PARAM (protocol 2 = UART)  6 FIFO mode, 8N1, 115200 (16x oversampling from
++ *   QUP 2.5)  7 BT_EN high, 110 ms, pins to qup6, start RX  8 HCI_Reset  9 Read_Local_Version; then always off.
++ * N stops after step N (default 9). nocts ignores CTS (TX_TRANS_CFG bit 1) when the controller never raises it.
++ * Sequence and values: the same T970Bluetooth.cpp powerOn()/sourceClock()/branchOn()/hciIdentify() (lines 398-670);
++ * GENI register values: UniXNU/QcaBluetooth src/qbt_geni.c qbt_geni_prepare (effe4ec) with DMA mode off;
++ * FIFO status bits: Linux qcom_geni_serial.c / geni-se.h. BT_EN 76 and the rails also in JeyKul gts7xl-mainline
++ * 0006 (qca6390-pmu bt-enable-gpios). Linux gcc-sm8250.c: RCG 0x17730, 96 MHz = GPLL0 even (src 6) M/N 8/25.
+  */
+ 
+ #include <pexpert/arm64/board_config.h>
+@@ -118,9 +130,489 @@ pong_bt_usb(char *reply, size_t reply_cap, int mode)
+ 			BT_ADD(" smr[%x=%d:%x of %u/%u]", BT_STREAM, hit, value, valid, groups);
+ 		}
+ 	}
+-	BT_ADD(" se6[skip] next=btrom\n");
++	BT_ADD(" se6[skip] next=bthci\n");
+ 	pong_ramoops_diagnostic_write(line, k);
+ 	strlcpy(reply, line, reply_cap);
+ 	return 0;
+ }
++
++/* ---- step 1: `bthci` ------------------------------------------------------------------------------------------ */
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern uint64_t mach_absolute_time(void);
++extern uint32_t pong_wcn_rails(uint32_t *rc);
++int pong_bt_hci_usb(char *reply, size_t reply_cap, const char *args);
++
++#define BT_GCC_23_PHYS      (0x00100000UL + 0x23000UL)   /* wrap0 core 0x23000, core_2x 0x23008 */
++#define BT_SE6_PHYS         0x00998000UL
++#define BT_QUP0_PHYS        0x009c0000UL
++#define BT_SWCTRL           124u                         /* north tile, read only */
++
++/* GENI (qbt_geni_regs.h) plus the FIFO registers (geni-se.h) */
++#define G_FORCE_DEFAULT     0x020u
++#define G_OUTPUT            0x024u
++#define G_CGC               0x028u
++#define G_STATUS            0x040u                       /* bit 0 M active, bit 12 S active */
++#define G_M_CLK             0x048u
++#define G_S_CLK             0x04cu
++#define G_IF_DISABLE        0x064u                       /* bit 0: FIFO interface disabled (GSI only) */
++#define G_FW_REV            0x068u                       /* bits 15:8 protocol, 2 = UART */
++#define G_CLK_SEL           0x07cu
++#define G_LOOPBACK          0x22cu
++#define G_BYTE_GRAN         0x254u
++#define G_DMA_MODE          0x258u
++#define G_TX_CFG            0x25cu                       /* bit 1: ignore CTS */
++#define G_TX_PACK0          0x260u
++#define G_TX_PACK1          0x264u
++#define G_TX_WORD           0x268u
++#define G_TX_STOP           0x26cu
++#define G_TX_LEN            0x270u
++#define G_RX_CFG            0x280u
++#define G_RX_PACK0          0x284u
++#define G_RX_PACK1          0x288u
++#define G_RX_WORD           0x28cu
++#define G_RX_STALE          0x294u
++#define G_TX_PARITY         0x2a4u
++#define G_RX_PARITY         0x2a8u
++#define G_MANUAL_RFR        0x2acu
++#define G_M_CMD             0x600u                       /* opcode << 27: UART_START_TX 1 */
++#define G_M_CTRL            0x604u                       /* 2 abort */
++#define G_M_IRQ_EN          0x614u
++#define G_M_CLEAR           0x618u
++#define G_S_CMD             0x630u                       /* UART_START_READ 1, param bit 7 RFR open */
++#define G_S_CTRL            0x634u
++#define G_S_IRQ_EN          0x644u
++#define G_S_CLEAR           0x648u
++#define G_TX_FIFO           0x700u
++#define G_RX_FIFO           0x780u
++#define G_TX_FIFO_STATUS    0x800u                       /* bits 27:0 words */
++#define G_RX_FIFO_STATUS    0x804u                       /* 24:0 words, 31 last, 30:28 valid bytes of the last */
++#define G_RX_RFR_WM         0x814u
++#define G_GSI_EVENT         0xe18u
++#define G_IRQ_EN            0xe1cu
++#define G_HW_PARAM0         0xe24u                       /* 21:16 TX FIFO depth (words) */
++#define G_HW_PARAM1         0xe28u                       /* 21:16 RX FIFO depth */
++#define G_DMA_CFG           0xe30u
++#define G_RFR_OFF           0x80000002u
++
++#define BT_PIN_IDLE(g)      ((g) >= 18 ? 3u : 1u)        /* gpio: CTS/RTS pull-down, TX/RX pull-up (rui) */
++#define BT_EN_CFG           (7u << 6 | 1u << 9)          /* gpio, 16 mA, output */
++
++static vm_offset_t g_bt_gcc23, g_bt_se, g_bt_qup, g_bt_sw;
++
++#define BT_RD(va, off)      (*(const volatile uint32_t *)((va) + (off)))
++
++static void
++bt_wr(vm_offset_t va, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(va + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint64_t
++bt_now_us(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++bt_spin_us(uint32_t us)
++{
++	uint64_t end = bt_now_us() + us;
++
++	while (bt_now_us() < end) {
++	}
++}
++
++static void
++bt_mark(int step)
++{
++	char m[20];
++	int n = snprintf(m, sizeof(m), "[PONG_BT] H%d\n", step);
++
++	if (n > 0) {
++		pong_ramoops_diagnostic_write(m, n);
++	}
++}
++
++/* pin index i of pong_bt_usb's table (0..3 = GPIO 16..19, 4 = BT_EN 76): IN_OUT first, then CFG (rui setPin) */
++static void
++bt_pin(unsigned i, uint32_t cfg, int level)
++{
++	if (level >= 0) {
++		bt_wr(g_bt_pin[i], 4, level ? 2u : 0u);
++	}
++	bt_wr(g_bt_pin[i], 0, cfg);
++}
++
++/* bit i: level of GPIO 16+i; bit 4 BT_EN driven high; bit 5 SW_CTRL (124) */
++static uint32_t
++bt_pins(void)
++{
++	uint32_t w = 0;
++
++	for (unsigned i = 0; i < 4; i++) {
++		w |= (BT_RD(g_bt_pin[i], 4) & 1u) << i;
++	}
++	w |= ((BT_RD(g_bt_pin[4], 4) >> 1) & 1u) << 4;
++	w |= (BT_RD(g_bt_sw, 4) & 1u) << 5;
++	return w;
++}
++
++/* Abort whatever the engine runs and clear its status (rui stopEngine, FIFO mode: no DMA resets). */
++static bool
++bt_engine_stop(void)
++{
++	unsigned i = 0;
++
++	if (BT_RD(g_bt_se, G_STATUS) & 0x1001u) {
++		bt_wr(g_bt_se, G_M_CTRL, 2);
++		bt_wr(g_bt_se, G_S_CTRL, 2);
++		for (; i < 1000 && (BT_RD(g_bt_se, G_STATUS) & 0x1001u); i++) {
++			bt_spin_us(1);
++		}
++	}
++	bt_wr(g_bt_se, G_M_CLEAR, UINT32_MAX);
++	bt_wr(g_bt_se, G_S_CLEAR, UINT32_MAX);
++	return i < 1000;
++}
++
++/* Controller off: engine stopped, BT_EN low, UART pins back to gpio. The rails, the clock and its votes stay. */
++static void
++bt_off(bool engine)
++{
++	if (engine) {
++		(void)bt_engine_stop();
++	}
++	bt_pin(4, BT_EN_CFG, 0);
++	for (unsigned i = 0; i < 4; i++) {
++		bt_pin(i, BT_PIN_IDLE(16 + i), -1);
++	}
++}
++
++/* One H4 packet of at most 16 bytes; 0 = the engine sent it within 100 ms (with CTS honoured, a silent controller
++ * holds it: then aborted, -1). */
++static int
++bt_send(const uint8_t *p, unsigned n)
++{
++	if (n == 0 || n > 16) {
++		return -1;
++	}
++	bt_wr(g_bt_se, G_TX_LEN, n);
++	bt_wr(g_bt_se, G_M_CMD, 1u << 27);
++	for (unsigned i = 0; i < n; i += 4) {
++		uint32_t word = 0;
++
++		for (unsigned j = 0; j < 4 && i + j < n; j++) {
++			word |= (uint32_t)p[i + j] << (8 * j);
++		}
++		bt_wr(g_bt_se, G_TX_FIFO, word);
++	}
++	for (uint64_t end = bt_now_us() + 100000; bt_now_us() < end;) {
++		if (!(BT_RD(g_bt_se, G_STATUS) & 1u) && !(BT_RD(g_bt_se, G_TX_FIFO_STATUS) & 0x0fffffffu)) {
++			return 0;
++		}
++		bt_spin_us(100);
++	}
++	bt_wr(g_bt_se, G_M_CTRL, 2);
++	bt_spin_us(1000);
++	bt_wr(g_bt_se, G_M_CLEAR, UINT32_MAX);
++	return -1;
++}
++
++/* Drains the RX FIFO into b until one whole event (04 code len ...) is in or ms run out. 1 = event in b[*ev]. */
++static int
++bt_recv(uint8_t *b, unsigned cap, unsigned *have, unsigned *ev, uint32_t ms)
++{
++	for (uint64_t end = bt_now_us() + ms * 1000ull;;) {
++		uint32_t st = BT_RD(g_bt_se, G_RX_FIFO_STATUS), wc = st & 0x1ffffffu;
++
++		for (uint32_t w = 0; w < wc && w < 64; w++) {
++			uint32_t v = BT_RD(g_bt_se, G_RX_FIFO), nb = 4;
++
++			if (w + 1 == wc && (st & (1u << 31)) && ((st >> 28) & 7u)) {
++				nb = (st >> 28) & 7u;
++			}
++			for (uint32_t j = 0; j < nb && *have < cap; j++) {
++				b[(*have)++] = (uint8_t)(v >> (8 * j));
++			}
++		}
++		for (unsigned i = 0; i + 2 < *have; i++) {
++			if (b[i] == 0x04 && i + 3u + b[i + 2] <= *have) {
++				*ev = i;
++				return 1;
++			}
++		}
++		if (bt_now_us() >= end) {
++			return 0;
++		}
++		bt_spin_us(200);
++	}
++}
++
++#define BT_HEX(b, n) do { \
++	for (unsigned h_ = 0; h_ < (n) && h_ < 20; h_++) { \
++		BT_ADD("%s%02x", h_ ? " " : "", (b)[h_]); \
++	} \
++} while (0)
++
++int
++pong_bt_hci_usb(char *reply, size_t reply_cap, const char *args)
++{
++	static const uint8_t hci_reset[4] = { 0x01, 0x03, 0x0c, 0x00 }, hci_version[4] = { 0x01, 0x01, 0x10, 0x00 };
++	char line[700];
++	int k = 0, step = 0, upto = 9;
++	bool cts = true, engine = false, powered = false;
++	uint32_t rc = 0, v;
++
++	if (!reply || reply_cap == 0) {
++		return -1;
++	}
++	for (const char *a = args; a && *a; a++) {
++		if (*a >= '1' && *a <= '9' && (a == args || a[-1] == ' ')) {
++			upto = *a - '0';
++		} else if (strncmp(a, "nocts", 5) == 0) {
++			cts = false;
++		}
++	}
++	BT_ADD("bthci:");
++
++	/* 1: map (nothing read) */
++	bt_mark(step = 1);
++	for (unsigned i = 0; i < 5; i++) {
++		if (!g_bt_pin[i]) {
++			static const uint8_t gpio[5] = { 16, 17, 18, 19, 76 };
++
++			g_bt_pin[i] = ml_io_map((i == 4 ? BT_TLMM_SOUTH : BT_TLMM_NORTH) + gpio[i] * 0x1000UL, 0x1000);
++		}
++	}
++	if (!g_bt_sw) {
++		g_bt_sw = ml_io_map(BT_TLMM_NORTH + BT_SWCTRL * 0x1000UL, 0x1000);
++	}
++	if (!g_bt_gcc) {
++		g_bt_gcc = ml_io_map(BT_GCC_SE6_PHYS, 0x1000);
++	}
++	if (!g_bt_gcc23) {
++		g_bt_gcc23 = ml_io_map(BT_GCC_23_PHYS, 0x1000);
++	}
++	if (!g_bt_vote) {
++		g_bt_vote = ml_io_map(BT_GCC_VOTE_PHYS, 0x1000);
++	}
++	if (!g_bt_se) {
++		g_bt_se = ml_io_map(BT_SE6_PHYS, 0x4000);
++	}
++	if (!g_bt_qup) {
++		g_bt_qup = ml_io_map(BT_QUP0_PHYS, 0x1000);
++	}
++	if (!g_bt_pin[0] || !g_bt_pin[1] || !g_bt_pin[2] || !g_bt_pin[3] || !g_bt_pin[4] || !g_bt_sw || !g_bt_gcc ||
++	    !g_bt_gcc23 || !g_bt_vote || !g_bt_se || !g_bt_qup) {
++		BT_ADD(" map-failed");
++		goto fail;
++	}
++	BT_ADD(" pins=%x", bt_pins());
++	if (upto < 2) {
++		goto done;
++	}
++
++	/* 2: the cnss rails (needed: smpa4/6/5, smpc8 = bits 0-3) */
++	bt_mark(step = 2);
++	v = pong_wcn_rails(&rc);
++	BT_ADD(" rails=%x/%x", v, rc);
++	if ((v & 0x0fu) != 0x0fu) {
++		goto fail;
++	}
++	if (upto < 3) {
++		goto done;
++	}
++
++	/* 3: controller held in reset, UART pins as gpio, 100 ms */
++	bt_mark(step = 3);
++	bt_off(false);
++	powered = true;             /* from here every exit lowers BT_EN again */
++	delay_for_interval(100, NSEC_PER_MSEC);
++	if (upto < 4) {
++		goto done;
++	}
++
++	/* 4: SE6 source 96 MHz, then the branch votes; every branch must be on (or under hw gating) before the engine */
++	bt_mark(step = 4);
++	{
++		static const uint32_t halt[5] = { 0x72c, 0x004, 0x008, 0x000, 0x008 };   /* se6 m_ahb s_ahb | core core_2x */
++		uint32_t off = 0;
++		unsigned i;
++
++		bt_wr(g_bt_gcc, 0x738, (BT_RD(g_bt_gcc, 0x738) & ~0xffffu) | 8u);                     /* M */
++		bt_wr(g_bt_gcc, 0x73c, (BT_RD(g_bt_gcc, 0x73c) & ~0xffffu) | (~(25u - 8u) & 0xffffu)); /* N */
++		bt_wr(g_bt_gcc, 0x740, (BT_RD(g_bt_gcc, 0x740) & ~0xffffu) | (~25u & 0xffffu));        /* D */
++		bt_wr(g_bt_gcc, 0x734, (BT_RD(g_bt_gcc, 0x734) & ~0x371fu) | 6u << 8 | 2u << 12 | 1u); /* src, dual edge, hid */
++		bt_wr(g_bt_gcc, 0x730, BT_RD(g_bt_gcc, 0x730) | 1u);                                   /* update */
++		for (i = 0; i < 1000 && (BT_RD(g_bt_gcc, 0x730) & 1u); i++) {
++			bt_spin_us(1);
++		}
++		BT_ADD(" rcg=%x/%x", BT_RD(g_bt_gcc, 0x730), BT_RD(g_bt_gcc, 0x734));
++		if (i == 1000) {
++			goto fail;
++		}
++		bt_wr(g_bt_vote, 0x008, BT_RD(g_bt_vote, 0x008) | 1u << 16 | 1u << 6 | 1u << 7 | 1u << 8 | 1u << 9);
++		for (i = 0; i < 1000; i++) {
++			off = 0;
++			for (unsigned h = 0; h < 5; h++) {
++				uint32_t r = BT_RD(h < 3 ? g_bt_gcc : g_bt_gcc23, halt[h]);
++
++				if ((r & (1u << 31)) && !(r & 2u)) {
++					off |= 1u << h;
++				}
++			}
++			if (!off) {
++				break;
++			}
++			bt_spin_us(1);
++		}
++		BT_ADD(" branches=%x", off);
++		if (off) {
++			goto fail;
++		}
++	}
++	if (upto < 5) {
++		goto done;
++	}
++
++	/* 5: the engine's identity: UART microcode (protocol 2), FIFO interface, depths */
++	bt_mark(step = 5);
++	{
++		uint32_t fw = BT_RD(g_bt_se, G_FW_REV), qup = BT_RD(g_bt_qup, 4), ifd = BT_RD(g_bt_se, G_IF_DISABLE);
++		uint32_t txd = (BT_RD(g_bt_se, G_HW_PARAM0) >> 16) & 0x3fu, rxd = (BT_RD(g_bt_se, G_HW_PARAM1) >> 16) & 0x3fu;
++
++		BT_ADD(" fw=%x qup=%x if=%x depth=%u/%u st=%x", fw, qup, ifd, txd, rxd, BT_RD(g_bt_se, G_STATUS));
++		if (((fw >> 8) & 0xffu) != 2 || (ifd & 1u) || txd < 4 || rxd < 4) {
++			goto fail;
++		}
++		if (upto < 6) {
++			goto done;
++		}
++
++		/* 6: FIFO mode, 8N1, 115200; RFR held off until the read starts */
++		bt_mark(step = 6);
++		engine = true;
++		if (!bt_engine_stop()) {
++			BT_ADD(" stop-timeout");
++			goto fail;
++		}
++		const uint32_t sample = qup >= 0x20050000u ? 16u : 32u, div = (96000000u + 115200u * sample / 2) / (115200u * sample);
++
++		bt_wr(g_bt_se, G_IRQ_EN, 0);
++		bt_wr(g_bt_se, G_GSI_EVENT, 0);
++		bt_wr(g_bt_se, G_M_IRQ_EN, 0);
++		bt_wr(g_bt_se, G_S_IRQ_EN, 0);
++		bt_wr(g_bt_se, G_CGC, BT_RD(g_bt_se, G_CGC) | 0x7fu);
++		bt_wr(g_bt_se, G_DMA_CFG, BT_RD(g_bt_se, G_DMA_CFG) | 0x0fu);
++		bt_wr(g_bt_se, G_OUTPUT, 0x7f);
++		bt_wr(g_bt_se, G_FORCE_DEFAULT, 1);
++		bt_wr(g_bt_se, G_DMA_MODE, 0);
++		bt_wr(g_bt_se, G_TX_PACK0, 0x4380e);
++		bt_wr(g_bt_se, G_TX_PACK1, 0xc3e0e);
++		bt_wr(g_bt_se, G_RX_PACK0, 0x4380e);
++		bt_wr(g_bt_se, G_RX_PACK1, 0xc3e0e);
++		bt_wr(g_bt_se, G_BYTE_GRAN, 0);
++		bt_wr(g_bt_se, G_TX_WORD, 8);
++		bt_wr(g_bt_se, G_RX_WORD, 8);
++		bt_wr(g_bt_se, G_TX_STOP, 0);
++		bt_wr(g_bt_se, G_TX_PARITY, 0);
++		bt_wr(g_bt_se, G_RX_PARITY, 0);
++		bt_wr(g_bt_se, G_TX_CFG, cts ? 0u : 2u);
++		bt_wr(g_bt_se, G_RX_CFG, 0);
++		bt_wr(g_bt_se, G_LOOPBACK, 0);
++		bt_wr(g_bt_se, G_RX_STALE, 160);
++		bt_wr(g_bt_se, G_RX_RFR_WM, rxd - 2);
++		bt_wr(g_bt_se, G_MANUAL_RFR, G_RFR_OFF);
++		bt_wr(g_bt_se, G_M_CLK, div << 4 | 1u);
++		bt_wr(g_bt_se, G_S_CLK, div << 4 | 1u);
++		bt_wr(g_bt_se, G_CLK_SEL, 0);
++		BT_ADD(" os=%u div=%u", sample, div);
++	}
++	if (upto < 7) {
++		goto done;
++	}
++
++	/* 7: release the controller (Android HAL: ~105 ms before it opens the port), pins to qup6, read with RFR open */
++	bt_mark(step = 7);
++	bt_pin(4, BT_EN_CFG, 1);
++	delay_for_interval(110, NSEC_PER_MSEC);
++	for (unsigned i = 0; i < 4; i++) {
++		bt_pin(i, 1u << 2 | BT_PIN_IDLE(16 + i), -1);
++	}
++	bt_wr(g_bt_se, G_M_CLEAR, UINT32_MAX);
++	bt_wr(g_bt_se, G_S_CLEAR, UINT32_MAX);
++	bt_wr(g_bt_se, G_S_CMD, 1u << 27 | 1u << 7);
++	bt_wr(g_bt_se, G_MANUAL_RFR, 0);
++	{
++		uint8_t b[16];
++		unsigned have = 0, ev = 0;
++
++		(void)bt_recv(b, sizeof(b), &have, &ev, 20);
++		BT_ADD(" on pins=%x rx0=%u", bt_pins(), have);
++		if (have) {
++			BT_ADD("[");
++			BT_HEX(b, have);
++			BT_ADD("]");
++		}
++	}
++	if (upto < 8) {
++		goto done;
++	}
++
++	/* 8, 9: HCI_Reset, Read_Local_Version (Command Complete: ncmd, opcode, status, ...) */
++	for (unsigned c = 0; c < 2; c++) {
++		uint8_t b[48];
++		unsigned have = 0, ev = 0;
++		int got;
++
++		bt_mark(step = 8 + (int)c);
++		if (bt_send(c ? hci_version : hci_reset, 4)) {
++			BT_ADD(" %s=tx-stuck(pins %x)", c ? "ver" : "reset", bt_pins());
++			goto fail;
++		}
++		got = bt_recv(b, sizeof(b), &have, &ev, 500);
++		BT_ADD(" %s=", c ? "ver" : "reset");
++		if (!have) {
++			BT_ADD("silent");
++			goto fail;
++		}
++		BT_ADD("[");
++		BT_HEX(b, have);
++		BT_ADD("]");
++		if (!got || b[ev + 1] != 0x0e || b[ev + 2] < 4 || b[ev + 6] != 0) {
++			goto fail;
++		}
++		if (c && b[ev + 2] >= 12) {
++			const uint8_t *p = b + ev + 3;
++
++			BT_ADD(" hci=%u rev=%x lmp=%u sub=%x mf=%x", p[4], p[5] | p[6] << 8, p[7], p[10] | p[11] << 8, p[8] | p[9] << 8);
++		}
++		if ((int)c + 8 >= upto) {
++			goto done;
++		}
++	}
++
++done:
++	if (powered) {
++		bt_off(engine);
++	}
++	bt_mark(10);
++	BT_ADD(" ok step=%d\n", step);
++	pong_ramoops_diagnostic_write(line, k);
++	strlcpy(reply, line, reply_cap);
++	return 0;
++fail:
++	if (powered) {
++		bt_off(engine);
++	}
++	bt_mark(-step);
++	BT_ADD(" FAIL step=%d\n", step);
++	pong_ramoops_diagnostic_write(line, k);
++	strlcpy(reply, line, reply_cap);
++	return -step;
++}
+ #endif /* PONG */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index e8cca09..e81bc29 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2104,6 +2104,15 @@ dispatch_command(const char *cmd)
+ 		bt_reply[0] = '\0';
+ 		(void)pong_bt_usb(bt_reply, sizeof(bt_reply), 0);
+ 		send_str(bt_reply[0] ? bt_reply : "btup: no reply\n");
++	} else if (strcmp(cmd, "bthci") == 0 || strncmp(cmd, "bthci ", 6) == 0) {
++		/* Bluetooth step 1: power the BT side, HCI_Reset + Read_Local_Version from ROM at 115200, power off
++		 * (bsd/dev/pong_bt.c, z98); `bthci N` stops after step N, `nocts` ignores CTS */
++		extern int pong_bt_hci_usb(char *reply, size_t reply_cap, const char *args);
++		static char bh_reply[700];
++
++		bh_reply[0] = '\0';
++		(void)pong_bt_hci_usb(bh_reply, sizeof(bh_reply), cmd + 5);
++		send_str(bh_reply[0] ? bh_reply : "bthci: no reply\n");
+ 	} else if (strcmp(cmd, "wifistack") == 0 || strcmp(cmd, "wifistack nwifi") == 0 || strcmp(cmd, "wifistat") == 0 ||
+ 	    strncmp(cmd, "wifilog", 7) == 0) {
+ 		/* the ath11k stack's worker: start it once per boot, or say where it is (bsd/dev/pong_wifi_stack.c) */
+@@ -2180,7 +2189,7 @@ dispatch_command(const char *cmd)
+ 	} else if (strncmp(cmd, "tgprefer ", 9) == 0) {
+ 		cmd_handle_tgprefer(cmd + 9);
+ 	} else {
+-		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, wifis4, adspup, btup, fwput, fwlist, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
++		send_str("ERROR: unknown command. Available: ping, status, log, reboot, reboot-recovery, screenshot, tap, swipe, threads, cpus, prefer, top, tgprefer, ipis, gic, gicr, gicw, rdr, rdw, ipimode, wifiup, wifidown, wifimhi, wifis3a, wifis3b, wifis3c, wifis3d, wifis4, adspup, btup, bthci, fwput, fwlist, temp, bl, gpuprobe, tick, idletick, timeripi, ipitrace\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index a490e75..31a8fa7 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -440,6 +440,35 @@ wl_rails(struct wl *w)
+ 	}
+ }
+ 
++/*
++ * The same votes for Bluetooth (bsd/dev/pong_bt.c `bthci`): the QCA6390's BT side runs from the PMU these rails feed
++ * (stock DTS bt_qca6390; JeyKul gts7xl-mainline qca6390-pmu). Never released, as for Wi-Fi; repeating a vote is
++ * idempotent. Maps only the RSC page and the command DB. Returns the voted rails (bit i = wl_rail[i]);
++ * *rc = rail_rc of the first failure (see struct wl), 0xb5 = Wi-Fi is mid-command, 0xfa = a mapping failed.
++ */
++uint32_t pong_wcn_rails(uint32_t *rc);
++uint32_t
++pong_wcn_rails(uint32_t *rc)
++{
++	struct wl w = { 0 };
++
++	if (__atomic_exchange_n(&wl_busy, 1, __ATOMIC_ACQUIRE)) {
++		*rc = 0xb5;
++		return 0;
++	}
++	if (!wl_cmddb) {
++		wl_cmddb = ml_io_map(CMDDB, CMDDB_SIZE);
++	}
++	if (!wl_ptr(RSC) || !wl_cmddb) {
++		w.rail_rc = 0xfa;
++	} else {
++		wl_rails(&w);
++	}
++	__atomic_store_n(&wl_busy, 0, __ATOMIC_RELEASE);
++	*rc = w.rail_rc;
++	return w.rails;
++}
++
+ /* ---- the sequence ------------------------------------------------------------------------- */
+ #define WL_FAIL(n, reason) do { w->step = -(n); w->why = (reason); return false; } while (0)
+ 
