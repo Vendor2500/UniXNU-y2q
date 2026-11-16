@@ -1,0 +1,707 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 648ee53..4ac0bae 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -411,6 +411,7 @@ bsd/dev/pong_pogo.c			standard
+ bsd/dev/pong_haptic.c			standard
+ bsd/dev/pong_usbhost.c			standard
+ bsd/dev/pong_usbnet.c			standard
++bsd/dev/pong_usbmux.c			standard
+ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
+diff --git a/bsd/dev/pong_usbmux.c b/bsd/dev/pong_usbmux.c
+new file mode 100644
+index 0000000..2387f94
+--- /dev/null
++++ b/bsd/dev/pong_usbmux.c
+@@ -0,0 +1,593 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * SM-T970 USB mux (pclink, boot-arg pong_usb_mux; device-untested). iOSPort work/pclink_scope/PLAN.md.
++ *
++ * The device half of the usbmux wire protocol, i.e. what AppleUSBDeviceMux does on an iPad: a PC's usbmuxd
++ * (libimobiledevice, or the WinUSB bridge in work/pclink_scope) opens TCP-like streams to a device port over
++ * one bulk pair, and each stream becomes an in-kernel socket to 127.0.0.1:<port>. 22H374 lockdownd only takes
++ * a loopback connection as USB when its peer pid is 0, which an in-kernel socket is, so lockdownd itself does
++ * pairing, TLS and starting services; nothing here answers for it.
++ *
++ * Wire format: libimobiledevice usbmuxd src/device.c (public). The connection logic follows
++ * ref/UniXNU-pong userland/usb-mux.c (BSD-2-Clause-Patent), which reached Finder pairing on 22H374, moved into
++ * the kernel so no daemon, launchd job or user client is needed.
++ *
++ * Everything runs on pong_usb_ctl.c's thread: pong_usbmux_rx() with each bulk OUT transfer, pong_usbmux_tx()
++ * for the next bulk IN frame, pong_usbmux_poll() every loop for the sockets. No locks.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/socket.h>
++#include <sys/kpi_socket.h>
++#include <netinet/in.h>
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
++extern int pong_usbmux_service_publish(void);           /* iokit/Kernel/PongUsbMuxService.cpp */
++extern void pong_usbmux_service_active(int on);
++
++int pong_usbmux_init(void);
++void pong_usbmux_link(int up);
++void pong_usbmux_rx(const volatile uint8_t *p, unsigned len);
++unsigned pong_usbmux_tx(volatile uint8_t *dst, unsigned cap);
++int pong_usbmux_poll(void);
++int pong_usbmux_stat(char *out, size_t cap);
++
++#define MUX_CONNS       8u
++#define CONN_BUF        65536u          /* host bytes the socket has not taken yet; the window we advertise */
++#define WIRE_MAX        49152u          /* largest host frame (usbmuxd USB_MTU) */
++#define IN_CAP          (WIRE_MAX + 16384u)
++#define OUT_CAP         65536u
++#define FRAME_DATA_MAX  16000u          /* device frames stay inside one 16 KiB host read and our TX buffer */
++#define CONNECT_MS      10000u
++
++enum { P_VERSION = 0, P_CONTROL = 1, P_SETUP = 2, P_TCP = 6 };
++enum { F_SYN = 2, F_RST = 4, F_PSH = 8, F_ACK = 16 };
++enum { C_FREE = 0, C_CONNECTING, C_SYNACK, C_OPEN };
++
++struct mux_conn {
++	int state;
++	uint16_t host, port;            /* host's source port, device port */
++	uint32_t receive, send, acked, window;
++	uint64_t deadline;
++	socket_t so;
++	unsigned pending;
++	uint8_t *buf;                   /* CONN_BUF, host -> service */
++};
++
++static struct mux_conn conns[MUX_CONNS];
++static uint8_t *in_buf, *out_buf, *scratch;
++static unsigned in_len, out_at, out_len;
++static unsigned version, linked;
++static uint16_t txseq, rxseq = 0xffff;
++static int init_rc = 1, publish_rc = 1;
++static unsigned activity;
++static struct {
++	unsigned rx_bytes, frames, tx_frames, versions, setups, controls, syn, refused, opened, closed, rsts_in;
++	unsigned dup, overrun, bad_frame, bad_ack, out_full, last_port, last_err;
++} st;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++static uint16_t get16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
++static uint32_t get32(const uint8_t *p) { return ((uint32_t)get16(p) << 16) | get16(p + 2); }
++static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
++static void put32(uint8_t *p, uint32_t v) { put16(p, (uint16_t)(v >> 16)); put16(p + 2, (uint16_t)v); }
++
++/* Queue one device frame: VERSION keeps the 8-byte v1 header, the rest get the 16-byte v2 one after VERSION 2. */
++static bool
++wire(unsigned proto, const void *a, unsigned alen, const void *b, unsigned blen)
++{
++	unsigned hdr = (proto != P_VERSION && version >= 2) ? 16 : 8;
++	unsigned n = hdr + alen + blen;
++	uint8_t *p;
++
++	if (out_at == out_len) {
++		out_at = out_len = 0;
++	} else if (out_at && out_len + 4 + n > OUT_CAP) {
++		memmove(out_buf, out_buf + out_at, out_len - out_at);
++		out_len -= out_at;
++		out_at = 0;
++	}
++	if (out_len + 4 + n > OUT_CAP) {
++		st.out_full++;
++		return false;
++	}
++	p = out_buf + out_len;
++	memcpy(p, &n, 4);
++	p += 4;
++	put32(p, proto);
++	put32(p + 4, n);
++	if (hdr == 16) {
++		put32(p + 8, 0xfacefaceu);      /* device -> host marker; the host writes 0xfeedface */
++		put16(p + 12, txseq++);
++		put16(p + 14, rxseq);
++	}
++	memcpy(p + hdr, a, alen);
++	if (blen) {
++		memcpy(p + hdr + alen, b, blen);
++	}
++	out_len += 4 + n;
++	return true;
++}
++
++static bool
++tcp(const struct mux_conn *c, uint8_t flags, const void *data, unsigned len)
++{
++	uint8_t h[20];
++
++	memset(h, 0, sizeof(h));
++	put16(h, c->port);
++	put16(h + 2, c->host);
++	put32(h + 4, c->send);
++	put32(h + 8, c->receive);
++	h[12] = 5 << 4;
++	h[13] = flags;
++	put16(h + 14, (uint16_t)((CONN_BUF - c->pending) >> 8));
++	return wire(P_TCP, h, sizeof(h), data, len);
++}
++
++static void
++conn_close(struct mux_conn *c, bool rst)
++{
++	if (rst) {
++		(void)tcp(c, F_RST | F_ACK, NULL, 0);
++	}
++	if (c->so) {
++		sock_close(c->so);
++	}
++	if (c->buf) {
++		kfree_data(c->buf, CONN_BUF);
++	}
++	if (c->state) {
++		st.closed++;
++	}
++	memset(c, 0, sizeof(*c));
++}
++
++/* Streams and the device's queue; the host bytes being parsed (in_buf) stay, VERSION arrives inside them. */
++static void
++reset_streams(void)
++{
++	for (unsigned i = 0; i < MUX_CONNS; i++) {
++		conn_close(&conns[i], false);
++	}
++	out_at = out_len = 0;
++	version = 0;
++	txseq = 0;
++	rxseq = 0xffff;
++}
++
++static void
++reset_all(void)
++{
++	reset_streams();
++	in_len = 0;
++}
++
++/* A connection to 127.0.0.1:port from the kernel (peer pid 0), not waiting for it to complete. */
++static int
++conn_open(struct mux_conn *c, uint16_t port)
++{
++	struct sockaddr_in a;
++	int one = 1, e;
++
++	e = sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &c->so);
++	if (e) {
++		c->so = NULL;
++		return e;
++	}
++	(void)sock_setsockopt(c->so, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++	memset(&a, 0, sizeof(a));
++	a.sin_len = sizeof(a);
++	a.sin_family = AF_INET;
++	a.sin_port = htons(port);
++	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++	e = sock_connect(c->so, (struct sockaddr *)&a, MSG_DONTWAIT);
++	return e == EINPROGRESS ? 0 : e;
++}
++
++static void
++tcp_input(const uint8_t *p, unsigned n)
++{
++	unsigned words, hlen, size;
++	uint16_t host, port;
++	uint32_t seq, ack;
++	uint8_t flags;
++	const uint8_t *data;
++	struct mux_conn *c = NULL;
++
++	if (n < 20) {
++		st.bad_frame++;
++		return;
++	}
++	/* Some host writers leave the data offset nibble 0 for their fixed 20-byte header. */
++	words = p[12] >> 4;
++	hlen = words ? words * 4 : 20;
++	if (hlen < 20 || hlen > n) {
++		st.bad_frame++;
++		return;
++	}
++	host = get16(p);
++	port = get16(p + 2);
++	seq = get32(p + 4);
++	ack = get32(p + 8);
++	flags = p[13];
++	data = p + hlen;
++	size = n - hlen;
++	for (unsigned i = 0; i < MUX_CONNS; i++) {
++		if (conns[i].state && conns[i].host == host && conns[i].port == port) {
++			c = &conns[i];
++			break;
++		}
++	}
++	if (flags & F_RST) {
++		st.rsts_in++;
++		if (c) {
++			conn_close(c, false);
++		}
++		return;
++	}
++	if (flags == F_SYN && !size) {
++		struct mux_conn refuse = { .host = host, .port = port, .receive = seq + 1 };
++		int e = EBUSY;
++
++		st.syn++;
++		st.last_port = port;
++		if (c) {
++			conn_close(c, true);
++			return;
++		}
++		for (unsigned i = 0; i < MUX_CONNS && !c; i++) {
++			if (!conns[i].state) {
++				c = &conns[i];
++			}
++		}
++		if (c && port) {
++			c->buf = kalloc_data(CONN_BUF, Z_WAITOK);
++			e = c->buf ? conn_open(c, port) : ENOMEM;
++		}
++		if (e) {
++			st.last_err = (unsigned)e;
++			st.refused++;
++			if (c) {
++				conn_close(c, false);
++			}
++			(void)tcp(&refuse, F_RST | F_ACK, NULL, 0);
++			return;
++		}
++		c->state = C_CONNECTING;
++		c->host = host;
++		c->port = port;
++		c->receive = seq + 1;
++		c->window = (uint32_t)get16(p + 14) << 8;
++		c->deadline = now_ms() + CONNECT_MS;
++		return;
++	}
++	if (!c) {
++		struct mux_conn refuse = { .host = host, .port = port, .receive = seq + size };
++
++		(void)tcp(&refuse, F_RST | F_ACK, NULL, 0);
++		return;
++	}
++	if (c->state == C_CONNECTING) {
++		return;                         /* the socket is not connected yet; the host waits for SYN|ACK */
++	}
++	/* PSH marks data on some hosts; it does not change the byte stream. */
++	if ((flags & ~F_PSH) != F_ACK) {
++		conn_close(c, true);
++		return;
++	}
++	if ((int32_t)(ack - c->acked) < 0 || (int32_t)(c->send - ack) < 0) {
++		st.bad_ack++;
++		conn_close(c, true);
++		return;
++	}
++	c->acked = ack;
++	c->window = (uint32_t)get16(p + 14) << 8;
++	if (c->state == C_SYNACK) {
++		if (ack != 1) {
++			st.bad_ack++;
++			conn_close(c, true);
++			return;
++		}
++		c->state = C_OPEN;
++		st.opened++;
++	}
++	if (seq != c->receive) {
++		st.dup++;
++		(void)tcp(c, F_ACK, NULL, 0);
++		return;
++	}
++	if (!size) {
++		return;
++	}
++	if (size > CONN_BUF - c->pending) {
++		st.overrun++;
++		conn_close(c, true);
++		return;
++	}
++	memcpy(c->buf + c->pending, data, size);
++	c->pending += size;
++	c->receive += size;
++	(void)tcp(c, F_ACK, NULL, 0);
++}
++
++static void
++frame(unsigned proto, const uint8_t *p, unsigned size, bool v2hdr, uint16_t host_seq)
++{
++	st.frames++;
++	if (proto == P_VERSION) {
++		uint8_t answer[12];
++		uint32_t major;
++
++		if (size < 12 || (major = get32(p)) < 1 || major > 2) {
++			st.bad_frame++;
++			return;
++		}
++		reset_streams();
++		memset(answer, 0, sizeof(answer));
++		put32(answer, major);
++		(void)wire(P_VERSION, answer, sizeof(answer), NULL, 0);
++		version = major;
++		st.versions++;
++	} else if (proto == P_SETUP) {
++		/* libimobiledevice sends 7, macOS 5 (Pong); both mean the basic v2 transport. */
++		st.setups++;
++		txseq = 0;
++		rxseq = v2hdr ? host_seq : 0xffff;
++	} else if (proto == P_TCP) {
++		if (version) {
++			tcp_input(p, size);
++		} else {
++			st.bad_frame++;
++		}
++	} else {
++		st.controls++;                  /* CONTROL information/warnings: nothing to do */
++	}
++}
++
++/* Bytes of one bulk OUT transfer. Frames may span transfers; a bad header drops what is buffered. */
++void
++pong_usbmux_rx(const volatile uint8_t *p, unsigned len)
++{
++	if (!in_buf) {
++		return;
++	}
++	activity++;
++	st.rx_bytes += len;
++	if (len > IN_CAP - in_len) {
++		st.bad_frame++;
++		in_len = 0;
++		return;
++	}
++	for (unsigned i = 0; i < len; i++) {
++		in_buf[in_len + i] = p[i];
++	}
++	in_len += len;
++	while (in_len >= 8) {
++		uint32_t proto = get32(in_buf), length = get32(in_buf + 4);
++		unsigned hdr = 8;
++
++		if (length < 8 || length > WIRE_MAX) {
++			st.bad_frame++;
++			in_len = 0;
++			return;
++		}
++		if (proto != P_VERSION && length >= 16) {
++			uint32_t magic;
++
++			if (in_len < 16) {
++				return;
++			}
++			magic = get32(in_buf + 8);
++			if (magic == 0xfeedfaceu || magic == 0xfacefaceu) {
++				hdr = 16;
++			}
++		}
++		if (in_len < length) {
++			return;
++		}
++		if (hdr == 16) {
++			rxseq = get16(in_buf + 12);
++		}
++		frame(proto, in_buf + hdr, length - hdr, hdr == 16, get16(in_buf + 12));
++		in_len -= length;
++		if (in_len) {
++			memmove(in_buf, in_buf + length, in_len);
++		}
++	}
++}
++
++/* The next device frame for bulk IN, or 0. pong_usb_ctl.c adds the zero-length packet a full last packet needs. */
++unsigned
++pong_usbmux_tx(volatile uint8_t *dst, unsigned cap)
++{
++	uint32_t n;
++
++	if (!out_buf || out_at == out_len) {
++		return 0;
++	}
++	memcpy(&n, out_buf + out_at, 4);
++	if (n > cap) {
++		out_at = out_len = 0;           /* cannot happen: frames are at most 16 + 20 + FRAME_DATA_MAX */
++		return 0;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		dst[i] = out_buf[out_at + 4 + i];
++	}
++	out_at += 4 + n;
++	st.tx_frames++;
++	return n;
++}
++
++/* Sockets: finish connects, feed the services, read their replies within the host's window. */
++int
++pong_usbmux_poll(void)
++{
++	unsigned before = activity;
++
++	if (publish_rc != 0 && init_rc == 0) {
++		publish_rc = pong_usbmux_service_publish();   /* retried until the platform exists */
++		if (publish_rc == 0 && linked) {
++			pong_usbmux_service_active(1);
++		}
++	}
++	for (unsigned i = 0; i < MUX_CONNS; i++) {
++		struct mux_conn *c = &conns[i];
++
++		if (!c->state) {
++			continue;
++		}
++		if (c->state == C_CONNECTING) {
++			int err = 0, elen = sizeof(err);
++
++			if (sock_isconnected(c->so)) {
++				if (!tcp(c, F_SYN | F_ACK, NULL, 0)) {
++					continue;
++				}
++				c->send = 1;
++				c->state = C_SYNACK;
++				c->deadline = now_ms() + CONNECT_MS;
++				activity++;
++			} else if ((sock_getsockopt(c->so, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err) ||
++			    now_ms() > c->deadline) {
++				st.refused++;
++				st.last_err = (unsigned)err;
++				conn_close(c, true);
++				activity++;
++			}
++			continue;
++		}
++		if (c->state == C_SYNACK) {
++			if (now_ms() > c->deadline) {
++				conn_close(c, true);
++			}
++			continue;
++		}
++		if (c->pending) {
++			struct iovec iov = { .iov_base = c->buf, .iov_len = c->pending };
++			struct msghdr msg;
++			size_t done = 0;
++			int e;
++
++			memset(&msg, 0, sizeof(msg));
++			msg.msg_iov = &iov;
++			msg.msg_iovlen = 1;
++			e = sock_send(c->so, &msg, MSG_DONTWAIT, &done);
++			if (done) {
++				c->pending -= (unsigned)done;
++				if (c->pending) {
++					memmove(c->buf, c->buf + done, c->pending);
++				}
++				(void)tcp(c, F_ACK, NULL, 0);   /* the window opened again */
++				activity++;
++			}
++			if (e && e != EWOULDBLOCK && e != EINTR) {
++				st.last_err = (unsigned)e;
++				conn_close(c, true);
++				continue;
++			}
++		}
++		{
++			uint32_t outstanding = c->send - c->acked;
++			unsigned allowed = c->window > outstanding ? c->window - outstanding : 0;
++			struct iovec iov;
++			struct msghdr msg;
++			size_t done = 0;
++			int e;
++
++			if (allowed > FRAME_DATA_MAX) {
++				allowed = FRAME_DATA_MAX;
++			}
++			if (!allowed || OUT_CAP - (out_len - out_at) < allowed + 64) {
++				continue;
++			}
++			iov.iov_base = scratch;
++			iov.iov_len = allowed;
++			memset(&msg, 0, sizeof(msg));
++			msg.msg_iov = &iov;
++			msg.msg_iovlen = 1;
++			e = sock_receive(c->so, &msg, MSG_DONTWAIT, &done);
++			if (done) {
++				if (tcp(c, F_ACK, scratch, (unsigned)done)) {
++					c->send += (uint32_t)done;
++				}
++				activity++;
++			} else if (e == 0 || (e != EWOULDBLOCK && e != EINTR)) {
++				st.last_err = (unsigned)e;
++				conn_close(c, true);    /* the service closed (or failed): the host sees a reset */
++				activity++;
++			}
++		}
++	}
++	return activity != before;
++}
++
++/* The host configured (1) or lost (0) the mux interface. Streams do not survive either way. */
++void
++pong_usbmux_link(int up)
++{
++	if (init_rc != 0) {
++		return;
++	}
++	reset_all();
++	linked = up != 0;
++	if (publish_rc == 0) {
++		pong_usbmux_service_active(linked);
++	}
++}
++
++int
++pong_usbmux_init(void)
++{
++	if (init_rc == 0) {
++		return 0;
++	}
++	in_buf = kalloc_data(IN_CAP, Z_WAITOK);
++	out_buf = kalloc_data(OUT_CAP, Z_WAITOK);
++	scratch = kalloc_data(FRAME_DATA_MAX, Z_WAITOK);
++	if (!in_buf || !out_buf || !scratch) {
++		return init_rc = ENOMEM;
++	}
++	init_rc = 0;
++	publish_rc = pong_usbmux_service_publish();
++	return 0;
++}
++
++int
++pong_usbmux_stat(char *out, size_t cap)
++{
++	unsigned open = 0, ports = 0;
++	char portlist[64];
++	int n;
++
++	portlist[0] = '\0';
++	for (unsigned i = 0; i < MUX_CONNS; i++) {
++		if (conns[i].state) {
++			open++;
++			if (ports < 6) {
++				size_t l = strlen(portlist);
++
++				snprintf(portlist + l, sizeof(portlist) - l, "%s%u/%d", ports ? "," : "", conns[i].port, conns[i].state);
++				ports++;
++			}
++		}
++	}
++	n = snprintf(out, cap, "mux: init %d publish %d link %u ver %u conns %u [%s] | rx %u B frames %u tx_frames %u "
++	    "versions %u setups %u controls %u | syn %u refused %u opened %u closed %u rst_in %u dup %u overrun %u "
++	    "bad_frame %u bad_ack %u out_full %u last_port %u last_err %u\n",
++	    init_rc, publish_rc, linked, version, open, portlist, st.rx_bytes, st.frames, st.tx_frames, st.versions,
++	    st.setups, st.controls, st.syn, st.refused, st.opened, st.closed, st.rsts_in, st.dup, st.overrun,
++	    st.bad_frame, st.bad_ack, st.out_full, st.last_port, st.last_err);
++	return n;
++}
+diff --git a/iokit/Kernel/PongUsbMuxService.cpp b/iokit/Kernel/PongUsbMuxService.cpp
+new file mode 100644
+index 0000000..db72d9d
+--- /dev/null
++++ b/iokit/Kernel/PongUsbMuxService.cpp
+@@ -0,0 +1,78 @@
++/*
++ * SM-T970 USB mux (pclink, boot-arg pong_usb_mux; device-untested): the registry object 22H374 lockdownd looks for.
++ *
++ * lockdownd finds the USB mux with IOServiceMatching("AppleUSBDeviceMux") and IOServiceMatching("IOUSBDeviceInterface")
++ * (strings in /usr/libexec/lockdownd: "Failed to create IOKit matching dictionary for 'AppleUSBDeviceMux'" and the same
++ * for 'IOUSBDeviceInterface'), reads USBDeviceFunction = "AppleUSBMux" and IsActive, and takes interest message
++ * 0xe3ff8201 (argument 1 configured / 0 not) as the host attaching ("Misc usbmuxd event: (messageType=0x%08x"). The
++ * values are those ref/UniXNU-pong drivers/PongUsb/PongUsbMux.h gave its own class, which lockdownd accepted up to
++ * Finder pairing; Pong pointed lockdownd at that class by interposing IOServiceMatching, here the class simply has the
++ * names. Neither Apple kext (IOUSBDeviceFamily, AppleUSBDeviceMux) is in this kernel, so the names are free.
++ * The bytes themselves go through bsd/dev/pong_usbmux.c; this object only carries the state.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++
++class IOUSBDeviceInterface : public IOService
++{
++	OSDeclareDefaultStructors(IOUSBDeviceInterface)
++};
++OSDefineMetaClassAndStructors(IOUSBDeviceInterface, IOService)
++
++class AppleUSBDeviceMux : public IOUSBDeviceInterface
++{
++	OSDeclareDefaultStructors(AppleUSBDeviceMux)
++};
++OSDefineMetaClassAndStructors(AppleUSBDeviceMux, IOUSBDeviceInterface)
++
++static AppleUSBDeviceMux * pong_mux_service;
++
++extern "C" int pong_usbmux_service_publish(void);
++extern "C" void pong_usbmux_service_active(int on);
++
++/* 0 published; -1 allocation, -2 no platform yet (pong_usbmux.c retries), -3 attach/start */
++extern "C" int
++pong_usbmux_service_publish(void)
++{
++	IOService * platform;
++	AppleUSBDeviceMux * s;
++
++	if (pong_mux_service) {
++		return 0;
++	}
++	platform = IOService::getPlatform();
++	if (!platform) {
++		return -2;
++	}
++	s = OSTypeAlloc(AppleUSBDeviceMux);
++	if (!s || !s->init()) {
++		OSSafeReleaseNULL(s);
++		return -1;
++	}
++	if (!s->attach(platform)) {
++		s->release();
++		return -3;
++	}
++	if (!s->start(platform)) {
++		s->detach(platform);
++		s->release();
++		return -3;
++	}
++	s->setName("AppleUSBDeviceMux");
++	s->setProperty("USBDeviceFunction", "AppleUSBMux");
++	s->setProperty("IsActive", false);
++	s->registerService();
++	pong_mux_service = s;
++	return 0;
++}
++
++extern "C" void
++pong_usbmux_service_active(int on)
++{
++	if (!pong_mux_service) {
++		return;
++	}
++	pong_mux_service->setProperty("IsActive", on != 0);
++	pong_mux_service->messageClients(0xe3ff8201u, reinterpret_cast<void *>(static_cast<uintptr_t>(on != 0)));
++}
+diff --git a/iokit/conf/files b/iokit/conf/files
+index 9de2aea..7c4355e 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -84,6 +84,7 @@ iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
+ iokit/Kernel/PongBacklightT970.cpp			optional iokitcpp
+ iokit/Kernel/PongBareAccel.cpp			optional iokitcpp
++iokit/Kernel/PongUsbMuxService.cpp		optional iokitcpp
+ iokit/Kernel/T970Audio.cpp			optional iokitcpp
+ iokit/Kernel/T970AudioService.cpp		optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
