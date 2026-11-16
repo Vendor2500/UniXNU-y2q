@@ -211,6 +211,22 @@ def t970_edits(gen, mhi, shared, out):
          '                      (unsigned)t970c->flags); }\n'
          '  send_auth(); lx_queue_delayed(&g_timer, 100); }\n'),
     ])
+    # 12. (11-16) The address the station uses: QCA6390 without a programmed address gives a new 00:03:7f:xx:xx:xx on every
+    #     start, so networks saw a new device each boot. The board (bsd/dev/pong_wifi_tools.c) keeps one locally
+    #     administered address on the Data volume and sets nw_wifi_t970_mac before the start; zero keeps the firmware's.
+    #     nw_wifi_t970_noba declines the access point's Block Ack requests (status 37, edit 7's behaviour) for a test:
+    #     on wi_gen_5G_56 the link came up, multicast arrived and no unicast (no DHCP offer) after one accepted session.
+    edit(out / 'nw_sta_pong.c', [
+        ('static void teardown(int notify_lost, int reason);\n',
+         'static void teardown(int notify_lost, int reason);\n'
+         'uint8_t nw_wifi_t970_mac[6];           /* the board\'s station address; zero = the firmware\'s */\n'
+         'volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n'),
+        ('  memcpy(g_vif->addr, hw->wiphy->perm_addr, 6); g_vif->addr_valid = true; memcpy(g_vif->bss_conf.addr, hw->wiphy->perm_addr, 6);',
+         '  { static const u8 t970z[6]; memcpy(g_vif->addr, memcmp(nw_wifi_t970_mac, t970z, 6) ? nw_wifi_t970_mac : hw->wiphy->perm_addr, 6); }\n'
+         '  g_vif->addr_valid = true; memcpy(g_vif->bss_conf.addr, g_vif->addr, 6);'),
+        ('    if (p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n',
+         '    if (!nw_wifi_t970_noba && p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n'),
+    ])
     return qrtr
 
 

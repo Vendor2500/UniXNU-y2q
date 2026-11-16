@@ -1,0 +1,127 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 5508759..2f1b7b8 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -105,7 +105,7 @@ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpupro
+ extern int pong_gpu_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ extern int pong_metal_diag_usb(char *out, size_t cap);   /* `metaldiag` (NativeAdrenoPublish.cpp, T970 patch) */
+ extern int pong_gpu_diag_usb(char *reply, size_t cap);   /* `gpudiag` (bsd/kern/kern_exit.c, z93) */
+-extern int pong_wifi_join_usb(char *reply, size_t cap);   /* `wifijoin` (pong_wifi_tools.c, z92) */
++extern int pong_wifi_join_usb(char *reply, size_t cap, const char *cmd);   /* `wifijoin` (pong_wifi_tools.c, z92) */
+ extern int pong_fs_usb(char *reply, size_t cap, const char *cmd);   /* `fsput`, `fsmkdir`, `fsstat`, `fssum` (pong_wifi_tools.c) */
+ extern int pong_gpu_tools_usb(char *reply, size_t cap, int what);     /* `gpuauto`, `gpusave` (pong_wifi_tools.c) */
+ extern int pong_t970_gpu_selftest(char *reply, size_t cap);           /* `gpuprobe selftest` (PongAdrenoCpT970.cpp) */
+@@ -2052,10 +2052,10 @@ dispatch_command(const char *cmd)
+ 
+ 		(void)pong_gpu_diag_usb(gd_reply, sizeof(gd_reply));
+ 		send_str(gd_reply);
+-	} else if (strcmp(cmd, "wifijoin") == 0) {
+-		char wj_reply[160];
++	} else if (strncmp(cmd, "wifijoin", 8) == 0) {
++		char wj_reply[260];
+ 
+-		(void)pong_wifi_join_usb(wj_reply, sizeof(wj_reply));
++		(void)pong_wifi_join_usb(wj_reply, sizeof(wj_reply), cmd);
+ 		send_str(wj_reply);
+ 	} else if (strcmp(cmd, "metaldiag") == 0) {
+ 		static char md_reply[700];
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 7c7bfdd..b69470f 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -129,7 +129,7 @@ extern int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t
+ #define WS_IRQ_BASE      800                     /* any number: the vectors are polled */
+ #define WS_WIMG_MASK     0xffu                   /* VM_WIMG_MASK */
+ #define WS_WIMG_WCOMB    0x6u                    /* VM_WIMG_WCOMB on arm: not cacheable | coherent */
+-#define WS_LOG_LINES     128u                    /* `wifilog N` hands them out from line N on, so a reader loses none */
++#define WS_LOG_LINES     1024u                   /* `wifilog N` hands them out from line N on, so a reader loses none */
+ #define WS_LOG_CHARS     160u                    /* the network side writes lines of up to 160 bytes */
+ #define WS_FW_NAMES      10u
+ 
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index dd5cc86..282ade8 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -347,6 +347,7 @@ wt_idle_forever(void)
+ }
+ 
+ static void wifi_join_loop(void);   /* below: save the daemon's last join, join it again after a restart (z92) */
++static void wifi_mac_prepare(void); /* below: the station address kept on the Data volume (z96) */
+ 
+ static void
+ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -378,6 +379,7 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    lp_write(lp != 0));
+ 	}
+ 	reply[0] = '\0';
++	wifi_mac_prepare();
+ 	(void)pong_wifi_stack_usb(reply, sizeof(reply), 1);
+ 	wt.auto_state = 2;
+ 	native_wifi_logf(6, "wifi-auto: firmware loaded from the Data volume after %d tries (%u+%u+%u+%u bytes); %s",
+@@ -1504,11 +1506,62 @@ wifi_join_loop(void)
+ 	}
+ }
+ 
+-int pong_wifi_join_usb(char *reply, size_t cap);
++/*
++ * The station address (z96). QCA6390 without a programmed address starts with a new 00:03:7f:xx:xx:xx every time, so
++ * every boot was a new device to the networks. One locally administered address is made once, kept on the Data volume
++ * and handed to the station before it starts (nw_wifi_t970_mac, build-pong-ath11k.py edit 12). Boot argument
++ * pong_wifi_noba=1 (or USB `wifijoin noba 1`, for the next join) declines the access point's Block Ack.
++ */
++#define WMAC_PATH "/private/var/pong/wifi-mac"
++extern uint8_t nw_wifi_t970_mac[6];
++extern volatile int nw_wifi_t970_noba;
++extern void read_random(void *buffer, unsigned int bytes);
++static int fs_put(const char *path, const uint8_t *data, uint32_t len, off_t off);
++static int wmac_rc = -1;
++
++static void
++wifi_mac_prepare(void)
++{
++	uint8_t m[6] = { 0 };
++	uint32_t noba = 0;
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int e = vnode_open(WMAC_PATH, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++
++	if (e == 0) {
++		int resid = 0;
++
++		e = vn_rdwr(UIO_READ, vp, (caddr_t)m, 6, 0, UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid, current_proc());
++		if (e == 0 && resid != 0) {
++			e = EIO;
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	vfs_context_rele(ctx);
++	if (e != 0 || (m[0] & 1) || !(m[0] | m[1] | m[2] | m[3] | m[4] | m[5])) {
++		read_random(m, sizeof(m));
++		m[0] = (uint8_t)((m[0] & 0xfc) | 0x02);   /* unicast, locally administered */
++		e = fs_put(WMAC_PATH, m, sizeof(m), 0);
++	}
++	memcpy(nw_wifi_t970_mac, m, sizeof(m));
++	(void)PE_parse_boot_argn("pong_wifi_noba", &noba, sizeof(noba));
++	nw_wifi_t970_noba = noba != 0;
++	wmac_rc = e;
++	native_wifi_logf(6, "wifi-mac: %02x:%02x:%02x:%02x:%02x:%02x (file %d), block ack %s", m[0], m[1], m[2], m[3], m[4], m[5], e,
++	    noba ? "declined" : "accepted");
++}
++
++int pong_wifi_join_usb(char *reply, size_t cap, const char *cmd);
+ 
+ int
+-pong_wifi_join_usb(char *reply, size_t cap)
++pong_wifi_join_usb(char *reply, size_t cap, const char *cmd)
+ {
+-	return snprintf(reply, cap, "wifijoin: saved %d saves %d tries %d last %d seq %u daemon joins/leaves %d state %d\n",
+-	           wj.loaded, wj.saves, wj.tries, wj.last_rc, wj.seq, wj.ops, wj.state);
++	if (cmd && strncmp(cmd, "wifijoin noba ", 14) == 0) {
++		nw_wifi_t970_noba = cmd[14] == '1';
++	}
++	return snprintf(reply, cap, "wifijoin: saved %d saves %d tries %d last %d seq %u daemon joins/leaves %d state %d | "
++	           "mac %02x:%02x:%02x:%02x:%02x:%02x file %d | block ack %s (next join)\n",
++	           wj.loaded, wj.saves, wj.tries, wj.last_rc, wj.seq, wj.ops, wj.state,
++	           nw_wifi_t970_mac[0], nw_wifi_t970_mac[1], nw_wifi_t970_mac[2], nw_wifi_t970_mac[3], nw_wifi_t970_mac[4],
++	           nw_wifi_t970_mac[5], wmac_rc, nw_wifi_t970_noba ? "declined" : "accepted");
+ }
