@@ -307,6 +307,23 @@ def t970_edits(gen, mhi, shared, out):
          '  if (which == 3 || which == 4) { t970_rxerr_polled = 1; t970_rx_err_line(b, n, which); }\n'
          '  else if (which == 1) snprintf(b, n, "tx ack/nack/free small'),
     ])
+    # 14. (11-16) Broadcast tests, boot arguments read when the station starts, both off by default. No frame addressed to
+    #     ff:ff:ff:ff:ff:ff ever reached en0 in any log (edit 13: ath11k's mc count equals en0's multicast, broadcast 0), and
+    #     the networks that worked sent their DHCP offers unicast; today's networks give no offer at all. pong_wifi_rxnwifi=1
+    #     has the hardware hand over 802.11 frames (native wifi, ath11k's default) instead of Ethernet ones; nw_sta_rx's
+    #     802.11 path takes them. pong_wifi_dhcpb=1 makes en0 set the BOOTP broadcast bit (build-t970-ath11k-link.py), so
+    #     the server answers by broadcast: a test of broadcast reception on a network that otherwise unicasts.
+    edit(out / 'nw_sta_pong.c', [
+        ('volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n',
+         'volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n'
+         'extern int PE_parse_boot_argn(const char *, void *, int);\n'
+         'unsigned nw_wifi_t970_rxnwifi, nw_wifi_t970_dhcpb;   /* boot arguments pong_wifi_rxnwifi, pong_wifi_dhcpb (edit 14) */\n'),
+        ('  g_vif->offload_flags = IEEE80211_OFFLOAD_ENCAP_ENABLED | IEEE80211_OFFLOAD_DECAP_ENABLED;',
+         '  PE_parse_boot_argn("pong_wifi_rxnwifi", &nw_wifi_t970_rxnwifi, sizeof nw_wifi_t970_rxnwifi);\n'
+         '  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n'
+         '  lx_log(6, "wifi: rx decap %s, dhcp broadcast bit %s", nw_wifi_t970_rxnwifi ? "native wifi" : "ethernet", nw_wifi_t970_dhcpb ? "set" : "left");\n'
+         '  g_vif->offload_flags = IEEE80211_OFFLOAD_ENCAP_ENABLED | (nw_wifi_t970_rxnwifi ? 0 : IEEE80211_OFFLOAD_DECAP_ENABLED);'),
+    ])
     return qrtr
 
 

@@ -85,6 +85,16 @@ def late_initialiser(obj, constructor, entry):
 # stack and refused, kinds in and out) is defined and never called: it becomes callable from the board, which asks
 # for it every ten seconds while the station is up. The ARP lines stop after 12 per direction; 60 here.
 NET_EDITS = (
+    # pong_wifi_dhcpb=1 (build-pong-ath11k.py edit 14): DHCP from the client asks for a broadcast answer (BOOTP flags bit 15;
+    # UDP checksum 0 = none, allowed over IPv4), a test of whether broadcast frames ever reach en0.
+    ('errno_t if_output(ifnet_t, mbuf_t m) {\n',
+     'extern "C" unsigned nw_wifi_t970_dhcpb;\nerrno_t if_output(ifnet_t, mbuf_t m) {\n'),
+    ('    uint8_t frame[2000]; mbuf_copydata(m, 0, length, frame);\n',
+     '    uint8_t frame[2000]; mbuf_copydata(m, 0, length, frame);\n'
+     '    if (nw_wifi_t970_dhcpb && length >= 14 + 20 + 8 + 12 && frame[12] == 8 && !frame[13] && frame[23] == 17) {\n'
+     '      uint8_t *u = frame + 14 + (frame[14] & 15) * 4;\n'
+     '      if (u + 8 + 12 <= frame + length && !u[0] && u[1] == 68 && !u[2] && u[3] == 67) { u[8 + 10] |= 0x80; u[6] = u[7] = 0; }\n'
+     '    }\n'),
     ('if (n >= 42 && shown[out]++ < 12) log(6, "wifi-net: arp %s op',
      'if (n >= 42 && shown[out]++ < 60) log(6, "wifi-net: arp %s op'),
     # where each received frame was addressed: broadcast, multicast, this station, someone else
