@@ -1,0 +1,252 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ecd50c5..75f95f0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -416,6 +416,7 @@ bsd/dev/pong_wifi_survey.c		standard
+ bsd/dev/pong_wifi_link.c		standard
+ bsd/dev/pong_wifi_stack.c		standard
+ bsd/dev/pong_wifi_tools.c		standard
++bsd/dev/pong_hangwatch.c		standard
+ bsd/dev/pong_gpu_gmu.c		standard
+ bsd/dev/adreno/AdrenoHfi.c		standard
+ bsd/dev/adreno/AdrenoHfiStartup.c		standard
+diff --git a/bsd/dev/pong_hangwatch.c b/bsd/dev/pong_hangwatch.c
+new file mode 100644
+index 0000000..689dc8a
+--- /dev/null
++++ b/bsd/dev/pong_hangwatch.c
+@@ -0,0 +1,181 @@
++/*
++ * z154 hangwatch (SM-T970): boot-arg pong_hangwatch=N (2..60 s; 0, the default, is off). A finger or button went down after
++ * the last frame and N s went by with no frame while the panel is on: the UI is taken as frozen. A still screen sends no
++ * frames, but a touch nearly always draws something; a false alarm costs one record (at most 4 a boot, 60 s apart).
++ *
++ * The record: short pmsg lines "[HANG] ..." (ages, the swapping process, unread touches; metaldiag; the end of gpudiag), then
++ * two stackshots written with IO_SYNC, which survive a forced restart, where USB `fileget` reads them:
++ *   /private/var/mobile/Library/Logs/CrashReporter/pong-hang-<n>.kcdata   the swapping process (backboardd), with load info
++ *   /private/var/mobile/Library/Logs/CrashReporter/pong-hang-<n>s.kcdata  every process, wait info only
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/stat.h>
++#include <sys/vnode.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/debug.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/OSAtomic.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern volatile uint64_t pong_touch_last_down;
++extern uint32_t pong_touch_unread(void);
++extern volatile uint64_t pong_swap_last;
++extern volatile int pong_swap_pid;
++extern int pong_panel_is_off(void);
++extern int pong_metal_diag_usb(char *out, size_t cap);
++extern int pong_gpu_diag_usb(char *reply, size_t cap);
++extern void pong_ramoops_diagnostic_write(const char *buf, int len);
++void pong_hangwatch_start(void);
++
++#define HANG_PATH "/private/var/mobile/Library/Logs/CrashReporter/pong-hang-"
++#define HANG_SS_MAX (1u << 20)
++
++static int
++hang_write(const char *path, const uint8_t *data, uint32_t len)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int resid = 0;
++	int e = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH,
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++
++	if (e == 0) {
++		int e2;
++
++		e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC,
++		    vfs_context_ucred(ctx), &resid, current_proc());
++		if (e == 0 && resid != 0) {
++			e = EIO;
++		}
++		e2 = vnode_close(vp, FWRITE, ctx);
++		if (e == 0) {
++			e = e2;
++		}
++	}
++	vfs_context_rele(ctx);
++	return e;
++}
++
++/* one short pmsg line (pmsg loses a few percent of its bytes: keep each line short and self-contained) */
++static void
++hang_pmsg(const char *text, size_t n)
++{
++	char line[200];
++	int len;
++
++	while (n > 0 && (text[n - 1] == '\n' || text[n - 1] == ' ')) {
++		n--;
++	}
++	len = snprintf(line, sizeof(line), "[HANG] %.*s\n", (int)(n < 180 ? n : 180), text);
++	if (len > 0) {
++		pong_ramoops_diagnostic_write(line, len < (int)sizeof(line) ? len : (int)sizeof(line) - 1);
++		printf("%s", line);
++	}
++}
++
++static uint32_t
++hang_shot(int pid, uint32_t flags, uint8_t *buf, const char *path, int *file)
++{
++	uint32_t len = 0;
++	kern_return_t kr = stack_snapshot_from_kernel(pid, buf, HANG_SS_MAX, flags, 0, 0, &len);
++
++	*file = kr == KERN_SUCCESS ? hang_write(path, buf, len) : -(int)kr;
++	return len;
++}
++
++static void
++hang_record(uint32_t n, uint64_t touch_age, uint64_t swap_age)
++{
++	static char diag[1800];
++	char line[200], path[96];
++	uint64_t ta = 0, sa = 0;
++	uint32_t l1 = 0, l2 = 0;
++	const int pid = pong_swap_pid;
++	int f1 = -1, f2 = -1, len;
++	uint8_t *buf;
++
++	absolutetime_to_nanoseconds(touch_age, &ta);
++	absolutetime_to_nanoseconds(swap_age, &sa);
++	len = snprintf(line, sizeof(line), "n=%u touch_age=%llums swap_age=%llums swapper=%d unread=%#x", n,
++	    ta / NSEC_PER_MSEC, sa / NSEC_PER_MSEC, pid, pong_touch_unread());
++	hang_pmsg(line, (size_t)len);
++	diag[0] = '\0';
++	(void)pong_metal_diag_usb(diag, sizeof(diag));
++	hang_pmsg(diag, strnlen(diag, 180));
++	diag[0] = '\0';
++	(void)pong_gpu_diag_usb(diag, sizeof(diag));
++	{   /* the newest gpudiag lines: its last 360 bytes, in two pmsg lines */
++		const size_t dl = strnlen(diag, sizeof(diag)), from = dl > 360 ? dl - 360 : 0;
++
++		hang_pmsg(diag + from, dl - from > 180 ? 180 : dl - from);
++		if (dl - from > 180) {
++			hang_pmsg(diag + from + 180, dl - from - 180);
++		}
++	}
++	buf = kalloc_data(HANG_SS_MAX, Z_WAITOK | Z_ZERO);
++	if (buf != NULL) {
++		if (pid > 0) {
++			(void)snprintf(path, sizeof(path), HANG_PATH "%u.kcdata", n);
++			l1 = hang_shot(pid, STACKSHOT_KCDATA_FORMAT | STACKSHOT_THREAD_WAITINFO | STACKSHOT_SAVE_LOADINFO | STACKSHOT_GET_DQ |
++			    STACKSHOT_NO_IO_STATS | STACKSHOT_TRYLOCK, buf, path, &f1);
++		}
++		(void)snprintf(path, sizeof(path), HANG_PATH "%us.kcdata", n);
++		l2 = hang_shot(-1, STACKSHOT_KCDATA_FORMAT | STACKSHOT_THREAD_WAITINFO | STACKSHOT_NO_IO_STATS | STACKSHOT_TRYLOCK,
++		    buf, path, &f2);
++		kfree_data(buf, HANG_SS_MAX);
++	}
++	len = snprintf(line, sizeof(line), "n=%u stackshot pid %d: %u B file %d; all: %u B file %d (negative = stackshot error)",
++	    n, pid, l1, f1, l2, f2);
++	hang_pmsg(line, (size_t)len);
++}
++
++static void
++hang_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t secs = 0, n = 0;
++	uint64_t limit, gap, last = 0, seen = 0;
++
++	(void)PE_parse_boot_argn("pong_hangwatch", &secs, sizeof(secs));
++	secs = secs < 2 ? 2 : secs > 60 ? 60 : secs;
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &limit);
++	nanoseconds_to_absolutetime(60ull * NSEC_PER_SEC, &gap);
++	printf("hangwatch: on, %u s\n", secs);
++	while (n < 4) {
++		uint64_t touch, swap, now;
++
++		delay_for_interval(500, 1000000u);
++		touch = pong_touch_last_down;
++		swap = pong_swap_last;
++		now = mach_absolute_time();
++		if (!touch || touch <= swap || touch == seen || now - touch < limit || (last && now - last < gap) ||
++		    pong_panel_is_off()) {
++			continue;
++		}
++		seen = touch;
++		last = now;
++		hang_record(n++, now - touch, now - swap);
++	}
++}
++
++/* from the first frame on (MiniIOMobileFramebuffer present); once */
++void
++pong_hangwatch_start(void)
++{
++	static volatile uint32_t started;
++	uint32_t secs = 0;
++	thread_t th = THREAD_NULL;
++
++	if (!PE_parse_boot_argn("pong_hangwatch", &secs, sizeof(secs)) || !secs ||
++	    !OSCompareAndSwap(0, 1, &started)) {
++		return;
++	}
++	if (kernel_thread_start(hang_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
+diff --git a/bsd/dev/pong_input.c b/bsd/dev/pong_input.c
+index c9050e3..6a82835 100644
+--- a/bsd/dev/pong_input.c
++++ b/bsd/dev/pong_input.c
+@@ -25,6 +25,15 @@ struct input_queue {
+ };
+ static struct input_queue queues[2];
+ static int input_major=-1;
++/* z154 hangwatch (pong_hangwatch.c): when a finger or button last went down, and the touch samples the UI has not read
++ * (bit 31: the queue is open). */
++volatile uint64_t pong_touch_last_down;
++uint32_t pong_touch_unread(void);
++uint32_t
++pong_touch_unread(void)
++{
++    return (queues[0].opened?1u<<31:0u)|((queues[0].tail-queues[0].head)&0x7fffffffu);
++}
+ 
+ void
+ pong_touch_post(uint32_t type,uint32_t finger,uint32_t x,uint32_t y)
+@@ -42,6 +51,7 @@ pong_touch_post(uint32_t type,uint32_t finger,uint32_t x,uint32_t y)
+     if (q->tail-q->head==QUEUE_SIZE) q->head++;
+     q->samples[q->tail++%QUEUE_SIZE]=(struct pong_touch){mach_absolute_time(),type,finger,x,y};
+     lck_mtx_unlock(&touch_lock);
++    if (type==PONG_TOUCH_DOWN || type==PONG_BUTTON_DOWN) pong_touch_last_down=mach_absolute_time();
+     wakeup(q);
+ }
+ 
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 471c46c..0682a1e 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -61,6 +61,8 @@ extern "C" void pong_backlight_t970_start(IOService *display);
+ extern "C" void pong_panel_power_request(uint64_t state);       /* bsd/dev/pong_backlight_t970.c */
+ extern "C" int pong_panel_is_off(void);
+ extern "C" int pong_mmio_quiet;
++/* z154 hangwatch (bsd/dev/pong_hangwatch.c): when the last swap came and from which process; the watch starts at the first. */
++extern "C" {volatile uint64_t pong_swap_last;volatile int pong_swap_pid;void pong_hangwatch_start(void);}
+ 
+ 
+ /* Framebuffer user-client selectors checked against the 22H374 framework. */
+@@ -1755,6 +1757,11 @@ IOMobileFramebuffer::present(const uint8_t * swap)
+ 	IOLockLock(fSwapLock);
+ 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
+ 	fSwapTime = now;
++	if (!pong_swap_last) {
++		pong_hangwatch_start();
++	}
++	pong_swap_last = now;
++	pong_swap_pid = proc_selfpid();
+ 	fStatHeld += fSwapsWaiting >= swapQueue();
+ 	while (fSwapsWaiting >= swapQueue()) {
+ 		if (IOLockSleepDeadline(fSwapLock, &fSwapsWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
