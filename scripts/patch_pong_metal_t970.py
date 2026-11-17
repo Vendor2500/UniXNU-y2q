@@ -179,13 +179,44 @@ FRONTEND_EDITS = (
 )
 
 
-def apply(path, edits):
+# 6. functionType never 0 for a function the library has: the translator refuses the properties of some functions (a specialized
+#    one's are derived from its specialized AIR), nmb_function_type then answers 0, and Metal's
+#    -[MTLComputePipelineDescriptorInternal setComputeFunction:] aborts on any type but Kernel (3): MobileNotes, PencilKit's
+#    newPaintShaderKernelPipelineState, every S Pen stroke (11-17). Specialization never changes the stage, so the unspecialized
+#    function of the same name answers; the refusal is kept as a problem (P0) either way.
+FUNCTION_TYPE = r'''// T970 (patch_pong_metal_t970.py, 6): the stage of a function whose own properties the translator refused.
+static MTLFunctionType functionTypeOf(NmbLibrary *library,NmbFunction *function,NSString *name) {
+ uint64_t type=nmb_function_type(function);
+ if(type)return (MTLFunctionType)type;
+ NBLOG(@"native-metal: function %@ type refused: %@",name,lastError());
+ if(NmbFunction *plain=name?nmb_function_new(library,name.UTF8String):nullptr){type=nmb_function_type(plain);nmb_function_release(plain);}
+ if(!type)NBLOG(@"native-metal: function %@ type unknown: %@",name,lastError());
+ return (MTLFunctionType)type;
+}
+static std::string quartzCoreCallers();
+@implementation NBLibrary
+'''
+FRONTEND_ALL = (
+    ('function.functionType=(MTLFunctionType)nmb_function_type(handle);', 'function.functionType=functionTypeOf(_handle,handle,name);', 3),
+)
+FRONTEND_EDITS = FRONTEND_EDITS + (
+    ('static std::string quartzCoreCallers();\n@implementation NBLibrary\n', FUNCTION_TYPE),
+)
+
+
+def apply(path, edits, every=()):
     text = path.read_text()
     for old, new in edits:
         if new in text:
             continue
         if text.count(old) != 1:
             raise SystemExit('expected exactly one %r in %s' % (old[:40], path))
+        text = text.replace(old, new)
+    for old, new, count in every:
+        if text.count(new) == count:
+            continue
+        if text.count(old) != count:
+            raise SystemExit('expected %d of %r in %s' % (count, old[:40], path))
         text = text.replace(old, new)
     path.write_text(text)
     print('patched:', path)
@@ -195,7 +226,7 @@ def main():
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
     apply(root / 'drivers/PongMetal/PongMetalPlugin.mm', EDITS)
     apply(root / 'drivers/PongMetal/bridge/NativeMetalObjects.rs', BRIDGE_EDITS)
-    apply(root / 'drivers/PongMetal/NativeBridgeMetalFrontend.mm', FRONTEND_EDITS)
+    apply(root / 'drivers/PongMetal/NativeBridgeMetalFrontend.mm', FRONTEND_EDITS, FRONTEND_ALL)
 
 
 if __name__ == '__main__':

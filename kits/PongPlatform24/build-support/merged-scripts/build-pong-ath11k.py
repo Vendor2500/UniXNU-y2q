@@ -328,6 +328,19 @@ def t970_edits(gen, mhi, shared, out):
          '  lx_log(6, "wifi: rx decap %s, dhcp broadcast bit %s", nw_wifi_t970_rxnwifi ? "native wifi" : "ethernet", nw_wifi_t970_dhcpb ? "set" : "left");\n'
          '  g_vif->offload_flags = IEEE80211_OFFLOAD_ENCAP_ENABLED | (nw_wifi_t970_rxnwifi ? 0 : IEEE80211_OFFLOAD_DECAP_ENABLED);'),
     ])
+    # 15. (11-17) A join that never ends. 11-16 a switch from one network to another (wi_gen_2.4G_46 -> wi_gen_5G_56) failed
+    #     with err -5 (NW_RES_UNSUPPORTED: the 5 GHz network's security, e.g. WPA3 or management frame protection required,
+    #     is outside rsn_check), and the next join then stayed in NW_STA_AUTH ("sta 3") for good: no "authentication sent
+    #     again", no timeout, en0 without an address until the tablet restarted. The retries and the give-up live in
+    #     timer_fn, so that timer was not running. nw_sta_run() runs on every step: a join still short of NW_STA_UP 15 s after
+    #     it started ends as a timeout there, whatever happened to the timer, and the log says whether the timer was armed.
+    edit(out / 'nw_sta_pong.c', [
+        ('    if (C.state == NW_STA_UP || C.state >= NW_STA_AUTH) send_queued(); } }',
+         '    if (C.state >= NW_STA_AUTH && C.state < NW_STA_UP && lx_now_ms() - C.started >= 15000) {   /* edit 15 */\n'
+         '      lx_log(4, "wifi: join still in state %d after 15 s (step timer armed %d, tries %d): giving up", C.state, g_timer.armed, C.tries);\n'
+         '      connect_done(NW_RES_TIMEOUT); }\n'
+         '    if (C.state == NW_STA_UP || C.state >= NW_STA_AUTH) send_queued(); } }'),
+    ])
     return qrtr
 
 
