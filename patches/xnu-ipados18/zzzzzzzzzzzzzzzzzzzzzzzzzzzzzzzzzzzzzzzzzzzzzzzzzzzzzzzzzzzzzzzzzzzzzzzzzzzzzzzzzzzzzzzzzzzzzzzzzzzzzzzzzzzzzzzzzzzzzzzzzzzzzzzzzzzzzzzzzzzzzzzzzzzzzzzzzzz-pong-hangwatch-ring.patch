@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/pong_hangwatch.c b/bsd/dev/pong_hangwatch.c
+index 689dc8a..5803a38 100644
+--- a/bsd/dev/pong_hangwatch.c
++++ b/bsd/dev/pong_hangwatch.c
+@@ -30,6 +30,7 @@ extern volatile int pong_swap_pid;
+ extern int pong_panel_is_off(void);
+ extern int pong_metal_diag_usb(char *out, size_t cap);
+ extern int pong_gpu_diag_usb(char *reply, size_t cap);
++extern int pong_t970_gpu_ring(char *reply, size_t cap);   /* z155: drivers/T970Adreno/PongAdrenoCpT970.cpp */
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ void pong_hangwatch_start(void);
+ 
+@@ -106,6 +107,9 @@ hang_record(uint32_t n, uint64_t touch_age, uint64_t swap_age)
+ 	    ta / NSEC_PER_MSEC, sa / NSEC_PER_MSEC, pid, pong_touch_unread());
+ 	hang_pmsg(line, (size_t)len);
+ 	diag[0] = '\0';
++	(void)pong_t970_gpu_ring(diag, sizeof(diag));   /* z155: a GPU that stopped finishing jobs shows issued > done, irq still */
++	hang_pmsg(diag, strnlen(diag, 180));
++	diag[0] = '\0';
+ 	(void)pong_metal_diag_usb(diag, sizeof(diag));
+ 	hang_pmsg(diag, strnlen(diag, 180));
+ 	diag[0] = '\0';
