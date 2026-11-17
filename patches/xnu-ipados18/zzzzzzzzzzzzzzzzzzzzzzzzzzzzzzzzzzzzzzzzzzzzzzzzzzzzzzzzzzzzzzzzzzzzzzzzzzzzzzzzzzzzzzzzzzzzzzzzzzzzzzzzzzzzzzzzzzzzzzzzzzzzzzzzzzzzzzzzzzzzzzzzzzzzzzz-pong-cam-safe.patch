@@ -1,0 +1,300 @@
+diff --git a/bsd/dev/pong_camera.c b/bsd/dev/pong_camera.c
+index 1d6ae2a..9705242 100644
+--- a/bsd/dev/pong_camera.c
++++ b/bsd/dev/pong_camera.c
+@@ -10,6 +10,13 @@
+  *   cam frame [sensor] [lines=N] [ae] [exp=N] [gain=N] [target=N] [lanes=N] [settle=N] [pa=0x..]
+  *                               C4 (+C4b with `ae`): one RAW frame, lines N around the centre (default 480, 0 = whole frame),
+  *                               measured, 64x48 thumbnail kept; the frame stays in the buffer for `cam save`
++ *   any of the above + upto=N   stop after stage N and power down (1 GCC camera AHB/AXI, 2 TITAN_TOP_GDSC = first camcc
++ *                               access, 3 roots, 4 branches, 5 CCI, 6 sensor power, 7 ID): one risky step at a time
++ *   any of the above + mmcx     first raise the MMCX rail (camcc's power domain, Linux camcc-sm8250 power-domains) to its
++ *                               top level through RPMh (pong_slpi.c pong_rpmh_mmcx_max); never lowered afterwards
++ * Every stage leaves "[PONG_CAM] <step> <n>" in pmsg first, so a hang names the access it stopped at (11-17: `cam id all`
++ * froze the kernel and the USB channel right after it started, cause unknown; a bus access that never completes cannot
++ * time out, hence stepping instead of timeouts).
+  *   cam thumb [row]             8 thumbnail rows from row (0..47): "tNN <128 hex>" (one Bayer site, 8-bit MSBs)
+  *   cam save [grbg|gbrg]        the last frame as a half-resolution colour PPM (2x2 Bayer quads, black 16, grey world,
+  *                               gamma 2) at /private/var/mobile/Media/DCIM/pong-cam.ppm, fetched with
+@@ -86,8 +93,8 @@ enum { CAM_ID = 1, CAM_STREAM, CAM_RX, CAM_FRAME };
+ struct cam_req {
+ 	int op;
+ 	unsigned bits;                     /* sensors: 1 front, 2 rear, 4 wide */
+-	uint32_t lines, exp, gain, target, lanes, settle, pa;
+-	bool ae;
++	uint32_t lines, exp, gain, target, lanes, settle, pa, upto;
++	bool ae, mmcx;
+ };
+ 
+ static struct {
+@@ -207,13 +214,21 @@ root_set(uint32_t cmd, uint32_t source, uint32_t hid, int stage)
+ }
+ static bool root_xo(uint32_t cmd, int stage) { return root_set(cmd, 0, 0, stage); }
+ 
++static void
++stage(int s, const char *what)
++{
++	cam.st[0] = s;
++	mark(what, s);
++}
++
++/* true = go on; false = failed (st[0] < 0) or stopped at upto (st[0] = upto) */
+ static bool
+-clocks_on(void)
++clocks_on(uint32_t upto)
+ {
+ 	bool on = false;
+ 	uint32_t g;
+ 
+-	cam.st[0] = 1;
++	stage(1, "gcc");
+ 	if (!g_gcc) {
+ 		g_gcc = ml_io_map(CAM_GCC, 0x10000);
+ 	}
+@@ -229,9 +244,13 @@ clocks_on(void)
+ 	}
+ 	wr(g_gcc, 0xb02c, RD(g_gcc, 0xb02c) | 1u);
+ 	wr(g_gcc, 0xb030, RD(g_gcc, 0xb030) | 1u);
++	if (upto == 1) {
++		return false;
++	}
+ 
+-	cam.st[0] = 2;                                        /* TITAN_TOP_GDSC: [0] SW_COLLAPSE, [31] PWR_ON, CFG [16] done */
++	stage(2, "gdsc");                                     /* TITAN_TOP_GDSC: [0] SW_COLLAPSE, [31] PWR_ON, CFG [16] done */
+ 	g = RD(g_camcc, 0xc144);
++	mark("gdscr", (int)g);
+ 	if (g & 1u) {
+ 		wr(g_camcc, 0xc144, g & ~1u);
+ 	}
+@@ -245,8 +264,11 @@ clocks_on(void)
+ 	if (!on) {
+ 		return fail(2, (int32_t)RD(g_camcc, 0xc148));
+ 	}
++	if (upto == 2) {
++		return false;
++	}
+ 
+-	cam.st[0] = 3;                                        /* roots on XO: slow AHB, camnoc AXI, CCI0/1, MCLK0..2 */
++	stage(3, "roots");                                    /* roots on XO: slow AHB, camnoc AXI, CCI0/1, MCLK0..2 */
+ 	if (!root_xo(0x7058, 3) || !root_xo(0xc0f8, 3) || !root_xo(0xc0bc, 3) || !root_xo(0xc0d8, 3)) {
+ 		return false;
+ 	}
+@@ -255,9 +277,12 @@ clocks_on(void)
+ 			return false;
+ 		}
+ 	}
+-	cam.st[0] = 4;                                        /* gdsc, core AHB, CPAS AHB, camnoc AXI, CCI0, CCI1 */
++	if (upto == 3) {
++		return false;
++	}
++	stage(4, "branches");                                 /* gdsc, core AHB, CPAS AHB, camnoc AXI, CCI0, CCI1 */
+ 	return branch_on(g_camcc, 0xc16c, 4) && branch_on(g_camcc, 0xc150, 4) && branch_on(g_camcc, 0xc0f4, 4) &&
+-	       branch_on(g_camcc, 0xc114, 4) && branch_on(g_camcc, 0xc0d4, 4) && branch_on(g_camcc, 0xc0f0, 4);
++	       branch_on(g_camcc, 0xc114, 4) && branch_on(g_camcc, 0xc0d4, 4) && branch_on(g_camcc, 0xc0f0, 4) && upto != 4;
+ }
+ static void
+ clocks_off(void)
+@@ -1364,7 +1389,7 @@ probe(unsigned index, const struct cam_req *r, bool last)
+ 	uint8_t id[4] = { 0, 0, 0, 0 };
+ 	int rc;
+ 
+-	cam.st[0] = 5;
++	stage(5, s->name);
+ 	if (!g_cci[s->cci]) {
+ 		g_cci[s->cci] = ml_io_map(s->cci ? 0x0ac50000UL : 0x0ac4f000UL, 0x1000);
+ 	}
+@@ -1373,6 +1398,7 @@ probe(unsigned index, const struct cam_req *r, bool last)
+ 		return -3;
+ 	}
+ 	cam.st[3] = (int32_t)RD(g_cci[s->cci], 0);
++	mark("cci_hw", cam.st[3]);
+ 	if (!function(s->sda, 1, 2, 3) || !function(s->scl, 1, 2, 3)) {   /* cci_i2c, 2 mA, pull-up */
+ 		(void)fail(5, -2);
+ 		return -3;
+@@ -1380,13 +1406,21 @@ probe(unsigned index, const struct cam_req *r, bool last)
+ 	if (!cci_init(g_cci[s->cci], s->master)) {
+ 		return -2;
+ 	}
++	if (r->upto == 5) {
++		return 0;
++	}
+ 
+-	cam.st[0] = 6;                                   /* VIO, VANA, 2 ms, MCLK, 2 ms, reset high, 10 ms */
++	stage(6, "power");                               /* VIO, VANA, 2 ms, MCLK, 2 ms, reset high, 10 ms */
++	mark("gpio", s->reset);
+ 	park(s->reset);
++	mark("gpio", CAM_VIO);
+ 	(void)output(CAM_VIO, true);
++	mark("gpio", s->vana);
+ 	(void)output(s->vana, true);
+ 	IOSleep(2);
++	mark("gpio", s->mclk_gpio);
+ 	(void)function(s->mclk_gpio, 1, 4, 0);
++	mark("mclk", s->mclk);
+ 	if (!branch_on(g_camcc, 0x5018 + 0x1c * s->mclk, 6)) {
+ 		power_down(s);
+ 		return -3;
+@@ -1394,8 +1428,12 @@ probe(unsigned index, const struct cam_req *r, bool last)
+ 	IOSleep(2);
+ 	(void)output(s->reset, true);
+ 	IOSleep(10);
++	if (r->upto == 6) {
++		power_down(s);
++		return 0;
++	}
+ 
+-	cam.st[0] = 7;
++	stage(7, "id");
+ 	rc = cci_read(s, 0x0000, id, 4);
+ 	if (rc == -1) {
+ 		IOSleep(20);                                 /* some modules answer only after a longer reset release */
+@@ -1423,7 +1461,13 @@ cam_thread(__unused void *arg, __unused wait_result_t w)
+ 	bzero(cam.st, sizeof(cam.st));
+ 	bzero(cam.ae, sizeof(cam.ae));
+ 	mark("start", r.op);
+-	if (clocks_on()) {
++	if (r.mmcx) {
++		extern int pong_rpmh_mmcx_max(void);
++
++		cam.st[1] = pong_rpmh_mmcx_max();
++		mark("mmcx", cam.st[1]);
++	}
++	if (clocks_on(r.upto)) {
+ 		for (unsigned i = 0; i < 3; i++) {
+ 			if (r.bits & (1u << i)) {
+ 				last = (int)i;
+@@ -1434,14 +1478,16 @@ cam_thread(__unused void *arg, __unused wait_result_t w)
+ 				continue;
+ 			}
+ 			(void)probe(i, &r, (int)i == last);
+-			if (cam.st[0] < 0) {
++			if (cam.st[0] < 0 || (r.upto && r.upto <= 6)) {
+ 				break;
+ 			}
+ 		}
+-		if (cam.st[0] > 0) {
++		if (cam.st[0] > 0 && !r.upto) {
+ 			cam.st[0] = 8;
+ 		}
+-		clocks_off();
++	}
++	if (cam.st[0] >= 2 || cam.st[0] <= -3) {
++		clocks_off();                                 /* camcc was reachable */
+ 	}
+ 	cam.st[8] = (int32_t)(now_ms() - t0);
+ 	mark("done", cam.st[0]);
+@@ -1584,7 +1630,7 @@ cam_status(char *reply, size_t cap)
+ int
+ pong_camera_usb(char *reply, size_t cap, const char *args)
+ {
+-	struct cam_req r = { 0, 1, 480, 0, 0, 0, 0, 0, 0, false };
++	struct cam_req r = { 0, 1, 480, 0, 0, 0, 0, 0, 0, 0, false, false };
+ 	thread_t th;
+ 
+ 	if (!reply || cap < 64) {
+@@ -1625,7 +1671,7 @@ pong_camera_usb(char *reply, size_t cap, const char *args)
+ 		r.op = CAM_FRAME;
+ 	} else {
+ 		return snprintf(reply, cap, "cam: id|stream|rx|frame [front|rear|wide] [lines=N] [ae] [exp=N] [gain=N] [target=N] "
+-		           "[lanes=N] [settle=N] [pa=0x..] | thumb [row] | save [grbg]\n");
++		           "[lanes=N] [settle=N] [pa=0x..] [upto=N] [mmcx] | thumb [row] | save [grbg]\n");
+ 	}
+ 	r.bits = strnstr(args, "all", strlen(args)) && r.op == CAM_ID ? 7u : strnstr(args, "rear", strlen(args)) ? 2u : strnstr(args, "wide", strlen(args)) ? 4u : 1u;
+ 	if (strnstr(args, "lines=", strlen(args))) {
+@@ -1638,6 +1684,8 @@ pong_camera_usb(char *reply, size_t cap, const char *args)
+ 	r.settle = arg_num(args, "settle=");
+ 	r.pa = arg_num(args, "pa=");
+ 	r.ae = strnstr(args, " ae", strlen(args)) != NULL;
++	r.upto = arg_num(args, "upto=");
++	r.mmcx = strnstr(args, "mmcx", strlen(args)) != NULL;
+ 	if (__atomic_exchange_n(&cam.busy, 1u, __ATOMIC_ACQ_REL)) {
+ 		return snprintf(reply, cap, "cam: busy\n");
+ 	}
+diff --git a/bsd/dev/pong_gps.c b/bsd/dev/pong_gps.c
+index ff9ed4c..8af7256 100644
+--- a/bsd/dev/pong_gps.c
++++ b/bsd/dev/pong_gps.c
+@@ -113,7 +113,7 @@ static LCK_GRP_DECLARE(gps_group, "pong-gps");
+ static LCK_MTX_DECLARE(gps_lock, &gps_group);   /* on / off / baud / tx; the RX thread only reads the FIFO */
+ static volatile int gps_state;                   /* 0 off, 1 on, 2 stopping */
+ static bool gps_cts = true;
+-static uint32_t gps_baud, gps_sample = 16, gps_depth_tx;
++static uint32_t gps_baud, gps_sample = 16, gps_depth_tx, gps_fw;   /* gps_fw: SE3 FW_REV at the last `gps on` */
+ static uint8_t gps_ring[GPS_RING];
+ static uint64_t gps_head;                        /* bytes received ever (atomic); ring index = head % GPS_RING */
+ static uint64_t gps_tail;                        /* the /dev reader's position */
+@@ -523,7 +523,7 @@ gps_on(uint32_t baud, bool cts, bool en)
+ 			return s - 10;                     /* -11 no source fits the rate, -12 RCG stuck, -13 a branch stayed off */
+ 		}
+ 	}
+-	fw = RD(g_se, G_FW_REV);
++	fw = gps_fw = RD(g_se, G_FW_REV);
+ 	txd = (RD(g_se, G_HW_PARAM0) >> 16) & 0x3fu;
+ 	rxd = (RD(g_se, G_HW_PARAM1) >> 16) & 0x3fu;
+ 	mark("fw", (int)fw);
+@@ -633,12 +633,12 @@ gps_status(char *reply, size_t cap, int rc)
+ 	int k;
+ 
+ 	k = snprintf(reply, cap, "gps: %s rc %d baud %u os %u cts %d en %u wake %u rx %llu tx %llu txfail %llu nmea %llu "
+-	        "fd %llu edges %llu lost %llu dev %s fw %x\nlast:",
++	        "fd %llu edges %llu lost %llu dev %s fw %x err %d\nlast:",
+ 	        gps_state == 1 ? "on" : "off", rc, gps_baud, gps_sample, gps_cts, g_en ? (RD(g_en, 4) >> 1) & 1u : 0,
+ 	        g_wake ? RD(g_wake, 4) & 1u : 0, (unsigned long long)h, (unsigned long long)gps_n.tx,
+ 	        (unsigned long long)gps_n.txfail, (unsigned long long)gps_n.nmea, (unsigned long long)gps_n.wakebytes,
+ 	        (unsigned long long)gps_n.edges, (unsigned long long)gps_n.lost,
+-	        gps_node ? "/dev/pong_gps" : "-", (unsigned)gps_n.last_err);
++	        gps_node ? "/dev/pong_gps" : "-", gps_fw, gps_n.last_err);
+ 	if (k < 0 || k > (int)cap - 16) {
+ 		return k;
+ 	}
+diff --git a/bsd/dev/pong_slpi.c b/bsd/dev/pong_slpi.c
+index f445695..e190c9f 100644
+--- a/bsd/dev/pong_slpi.c
++++ b/bsd/dev/pong_slpi.c
+@@ -399,7 +399,7 @@ sl_rpmh(uint32_t address, uint32_t value)
+ 	return rc;
+ }
+ 
+-static QcomRpmhResource sl_lcx, sl_lmx, sl_l8, sl_l5;
++static QcomRpmhResource sl_lcx, sl_lmx, sl_l8, sl_l5, sl_mmcx;
+ /* Proxy votes: lcx/lmx at their top level while the SLPI boots (qcom_q6v5_pas proxy_pd), 0 after its handover; the sensor
+  * supply pm8150a_l8 at 1.8 V, HPM, on (the DT's active-reg sensor_vdd: the hub's chips need it, the boot does not). */
+ static int
+@@ -421,6 +421,7 @@ sl_cmd_db(void)
+ 			}
+ 			(void)qcom_cmd_db_find(db, SL_CMDDB_SIZE, "ldoc8", &sl_l8);
+ 			(void)qcom_cmd_db_find(db, SL_CMDDB_SIZE, "ldoc5", &sl_l5);     /* the microphone bias (t970_rpmh_write) */
++			(void)qcom_cmd_db_find(db, SL_CMDDB_SIZE, "mmcx.lvl", &sl_mmcx); /* camcc's rail (pong_rpmh_mmcx_max) */
+ 		}
+ 		if (va) {
+ 			ml_io_unmap(va, SL_CMDDB_SIZE);
+@@ -454,6 +455,29 @@ t970_rpmh_write(const char *name, uint32_t word, uint32_t value)
+ 	return sl_rpmh(r->address + word, value);
+ }
+ 
++/* pong_camera.c `cam ... mmcx`: MMCX (the camera and display rail) to its top level. Only ever raised: votes from this APPS
++ * DRV replace each other, so any lower value could undercut the level the display runs on. 0, 1 no command DB, 2 no mmcx.lvl,
++ * 3 no level table, 10 + RSC error. */
++int pong_rpmh_mmcx_max(void);
++int
++pong_rpmh_mmcx_max(void)
++{
++	uint32_t i = 0;
++	int rc;
++
++	if (!sl_map() || sl_cmd_db()) {
++		return 1;
++	}
++	if (!sl_mmcx.address) {
++		return 2;
++	}
++	if (qcom_rpmh_level_index(&sl_mmcx, 0xffffffffu, &i)) {
++		return 3;
++	}
++	rc = sl_rpmh(sl_mmcx.address, i);
++	return rc ? 10 + rc : 0;
++}
++
+ /* The lcx/lmx proxy votes of every DSP boot, counted: raised by the first boot, dropped when the last one hands over or gives up
+  * (so the SLPI's handover cannot drop the levels under an ADSP still booting). 0, 1 no command DB, 2 no level, 10 + RSC error. */
+ int

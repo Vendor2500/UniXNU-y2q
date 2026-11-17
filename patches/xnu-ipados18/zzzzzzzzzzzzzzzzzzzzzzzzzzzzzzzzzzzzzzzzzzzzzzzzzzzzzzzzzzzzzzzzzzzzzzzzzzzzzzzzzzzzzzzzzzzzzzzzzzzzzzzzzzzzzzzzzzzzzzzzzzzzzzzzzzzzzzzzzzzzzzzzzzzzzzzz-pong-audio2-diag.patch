@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index 1193653..5ca8357 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -779,14 +779,17 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 		{
+ 			/* IOAudio2Device (T970IOAudio2.cpp): mode, published, clients, StartIO ok/refused, frames passed, resyncs,
+ 			 * dropped, StopIO, volume step << 8 | mute */
+-			extern volatile uint32_t t970_audio2[16];
++			extern volatile uint32_t t970_audio2[20];
+ 
+ 			AD_ADD(" io2=%u/%#x clients=%u start=%u/%u frames=%u resync=%u drop=%u stop=%u vol=%#x", t970_audio2[0], t970_audio2[1],
+ 			    t970_audio2[2], t970_audio2[3], t970_audio2[4], t970_audio2[5], t970_audio2[6], t970_audio2[7], t970_audio2[8],
+ 			    t970_audio2[9]);
+ 			/* the input stream (pong_audio2_in=1): on, frames copied, peak, resyncs; memory types asked and not served, last one */
+-			AD_ADD(" in=%u/%u/%u/%u mem=%u/%#x\n", t970_audio2[15], t970_audio2[10], t970_audio2[11], t970_audio2[14], t970_audio2[12],
++			AD_ADD(" in=%u/%u/%u/%u mem=%u/%#x", t970_audio2[15], t970_audio2[10], t970_audio2[11], t970_audio2[14], t970_audio2[12],
+ 			    t970_audio2[13]);
++			/* the engine's own positions (input read / output committed; input moving = an app reads the microphone) and its
++			 * control calls (count, last: ID << 16 | value; ID 1 volume step, 2 mute) */
++			AD_ADD(" hal=%u/%u ctl=%u/%#x\n", t970_audio2[16], t970_audio2[17], t970_audio2[18], t970_audio2[19]);
+ 		}
+ 		return 0;
+ 	}
+diff --git a/iokit/Kernel/T970IOAudio2.cpp b/iokit/Kernel/T970IOAudio2.cpp
+index 08978ba..c769435 100644
+--- a/iokit/Kernel/T970IOAudio2.cpp
++++ b/iokit/Kernel/T970IOAudio2.cpp
+@@ -36,8 +36,10 @@ extern "C" int t970_audio_request(uint32_t selector);
+ extern "C" void t970_audio2_start(unsigned mode);
+ // [0] mode, [1] published, [2] clients opened, [3] StartIO, [4] StartIO refused, [5] frames passed to T970Audio, [6] write resyncs,
+ // [7] frames dropped (ring full), [8] StopIO, [9] last volume step << 8 | mute, [10] input frames copied, [11] input peak,
+-// [12] memory types asked that this device does not serve, [13] the last such type, [14] input resyncs, [15] the input on (1)
+-extern "C" {volatile uint32_t t970_audio2[16];}
++// [12] memory types asked that this device does not serve, [13] the last such type, [14] input resyncs, [15] the input on (1),
++// [16] the engine's input read position (status +0x18, low 32 bits), [17] its committed output position (+0x20), [18] control calls,
++// [19] the last one: control ID << 16 | value (1 volume step 0..16, 2 mute)
++extern "C" {volatile uint32_t t970_audio2[20];}
+ 
+ namespace {
+ constexpr unsigned Audio2Frames = 16384, Audio2Rate = 48000, Audio2FrameBytes = 4;
+@@ -394,9 +396,13 @@ void IOAudio2Device::clockLoop() {
+         auto st = static_cast<Audio2Status *>(status->getBytesNoCopy());
+         st->frames = frames; st->host = origin + ticks;
+         __atomic_store_n(&st->seed, seed, __ATOMIC_RELEASE);
+-        if (gMode == 2) pump();
+-        if (gMode == 2 && gInput) pullInput();
+-        else {readAt = __atomic_load_n(&st->clientOutputEnd, __ATOMIC_ACQUIRE); readValid = true;}   // the silent clock drops them
++        if (gMode == 2) {
++            pump();
++            if (gInput) pullInput();
++        } else {readAt = __atomic_load_n(&st->clientOutputEnd, __ATOMIC_ACQUIRE); readValid = true;}   // the silent clock drops them
++        // what the engine wrote back: how far it read the input / committed the output (low 32 bits of each sample position)
++        t970_audio2[16] = uint32_t(__atomic_load_n(&st->clientInputEnd, __ATOMIC_ACQUIRE));
++        t970_audio2[17] = uint32_t(__atomic_load_n(&st->clientOutputEnd, __ATOMIC_ACQUIRE));
+         IOLockUnlock(gate);
+     }
+     release();
+@@ -409,6 +415,8 @@ void IOAudio2Device::applyVolume() {
+     __atomic_add_fetch(&c->out_volume_seq, 1u, __ATOMIC_ACQ_REL);
+ }
+ IOReturn IOAudio2Device::control(unsigned id, unsigned value, uint64_t *result) {
++    t970_audio2[18] = t970_audio2[18] + 1;           // every control call the engine makes, refused ones included
++    t970_audio2[19] = id << 16 | (value & 0xffff);
+     if ((id == 1 && value > 16) || (id == 2 && value > 1) || (id != 1 && id != 2)) return kIOReturnBadArgument;
+     IOLockLock(controlGate);
+     IOLockLock(gate);

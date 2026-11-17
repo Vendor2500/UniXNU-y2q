@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 1ca7acf..471c46c 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -832,19 +832,23 @@ panel120Hz(void)
+ /*
+  * fb_120hz=3: the refresh rate follows the frames, as ProMotion does it. A command-mode panel keeps
+  * showing what it was last sent, so the rate is the panel's own: 60 Hz while nothing moves, 120 as
+- * soon as two frames come within RATE_ACTIVE_US of each other (something moves), back to 60 when
+- * none has come for RATE_IDLE_MS. (The first version went by the average interval, under 12.5 ms:
+- * on the device, 11-16, frames came some 20 a second and the panel stayed at 60.) The switch is the stock runtime command (samsung,vrr_tx_cmds:
++ * soon as two intervals in a row are under fb_vrr_active_us (something moves), back to 60 when no
++ * such frame has come for fb_vrr_idle_ms. On the device a still screen still gets a frame some every
++ * 50 ms (11-17: 20 a second, 48-51 ms), a drag some every 20-25 ms (40-50 a second): 30 ms tells them
++ * apart, and the frames of a still screen neither raise the rate nor keep it up. (11-16: an average
++ * under 12.5 ms was never reached; 11-17: any interval under 50 ms caught the still screen's frames
++ * and the rate never came down.) The switch is the stock runtime command (samsung,vrr_tx_cmds:
+  * 60 20, no wait; 60 00 back) and INTF1's line counter for that mode; the DSI link stays as it is
+  * (the same rate for both modes). What iOS itself could say (selector 87, AnnounceNextSwapTimestamp;
+  * displayMaxRefreshInterval) is not used yet: work/gap_audit/DPU_TEST.md.
+  */
+-#define RATE_ACTIVE_US          50000           /* two frames this close: something moves (11-16: the frames came some 20 a second, never 80) */
+-#define RATE_IDLE_MS            500             /* ponytail: fixed; a boot-arg when a device test says otherwise */
++static TUNABLE(uint32_t, gRateActiveUs, "fb_vrr_active_us", 30000);
++static TUNABLE(uint32_t, gRateIdleMs, "fb_vrr_idle_ms", 500);
+ static IOLock *         gRateLock;
+ static thread_call_t    gRateIdle;
+ static bool             gRateFast;              /* the panel at 120 now */
+ static uint64_t         gRateLast, gRateAvgUs;  /* the last frame's time, the average interval */
++static uint32_t         gRateShort;             /* intervals under fb_vrr_active_us in a row */
+ static uint32_t         gRateUp, gRateDown, gRateFailed;
+ 
+ /* The panel to 120 (`fast`) or 60, with the line counter for it. With gRateLock held. */
+@@ -889,8 +893,8 @@ panelRateInit(void)
+ 	g120Sync[0] = g120Sync[1] = mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC);
+ 	gRateLock = IOLockAlloc();
+ 	gRateIdle = thread_call_allocate(panelRateIdle, NULL);
+-	IOLog("MiniIOMobileFramebuffer: dpu: fb_120hz=3: 60 Hz, 120 while frames come faster than every %u us (intf1 sync %#x)\n",
+-	    RATE_ACTIVE_US, g120Sync[0]);
++	IOLog("MiniIOMobileFramebuffer: dpu: fb_120hz=3: 60 Hz, 120 after two frame intervals under %u us, 60 %u ms after the last "
++	    "(intf1 sync %#x)\n", gRateActiveUs, gRateIdleMs, g120Sync[0]);
+ }
+ 
+ /* A frame was put on the panel at `now` (fb_120hz=3). */
+@@ -898,6 +902,7 @@ static void
+ panelRateFrame(uint64_t now)
+ {
+ 	uint64_t us, deadline;
++	bool moving;
+ 
+ 	if (gRateLock == NULL || gRateIdle == NULL) {
+ 		return;
+@@ -907,13 +912,18 @@ panelRateFrame(uint64_t now)
+ 	gRateLast = now;
+ 	if (us != 0 && us < 200000) {
+ 		gRateAvgUs = gRateAvgUs == 0 ? us : (gRateAvgUs * 3 + us) / 4;
+-		if (us < RATE_ACTIVE_US) {
+-			panelRateSet(true);     /* (back to 60: panelRateIdle(), RATE_IDLE_MS after the last frame) */
+-		}
++	}
++	gRateShort = us != 0 && us < gRateActiveUs ? gRateShort + 1 : 0;
++	moving = gRateShort >= 2;
++	if (moving) {
++		panelRateSet(true);
+ 	}
+ 	IOLockUnlock(gRateLock);
+-	clock_interval_to_deadline(RATE_IDLE_MS, kMillisecondScale, &deadline);
+-	thread_call_enter_delayed(gRateIdle, deadline);
++	if (moving) {
++		/* (back to 60: panelRateIdle(), fb_vrr_idle_ms after the last moving frame; a still screen's frames do not count) */
++		clock_interval_to_deadline(gRateIdleMs, kMillisecondScale, &deadline);
++		thread_call_enter_delayed(gRateIdle, deadline);
++	}
+ }
+ 
+ /*

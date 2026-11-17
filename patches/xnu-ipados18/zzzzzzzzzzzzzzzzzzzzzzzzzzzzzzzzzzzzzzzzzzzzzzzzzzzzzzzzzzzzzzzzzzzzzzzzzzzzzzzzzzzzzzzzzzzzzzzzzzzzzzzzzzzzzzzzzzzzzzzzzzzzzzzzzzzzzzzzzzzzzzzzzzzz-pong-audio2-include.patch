@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/T970IOAudio2.cpp b/iokit/Kernel/T970IOAudio2.cpp
+index 1836302..9bb6291 100644
+--- a/iokit/Kernel/T970IOAudio2.cpp
++++ b/iokit/Kernel/T970IOAudio2.cpp
+@@ -16,6 +16,7 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMessage.h>
++#include <IOKit/IOPlatformExpert.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -26,6 +27,7 @@
+ 
+ extern "C" IOBufferMemoryDescriptor *t970_audio_memory(uint32_t type);   // T970Audio.cpp: retained, null until it serves
+ extern "C" int t970_audio_request(uint32_t selector);
++extern "C" void t970_audio2_start(unsigned mode);
+ // [0] mode, [1] published, [2] clients opened, [3] StartIO, [4] StartIO refused, [5] frames passed to T970Audio, [6] write resyncs,
+ // [7] frames dropped (ring full), [8] StopIO, [9] last volume step << 8 | mute
+ extern "C" {volatile uint32_t t970_audio2[10];}

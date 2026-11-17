@@ -1,0 +1,220 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 257c174..4416b42 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -103,6 +103,7 @@ extern int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);   /* po
+ extern int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);   /* pong_wifi_tools.c */
+ extern int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);   /* `nettest [dns]` */
+ extern int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);   /* `fileget <path> <offset>` */
++extern int pong_wifi_tools_fileraw(char *reply, size_t cap, const char *args, const uint8_t **data, uint32_t *len);
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
+ extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpuprobe gxon` (pong_gpu_gmu.c) */
+@@ -1228,6 +1229,26 @@ copy_from_device(uint8_t *dst, const volatile uint8_t *src, unsigned len)
+ 	for (unsigned i = 0; i < len; i++) dst[i] = src[i];
+ }
+ 
++/*
++ * Bulk IN data goes through OFF_TX_BIG (0x6000..0x7fff, free in the plain, NCM and mux layouts): 8 KiB per TRB.
++ * Before z152 it was 4096 bytes at OFF_TX_DATA, whose room ends at 0x4000 (3840 bytes), so every full chunk also
++ * overwrote the interrupt endpoint's TRB; and each chunk waited in 1 ms steps (~4 MB/s at best).
++ */
++#define OFF_TX_BIG              0x6000
++#define TX_BIG_BYTES            0x2000u
++
++/* wait up to 500 ms for the previous bulk IN transfer, polling every 50 us */
++static void
++tx_wait(void)
++{
++	for (unsigned w = 0; w < 10000 && ctl_tx_active; w++) {
++		process_events();
++		if (ctl_tx_active) {
++			delay_for_interval(50, NSEC_PER_USEC);
++		}
++	}
++}
++
+ static void
+ send_response(const void *data, unsigned len)
+ {
+@@ -1236,33 +1257,24 @@ send_response(const void *data, unsigned len)
+ 	unsigned remaining = len;
+ 
+ 	while (remaining > 0) {
+-		unsigned chunk = (remaining > 4096) ? 4096 : remaining;
+-		for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
+-			process_events();
+-			delay_for_interval(1, NSEC_PER_MSEC);
+-		}
++		unsigned chunk = (remaining > TX_BIG_BYTES) ? TX_BIG_BYTES : remaining;
++		tx_wait();
+ 		if (ctl_tx_active) {
+ 			pmsg_log("[PONG_USB] tx busy drop\n");
+ 			return;
+ 		}
+-		memcpy((void *)(dma_wcomb + OFF_TX_DATA), src, chunk);
++		memcpy((void *)(dma_wcomb + OFF_TX_BIG), src, chunk);
+ 		ctl_tx_active = true;
+-		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, chunk, DWC3_TRBCTL_NORMAL);
++		ep_transfer(3, OFF_TX_TRB, OFF_TX_BIG, chunk, DWC3_TRBCTL_NORMAL);
+ 		src += chunk;
+ 		remaining -= chunk;
+ 	}
+-	for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
+-		process_events();
+-		delay_for_interval(1, NSEC_PER_MSEC);
+-	}
++	tx_wait();
+ 	/* ZLP termination if total transfer length is an exact multiple of packet size */
+ 	if (len > 0 && ctl_packet_size > 0 && (len % ctl_packet_size) == 0 && !ctl_tx_active) {
+ 		ctl_tx_active = true;
+-		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, 0, DWC3_TRBCTL_NORMAL);
+-		for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
+-			process_events();
+-			delay_for_interval(1, NSEC_PER_MSEC);
+-		}
++		ep_transfer(3, OFF_TX_TRB, OFF_TX_BIG, 0, DWC3_TRBCTL_NORMAL);
++		tx_wait();
+ 	}
+ }
+ 
+@@ -1454,9 +1466,9 @@ cmd_handle_screenshot(void)
+ 		}
+ 
+ 		copy_from_device(staging, fb + sent, chunk);
+-		memcpy((void *)(dma_wcomb + OFF_TX_DATA), staging, chunk);
++		memcpy((void *)(dma_wcomb + OFF_TX_BIG), staging, chunk);
+ 		ctl_tx_active = true;
+-		ep_transfer(3, OFF_TX_TRB, OFF_TX_DATA, chunk, DWC3_TRBCTL_NORMAL);
++		ep_transfer(3, OFF_TX_TRB, OFF_TX_BIG, chunk, DWC3_TRBCTL_NORMAL);
+ 		sent += chunk;
+ 	}
+ 	for (unsigned w = 0; w < 500 && ctl_tx_active; w++) {
+@@ -2914,6 +2926,18 @@ dispatch_command(const char *cmd)
+ 			(void)pong_wifi_tools_usb(wt_reply, sizeof(wt_reply), strcmp(cmd, "fwstat") == 0 ? 0 : 1);
+ 		}
+ 		send_str(wt_reply[0] ? wt_reply : "fwsave: no reply\n");
++	} else if (strncmp(cmd, "fileraw ", 8) == 0) {
++		/* the same files as raw bytes: one header line, then n bytes (pong_wifi_tools.c, z152) */
++		static char fr_reply[200];
++		const uint8_t *fr_data = NULL;
++		uint32_t fr_len = 0;
++
++		fr_reply[0] = '\0';
++		(void)pong_wifi_tools_fileraw(fr_reply, sizeof(fr_reply), cmd + 8, &fr_data, &fr_len);
++		send_str(fr_reply[0] ? fr_reply : "fileraw: no reply\n");
++		if (fr_data && fr_len) {
++			send_response(fr_data, fr_len);
++		}
+ 	} else if (strncmp(cmd, "fileget ", 8) == 0) {
+ 		/* a file from the Photos folder in base64 pieces (bsd/dev/pong_wifi_tools.c) */
+ 		static char fg_reply[1500];
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index be41e7d..66ac89a 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -31,6 +31,7 @@
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
++#include <libkern/crc.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -43,6 +44,7 @@ int pong_fw_store_lookup(const char *name, const uint8_t **data, uint32_t *len);
+ int pong_wifi_tools_usb(char *reply, size_t reply_cap, int what);
+ int pong_wifi_tools_nettest(char *reply, size_t cap, const char *args);
+ int pong_wifi_tools_fileget(char *reply, size_t cap, const char *args);
++int pong_wifi_tools_fileraw(char *reply, size_t cap, const char *args, const uint8_t **data, uint32_t *len);
+ int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);
+ int pong_launch_policy_usb(char *reply, size_t cap, const char *args);
+ int pong_stackshot_usb(char *reply, size_t cap, const char *cmd);
+@@ -1020,6 +1022,88 @@ pong_wifi_tools_fileget(char *reply, size_t cap, const char *args)
+ 	return 0;
+ }
+ 
++/*
++ * `fileraw <path> <offset> [<len>]` (z152): the same files as fileget, as raw bytes. The reply is one line
++ * "fileraw: <size> <offset> <n> <crc32>" and then exactly n bytes (at most FR_MAX; len 0 or missing = FR_MAX),
++ * which pong_usb_ctl.c sends from *data. fileget's 1 KiB base64 round trips ran at ~13 KB/s.
++ */
++#define FR_MAX    (512u * 1024u)
++
++int
++pong_wifi_tools_fileraw(char *reply, size_t cap, const char *args, const uint8_t **data, uint32_t *len)
++{
++	static uint8_t *buf;            /* FR_MAX, allocated on first use and kept */
++	char path[160];
++	size_t pl = 0;
++	uint64_t offset = 0, want = 0, size = 0;
++	vfs_context_t ctx;
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int e, resid = 0;
++	uint32_t n = 0;
++
++	*data = NULL;
++	*len = 0;
++	while (args && *args == ' ') {
++		args++;
++	}
++	while (args && *args && *args != ' ' && pl + 1 < sizeof(path)) {
++		path[pl++] = *args++;
++	}
++	path[pl] = '\0';
++	for (int k = 0; k < 2; k++) {
++		uint64_t *v = k ? &want : &offset;
++
++		while (args && *args == ' ') {
++			args++;
++		}
++		while (args && *args >= '0' && *args <= '9' && *v < (1ull << 40)) {
++			*v = *v * 10u + (uint64_t)(*args++ - '0');
++		}
++	}
++	if (!fg_allowed(path, pl)) {
++		strlcpy(reply, "fileraw: only files under " FG_PREFIX " or " FG_PREFIX2 ", no ..\n", cap);
++		return -1;
++	}
++	if (!buf) {
++		buf = kalloc_data(FR_MAX, Z_WAITOK);
++		if (!buf) {
++			strlcpy(reply, "fileraw: no memory\n", cap);
++			return -1;
++		}
++	}
++	if (want == 0 || want > FR_MAX) {
++		want = FR_MAX;
++	}
++	ctx = vfs_context_create(NULL);
++	e = vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (e == 0) {
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		e = vnode_getattr(vp, &va, ctx);
++		if (e == 0 && VATTR_IS_SUPPORTED(&va, va_data_size)) {
++			size = va.va_data_size;
++		}
++		if (e == 0 && offset < size) {
++			n = (uint32_t)(size - offset < want ? size - offset : want);
++			e = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, (off_t)offset, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, current_proc());
++			n -= (uint32_t)resid;
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	vfs_context_rele(ctx);
++	if (e != 0) {
++		(void)snprintf(reply, cap, "fileraw: error %d\n", e);
++		return -1;
++	}
++	(void)snprintf(reply, cap, "fileraw: %llu %llu %u %08x\n", (unsigned long long)size, (unsigned long long)offset, n,
++	    crc32(0, buf, n));
++	*data = buf;
++	*len = n;
++	return 0;
++}
++
+ /* ---- process diagnostics: why apps and their helper processes end (Safari's WebContent / GPU processes) ---- */
+ struct pong_exit_rec {
+ 	uint32_t t_ms;

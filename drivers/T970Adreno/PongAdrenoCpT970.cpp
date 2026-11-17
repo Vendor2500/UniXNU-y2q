@@ -49,6 +49,7 @@ IOReturn armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *,
 int get_preemption_level(void);
 int pong_t970_gpu_start(char *reply, size_t cap);
 int pong_t970_gpu_selftest(char *reply, size_t cap);
+int pong_t970_gpu_ring(char *reply, size_t cap);
 }
 
 namespace {
@@ -478,6 +479,19 @@ extern "C" int pong_t970_gpu_start(char *reply, size_t cap)
     return status ? -1 : 0;
 }
 
+/* z155 hangwatch (bsd/dev/pong_hangwatch.c): the ring as the software sees it. No register is read: the GX rail may be
+ * off. issued - done = jobs the CP has not been seen to finish (done moves when a waiter looks), irq = GPU interrupts. */
+extern "C" int pong_t970_gpu_ring(char *reply, size_t cap)
+{
+    if (!gpu || !gpu->started) {
+        snprintf(reply, cap, "gpu ring: not started");
+        return -1;
+    }
+    snprintf(reply, cap, "gpu ring: issued=%u done=%u subs=%u rptr=%u irq=%u fatal=%#x status=%#x faults=%llu poisoned=%d/%d",
+        gpu->ring.lastSubmitted(), gpu->ring.completedFence(), gpu->ring.submissions(), gpu->ring.readPointer(), gpu->irq_count,
+        gpu->irq_fatal, gpu->irq_status, (unsigned long long)gpu->status.faults(), gpu->ring.poisoned() ? 1 : 0, gpu->poisoned ? 1 : 0);
+    return 0;
+}
 extern "C" int pong_t970_gpu_selftest(char *reply, size_t cap)
 {
     IOService *svc = native_adreno_published_service();
