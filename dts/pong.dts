@@ -1,24 +1,29 @@
 /dts-v1/;
 /include/ "sm8475.dtsi"
 / {
-    model = "Samsung Galaxy Tab S7+ (SM-T970) / SM8250";
-    compatible = "samsung,gts7xlwifi", "qcom,sm8250";
-    /* The Apple device tree carries one contiguous DRAM range: format 2 reads /memory as a single
-       reg pair and XNU takes its base and size as /chosen/dram-base and dram-size.
-       T970 has 8 GiB physical DRAM from 0x80000000. */
-    memory@80000000 { device_type = "memory"; reg = <0x0 0x80000000 0x2 0x0>; };
+    model = "Samsung Galaxy S20+ 5G (SM-G986 / y2q) / SM8250";
+    compatible = "samsung,y2q", "qcom,sm8250";
+
+    /* S20+ 5G has 12 GiB physical DRAM (0x80000000 base, total 0x300000000 size).
+       Note: Format 2 takes one contiguous range; if XNU requires single block without
+       high-mem hole issues, test 0x3 0x0 (12GB) first, fallback to 0x2 0x0 (8GB). */
+    memory@80000000 { device_type = "memory"; reg = <0x0 0x80000000 0x3 0x0>; };
+
     reserved-memory {
         #address-cells = <2>;
         #size-cells = <2>;
         ranges;
+
+        /* Exact reserved regions extracted from live Galaxy S20+ (y2q) */
         hyp@80000000 { reg = <0x0 0x80000000 0x0 0x600000>; no-map; };
+        removed@80b00000 { reg = <0x0 0x80b00000 0x0 0x6300000>; no-map; };
         cont_splash@9c000000 { reg = <0x0 0x9c000000 0x0 0x2300000>; no-map; };
-        ramoops@9fa00000 { reg = <0x0 0x9fa00000 0x0 0x100000>; no-map; };
-        rkp@b0200000 { reg = <0x0 0xb0200000 0x0 0x200000>; no-map; };
-        uh_heap@b0400000 { reg = <0x0 0xb0400000 0x0 0x1800000>; no-map; };
-        sec_debug@ffc00000 { reg = <0x0 0xffc00000 0x0 0x0b100000>; no-map; };
+        sec_debug_low@9f800000 { reg = <0x0 0x9f800000 0x0 0x800000>; no-map; };
+        tima_rkp_uh@b0100000 { reg = <0x0 0xb0100000 0x0 0x2300000>; no-map; };
+        sec_debug_high@100000000 { reg = <0x1 0x00000000 0x0 0xad00000>; no-map; };
     };
 };
+
 // All eight cores: 4 Silver (Cluster 0, E) + 3 Gold (Cluster 1, P) + 1 Prime (Cluster 2, P).
 // Kryo 585 Silver cpu0-3 (Cortex-A55), Gold cpu4-6 (Cortex-A77), Prime cpu7 (Cortex-A77).
 &cpu0 { unixnu,cluster-type = "E"; unixnu,die-cluster-id = <0>; unixnu,cluster-core-id = <0>; };
@@ -36,8 +41,6 @@
 };
 &ufs {
     status = "disabled";
-    /* SM8250: the GCC UFS PHY GDSC and branch registers sit at GCC (0x100000) + 0x77000, per
-       Linux drivers/clk/qcom/gcc-sm8250.c. SM8450/SM8475 use + 0x87000 (0x187000). */
     pong,gcc-ufs-page = <0x00177000>;
     pong,smmu-stream-id = <0xE0>;
     pong,ufs-spi = <265>;
